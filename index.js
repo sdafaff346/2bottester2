@@ -25,9 +25,10 @@ const defaultSettings = Object.freeze({
     newChat: true,
     delayMs: 300,
     genMode: 'batch',        // 'batch' = write all test messages in one call (fast), 'adaptive' = one call per turn
-    testerMaxTokens: 2048,
+    testerMaxTokens: 4096,
     autoMinimize: true,
     funReference: '',       // creator's proven fun style (from 재미 분석)
+    funReferenceSamples: '', // short quotes from the reference bot (format examples for restyle)
     accent: 'champagne',
     panelPos: null,
     panelWidth: null,        // user-resized width (desktop only)          // {x, y} in px, null = default dock
@@ -35,7 +36,7 @@ const defaultSettings = Object.freeze({
     refMaxChars: 15000,
     evalMessages: 20,
     includeLorebook: true,
-    evalMaxTokens: 8000,
+    evalMaxTokens: 16000,
     testerProfile: '',   // '' = current connection
     evalProfile: '',     // '' = current connection
     autoEvalAfterTest: true,
@@ -44,7 +45,7 @@ const defaultSettings = Object.freeze({
     fanonSearch: true,
     voiceSamples: true,
     voiceUseChat: true,
-    profileMaxTokens: 8000,
+    profileMaxTokens: 16000,
 });
 
 function getSettings() {
@@ -322,10 +323,14 @@ function getProfiles() {
 
 /** Output budget for evaluation JSON (reasoning models spend tokens thinking too). */
 function evalTokens() {
-    return Math.max(Number(getSettings().evalMaxTokens) || 0, 8000);
+    return Math.max(Number(getSettings().evalMaxTokens) || 0, 16000);
 }
 
-async function callLLM({ system, prompt, profileId = '', maxTokens = 600 }) {
+/** Remembers the largest output budget the current API accepted, so later calls skip failing sizes. */
+let tokenCeiling = Infinity;
+const TOKEN_STEPS = [64000, 32000, 16000, 8192, 4096];
+
+async function callLLMOnce({ system, prompt, profileId = '', maxTokens = 600 }) {
     const c = ctx();
     if (profileId) {
         const res = await c.ConnectionManagerRequestService.sendRequest(
@@ -338,6 +343,65 @@ async function callLLM({ system, prompt, profileId = '', maxTokens = 600 }) {
     }
     const out = await c.generateRaw({ systemPrompt: system, prompt, responseLength: maxTokens });
     return String(out ?? '').trim();
+}
+
+/**
+ * Calls the LLM. Big output budgets prevent cut-off results, but some APIs reject budgets above
+ * their model limit — in that case retry with the next smaller budget automatically.
+ */
+async function callLLM({ system, prompt, profileId = '', maxTokens = 600 }) {
+    let budget = Math.min(maxTokens, tokenCeiling);
+    let lastErr = null;
+    for (let i = 0; i < 5; i++) {
+        try {
+            const out = await callLLMOnce({ system, prompt, profileId, maxTokens: budget });
+            if (budget > 4096 && !out) throw new Error('empty response');
+            return out;
+        } catch (e) {
+            lastErr = e;
+            const next = TOKEN_STEPS.find(t => t < budget);
+            if (!next || budget <= 4096) break;
+            console.warn(LOG, `request with max ${budget} tokens failed, retrying with ${next}`, e);
+            budget = next;
+            tokenCeiling = Math.min(tokenCeiling, budget);
+        }
+    }
+    throw lastErr || new Error('AI 요청 실패');
+}
+
+/** True when a JSON answer stopped before its final closing brace. */
+function jsonCutOff(raw) {
+    const t = stripReasoning(String(raw || '')).replace(/```[a-zA-Z]*\s*/g, '');
+    const a = t.indexOf('{');
+    if (a === -1) return false;
+    const { depth, inStr } = jsonOpenDepth(t.slice(a));
+    return depth > 0 || inStr;
+}
+
+/** Appends `more` to `raw`, dropping any text the model repeated from the end of `raw`. */
+function joinContinuation(raw, more) {
+    let m = String(more || '').replace(/^```[a-zA-Z]*\s*/, '');
+    const tail = raw.slice(-400);
+    for (let n = Math.min(tail.length, m.length, 400); n >= 12; n--) {
+        if (tail.endsWith(m.slice(0, n))) { m = m.slice(n); break; }
+    }
+    return raw + m;
+}
+
+/** Asks the model to continue a cut-off answer (up to `times` rounds). */
+async function continueIfCut(raw, { system, prompt, profileId, maxTokens, isCut, label }) {
+    let out = raw;
+    for (let i = 0; i < 2 && isCut(out); i++) {
+        const more = await withTimer(`${label} (이어서 받는 중 ${i + 1})`, callLLM({
+            system: `${system}\n\nYour previous answer was cut off by the length limit. Continue it EXACTLY from the next character. Output ONLY the missing continuation — no repetition, no preamble, no code fences.`,
+            prompt: `${prompt}\n\n[Your previous answer so far — it ends mid-way]\n${out.slice(-8000)}\n\nContinue from the very next character.`,
+            profileId,
+            maxTokens,
+        }));
+        if (!more) break;
+        out = joinContinuation(out, more);
+    }
+    return out;
 }
 
 function stripReasoning(text) {
@@ -815,7 +879,11 @@ function escapeStrayQuotes(t) {
  * to rewrite its own reply as valid JSON. Throws an Error with `.raw` on failure.
  */
 async function requestJson({ system, prompt, profileId = '', maxTokens = 4000, label = '🤖 AI 응답 대기 중…', quietTruncation = false }) {
-    const raw = await withTimer(label, callLLM({ system, prompt, profileId, maxTokens }));
+    let raw = await withTimer(label, callLLM({ system, prompt, profileId, maxTokens }));
+    if (jsonCutOff(raw)) {
+        console.warn(LOG, 'answer was cut off — asking the model to continue');
+        raw = await continueIfCut(raw, { system, prompt, profileId, maxTokens, isCut: jsonCutOff, label });
+    }
     try {
         const data = parseJsonLoose(raw);
         if (data.__truncated && !quietTruncation) toastr.warning('결과가 길어서 끝부분이 잘렸어요. 설정에서 최대 토큰을 늘리면 전부 나와요.');
@@ -837,6 +905,7 @@ async function requestJson({ system, prompt, profileId = '', maxTokens = 4000, l
         throw err;
     }
 }
+
 
 async function runEvaluation({ useChat = true, messages = 0 } = {}) {
     if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
@@ -1146,12 +1215,12 @@ ${doctorPageHtml()}
           ${field('응답 언어', '<input id="bt_language" class="bt-input" type="text">')}
           ${field('최근 메시지 수', '<input id="bt_evalmsgs" class="bt-input bt-num" type="number" min="2" max="200">')}
           ${field('원작 자료 최대 글자', '<input id="bt_refmax" class="bt-input bt-num" type="number" min="1000" max="200000" step="1000">')}
-          ${field('평가 최대 토큰', '<input id="bt_evaltokens" class="bt-input bt-num" type="number" min="500" max="32000" step="100">')}
-          ${field('프로필 최대 토큰', '<input id="bt_proftokens" class="bt-input bt-num" type="number" min="1000" max="32000" step="500">')}
-          ${field('테스트 메시지 최대 토큰', '<input id="bt_testertokens" class="bt-input bt-num" type="number" min="256" max="16000" step="128">')}
+          ${field('평가 최대 토큰', '<input id="bt_evaltokens" class="bt-input bt-num" type="number" min="2000" max="64000" step="500">')}
+          ${field('프로필 최대 토큰', '<input id="bt_proftokens" class="bt-input bt-num" type="number" min="4000" max="64000" step="500">')}
+          ${field('테스트 메시지 최대 토큰', '<input id="bt_testertokens" class="bt-input bt-num" type="number" min="1024" max="16000" step="256">')}
         </div>
         ${field('웹 검색 방식', `<select id="bt_searchengine" class="bt-input">
-            <option value="auto">자동 — DuckDuckGo · Bing + 레딧 (키 불필요)</option>
+            <option value="auto">자동 (키 불필요)</option>
             <option value="serper">Serper (Google, API 키 필요)</option>
             <option value="tavily">Tavily (API 키 필요)</option>
             <option value="serpapi">SerpApi (API 키 필요)</option>
@@ -1517,6 +1586,7 @@ function updateRunState() {
         $id(id)?.classList.toggle('disabled', running);
     }
     document.querySelectorAll('#bt_panel .bt-vset-btn').forEach(b => b.classList.toggle('disabled', running));
+    $id('restyle_run')?.classList.toggle('disabled', running || !restyleSource());
     $id('panel')?.classList.toggle('bt-busy', running);
     if (running) { $id('ab_runb')?.classList.add('disabled'); $id('ab_pin')?.classList.add('disabled'); }
     else { const ch = getCurrentCharacter(); if (ch) loadCharData(ch).then(renderAbPanel); }
@@ -2092,7 +2162,7 @@ async function autofillNames(char, charData) {
         '{"ja":"<Japanese name in original script, e.g. 白布賢二郎>","en":"<official English name>","ko":"<official Korean name>","seriesJa":"<series title in Japanese>","seriesEn":"<series title in English>","seriesKo":"<series title in Korean>"}',
         'If the work is not Japanese, still fill each language with the official/common name. Use "" if unknown.',
     ].filter(Boolean).join('\n\n');
-    const data = await requestJson({ system, prompt, profileId: s.evalProfile, maxTokens: 2000, label: '✨ 캐릭터 이름 확인 중…' });
+    const data = await requestJson({ system, prompt, profileId: s.evalProfile, maxTokens: 4000, label: '✨ 캐릭터 이름 확인 중…' });
     return Object.assign(emptyNames(), data);
 }
 
@@ -2132,7 +2202,7 @@ async function buildVoiceProfile() {
 
         let research = { text: '', sources: [], okCount: 0, total: 0 };
         if (s.fanonSearch) {
-            research = await withTimer('🌐 일·영·한 웹/트위터/레딧 검색 중…', runResearch(charData.names));
+            research = await withTimer('🌐 자료 찾는 중…', runResearch(charData.names));
         }
 
         const versions = Object.keys(VOICE_VERSIONS);
@@ -2169,7 +2239,7 @@ async function buildVoiceProfile() {
 
         let profile;
         try {
-            profile = sanitizeProfile(await requestJsonComplete({ system, prompt, profileId: s.evalProfile, maxTokens: Math.max(Number(s.profileMaxTokens) || 0, 10000), label: '🧠 말투·성격 프로필 정리 중…' }));
+            profile = sanitizeProfile(await requestJsonComplete({ system, prompt, profileId: s.evalProfile, maxTokens: Math.max(Number(s.profileMaxTokens) || 0, 16000), label: '🧠 말투·성격 프로필 정리 중…' }));
         } catch (e) {
             if (!e.raw) throw e;
             throw new Error('프로필 결과 형식이 깨졌어요. 평가용 연결을 더 큰 모델로 바꿔보세요.');
@@ -2182,7 +2252,7 @@ async function buildVoiceProfile() {
         };
         await saveCharData(char, charData);
         renderVoiceProfile(charData.voiceProfile);
-        setStatus(`✅ 프로필 완성 (웹 검색 성공 ${charData.voiceProfile.searchStat})`);
+        setStatus('✅ 말투·성격 프로필 완성');
         toastr.success('말투·성격 프로필을 만들었어요');
     } catch (e) {
         console.error(LOG, e);
@@ -2572,7 +2642,7 @@ function voicePageHtml() {
           </div>
         </details>
         <div class="bt-switches">
-          ${toggle('fanonsearch', '웹 검색으로 자료 보강', '일·영·한 위키와 대사, X(트위터)·레딧 2차 캐해')}
+          ${toggle('fanonsearch', '웹 검색으로 자료 보강')}
           ${toggle('vsamples', '언어별 샘플 대사 생성', '봇이 직접 답해요. 채팅에는 남지 않아요.')}
           ${toggle('vchat', '현재 채팅의 봇 대사도 검사')}
         </div>
@@ -2631,7 +2701,7 @@ function renderVoiceProfile(vp) {
         return;
     }
     const p = sanitizeProfile(structuredClone(vp.profile));
-    if (meta) meta.textContent = `${new Date(vp.time).toLocaleString()} · 웹 검색 ${vp.searchStat}`;
+    if (meta) meta.textContent = new Date(vp.time).toLocaleString();
 
     const speech = Object.entries(p.speech || {}).filter(([, sp]) => sp).map(([k, sp]) => `
         <article class="bt-vcard">
@@ -2670,7 +2740,7 @@ function renderVoiceProfile(vp) {
             ${f.divergence_from_canon?.length ? `<dl class="bt-dl bt-dl-wide"><dt>원작과 차이</dt><dd>${renderList(f.divergence_from_canon)}</dd></dl>` : ''}
         </article>
         ${p.notes ? `<p class="bt-note">${ico('circle-info')} ${escapeHtml(p.notes)}</p>` : ''}
-        ${vp.sources?.length ? `<details class="bt-disclosure bt-disclosure-sm"><summary><span>참고한 검색 결과 ${vp.sources.length}개</span>${ico('chevron-down')}</summary><ul class="bt-list bt-sources">${vp.sources.map(u => `<li><a href="${escapeHtml(u)}" target="_blank" rel="noopener noreferrer">${escapeHtml(u)}</a></li>`).join('')}</ul></details>` : ''}`;
+`;
 }
 
 let currentVoiceSet = 'ja_ko';
@@ -3234,6 +3304,7 @@ function doctorPageHtml() {
         <p class="bt-note">토큰 수는 지금 연결된 모델의 토크나이저 기준이에요. GPT·Claude·Gemini끼리는 ±10~20% 정도 차이 나요.</p>
       </section>
       <div id="bt_doc_fun" class="bt-result"></div>
+${restyleCardHtml()}
       <div id="bt_doc_local_view" class="bt-result"></div>
       <div id="bt_doc_card" class="bt-result"></div>
       <div id="bt_doc_chat" class="bt-result"></div>
@@ -3741,6 +3812,13 @@ function renderAbCompare(data) {
 
 // ---------------------------------------------------------------------------
 // Token diet (토큰 다이어트): compress card fields / lorebook entries / reference text
+//
+// Based on how SillyTavern builds the prompt:
+//  - Description / Personality / Scenario / Character Note / prompt overrides are sent EVERY turn
+//    (permanent tokens) → the real cost. Cutting them gives the chat more memory.
+//  - First message is sent once; example dialogue gets pushed out as the chat grows → cheap.
+//  - Keyword lorebook entries only cost tokens when their keyword shows up → moving situational
+//    details there keeps them available without paying for them every turn.
 // ---------------------------------------------------------------------------
 
 const DIET_FIELD_MAP = {
@@ -3748,11 +3826,38 @@ const DIET_FIELD_MAP = {
     system: 'system_prompt', jailbreak: 'post_history', charDepthPrompt: 'char_note', firstMessage: 'first_mes',
 };
 
-const DIET_LEVELS = {
-    light: { label: '가볍게 (약 20~30% 줄임)', ratio: 0.75, rule: 'Remove only obvious redundancy, filler words and repeated info. Keep the writing style.' },
-    normal: { label: '보통 (약 40~50% 줄임)', ratio: 0.55, rule: 'Merge repeated info, cut flowery prose, turn long explanations into short declarative sentences or compact "Trait: value" lines.' },
-    strong: { label: '강하게 (약 60~70% 줄임)', ratio: 0.35, rule: 'Keep only what changes how the character talks and acts. Use very compact lines (e.g. "Speech: …", "Likes: …"). Drop background that never affects roleplay.' },
+/** How often each part is actually sent to the model. */
+const DIET_COST = {
+    perm: { label: '매번 전송', desc: '모든 답장마다 들어가요' },
+    once: { label: '처음 한 번', desc: '채팅 시작에만 쓰여요' },
+    fade: { label: '길어지면 빠짐', desc: '채팅이 길어지면 밀려나요' },
+    lorec: { label: '상시 로어북', desc: '매번 들어가요' },
+    lorek: { label: '키워드 때만', desc: '키워드가 나올 때만 들어가요' },
 };
+const SPLITTABLE_FIELDS = ['description', 'personality', 'scenario', 'char_note'];
+
+const DIET_LEVELS = {
+    light: { label: '가볍게 (20~30%)', ratio: 0.75, rule: 'Remove only obvious redundancy, filler words, decorative separators and repeated info. Keep the writing style.' },
+    normal: { label: '보통 (40~50%)', ratio: 0.55, rule: 'Merge repeated info, cut flowery filler, turn flat facts (appearance, likes, background) into compact lines. Keep behaviour cues as sentences.' },
+    strong: { label: '강하게 (60~70%)', ratio: 0.35, rule: 'Keep only what changes how the character talks and acts. Flat facts become one compact trait line each. Drop background that never shows up in a scene.' },
+};
+
+const DIET_MODES = {
+    compress: { label: '압축', desc: '같은 칸 안에서 짧게 정리해요' },
+    split: { label: '로어북으로 나누기', desc: '핵심만 남기고 상황별 설정은 키워드 로어북으로 옮겨요' },
+};
+
+/** Research-based principles shared by every diet prompt. */
+const DIET_PRINCIPLES = [
+    'TOKEN-SAVING PRINCIPLES (from SillyTavern card-writing practice):',
+    '- The test for every sentence: does it change how the character responds in a scene? If never, it costs tokens for nothing — cut it.',
+    '- Say each fact ONCE. If the same trait appears in two places (or in another field shown as context), keep the stronger one.',
+    '- Flat facts (appearance, age, height, likes/dislikes, job, family) compress well into short "Label: a, b, c" lines. Behaviour, voice and directorial cues do NOT — keep those as short, vivid sentences.',
+    '- Remove decorative separators (═══, ★☆, ---, emoji dividers), repeated headers, markdown fluff and meta commentary to the reader.',
+    '- Personality is conveyed best by what the character does and says, not by adjective piles: keep one concrete behaviour over five synonyms.',
+    '- Example dialogue: 2-3 strong, distinct examples beat many similar ones. Drop the weakest or most repetitive examples; keep kept lines verbatim.',
+    '- Situational details (a location, an event, a side character, an item) do not need to be in every turn — they belong in keyword lorebook entries.',
+].join('\n');
 
 function rawCardValue(char, applyKey) {
     const fromEditor = readField(applyKey);
@@ -3765,6 +3870,12 @@ function rawCardValue(char, applyKey) {
     }[applyKey] ?? '');
 }
 
+function fieldCost(key) {
+    if (key === 'first_mes') return 'once';
+    if (key === 'mes_example') return 'fade';
+    return 'perm';
+}
+
 /** Everything that can be compressed, with raw text and token counts. */
 async function dietTargets(char) {
     const out = [];
@@ -3772,7 +3883,7 @@ async function dietTargets(char) {
         const key = DIET_FIELD_MAP[docKey];
         const text = rawCardValue(char, key);
         if (!text.trim()) continue;
-        out.push({ id: `f:${key}`, kind: 'field', field: key, label, text, tokens: await countTokens(text) });
+        out.push({ id: `f:${key}`, kind: 'field', field: key, label, text, tokens: await countTokens(text), cost: fieldCost(key) });
     }
     const worldName = char?.data?.extensions?.world;
     if (worldName && typeof ctx().loadWorldInfo === 'function') {
@@ -3782,8 +3893,9 @@ async function dietTargets(char) {
                 if (e.disable || !String(e.content || '').trim()) continue;
                 out.push({
                     id: `l:${e.uid}`, kind: 'lore', world: worldName, uid: e.uid,
-                    label: `로어북: ${e.comment || (e.key || []).slice(0, 3).join(', ') || `#${e.uid}`}${e.constant ? ' (상시)' : ''}`,
+                    label: `로어북: ${e.comment || (e.key || []).slice(0, 3).join(', ') || `#${e.uid}`}`,
                     text: String(e.content), tokens: await countTokens(String(e.content)), constant: !!e.constant,
+                    cost: e.constant ? 'lorec' : 'lorek',
                 });
             }
         } catch (err) { console.warn(LOG, 'diet lore load failed', err); }
@@ -3791,39 +3903,88 @@ async function dietTargets(char) {
     return out;
 }
 
-function parseDietOutput(raw) {
-    const t = stripReasoning(String(raw || ''));
-    const pick = (tag) => { const m = t.match(new RegExp(`<${tag}>([\\s\\S]*?)(?:</${tag}>|$)`, 'i')); return m ? m[1].trim() : ''; };
-    let compressed = pick('compressed');
-    const removed = pick('removed').split('\n').map(x => x.replace(/^[\s\-*•·]+/, '').trim()).filter(Boolean);
-    const funRisk = pick('fun_risk').split('\n').map(x => x.replace(/^[\s\-*•·]+/, '').trim()).filter(x => x && !/^(없음|none|n\/a)$/i.test(x));
-    if (!compressed) compressed = t.replace(/<\/?(?:removed|notes|fun_risk)>[\s\S]*$/i, '').trim();
-    return { compressed, removed, funRisk };
+function pickTag(text, tag) {
+    const m = String(text).match(new RegExp(`<${tag}>([\\s\\S]*?)(?:</${tag}>|$)`, 'i'));
+    return m ? m[1].trim() : '';
 }
 
-async function compressText({ text, label, kind, level, keepExamples, positive, isReference = false, protectFun = true, charData = null }) {
+function tagLines(text, tag) {
+    return pickTag(text, tag).split('\n').map(x => x.replace(/^[\s\-*•·]+/, '').trim()).filter(x => x && !/^(없음|none|n\/a|-)$/i.test(x));
+}
+
+/** True when the model opened `<tag>` but never closed it (answer was cut off). */
+function tagCutOff(tag) {
+    return (raw) => {
+        const t = stripReasoning(String(raw || ''));
+        return new RegExp(`<${tag}>`, 'i').test(t) && !new RegExp(`</${tag}>`, 'i').test(t);
+    };
+}
+
+/** Calls the model for a tagged (non-JSON) answer, continuing it if it was cut off. */
+async function requestTagged({ system, prompt, maxTokens, lastTag, isCut: cutFn, label }) {
     const s = getSettings();
+    const budget = Math.max(4000, maxTokens);
+    let raw = await callLLM({ system, prompt, profileId: s.evalProfile, maxTokens: budget });
+    const isCut = cutFn || tagCutOff(lastTag);
+    if (isCut(raw)) raw = await continueIfCut(raw, { system, prompt, profileId: s.evalProfile, maxTokens: budget, isCut, label });
+    return stripReasoning(raw);
+}
+
+function parseDietOutput(raw) {
+    const t = stripReasoning(String(raw || ''));
+    let compressed = pickTag(t, 'compressed');
+    if (!compressed) compressed = t.replace(/<\/?(?:removed|notes|fun_risk)>[\s\S]*$/i, '').trim();
+    return { compressed, removed: tagLines(t, 'removed'), funRisk: tagLines(t, 'fun_risk') };
+}
+
+/** Split answers are cut if the core never closed, or the lore block opened but never closed. */
+function splitCutOff(raw) {
+    const t = stripReasoning(String(raw || ''));
+    if (/<core>/i.test(t) && !/<\/core>/i.test(t)) return true;
+    return /<lore>/i.test(t) && !/<\/lore>/i.test(t);
+}
+
+function parseLoreEntries(text) {
+    const block = pickTag(text, 'lore');
+    const out = [];
+    for (const m of block.matchAll(/<entry>([\s\S]*?)(?:<\/entry>|$)/gi)) {
+        const e = m[1];
+        const name = pickTag(e, 'name');
+        const keys = pickTag(e, 'keys').split(/[,，、\n]/).map(x => x.trim()).filter(Boolean).slice(0, 8);
+        const content = pickTag(e, 'content');
+        if (content && keys.length) out.push({ name: name || keys[0], keys, content });
+    }
+    return out;
+}
+
+function funProtectRules(charData) {
+    return [
+        '- PROTECT (never remove or water down, even if it costs tokens): directorial narration cues (how to show a trait on the page), state-change beats, escalation tiers with their triggers and cooldown, per-language speech mechanics and sample lines, prohibitions that name a replacement behavior, nickname/suffix systems, running gags and anecdotes, signature lines, subtext tells, scene hooks.',
+        '- Cut ONLY: exact repetition, facts stated twice, trivia that never affects a scene, filler words, decorative formatting, over-long transitions.',
+        '- If reaching the target length would require cutting protected material, stop above the target instead.',
+        funGuard(charData),
+    ].join('\n');
+}
+
+async function compressText({ text, label, kind, level, keepExamples, positive, isReference = false, protectFun = true, charData = null, context = '' }) {
     const L = DIET_LEVELS[level] || DIET_LEVELS.normal;
     const inTok = await countTokens(text);
     const target = Math.max(40, Math.round(inTok * L.ratio));
     const system = [
         isReference
             ? 'You condense wiki/reference material about a fictional character into a compact reference used to judge roleplay accuracy.'
-            : 'You compress SillyTavern character card text to save tokens while keeping everything that matters for roleplay.',
+            : 'You compress SillyTavern character card text to save tokens while keeping roleplay quality exactly as good.',
         `Target length: about ${target} tokens (original ≈ ${inTok}). ${L.rule}`,
+        isReference ? '' : DIET_PRINCIPLES,
         'Rules:',
         '- Keep the SAME language as the original. Do not translate.',
         '- Keep every macro exactly as written ({{char}}, {{user}}, <START>, etc.).',
         '- Keep names, speech style, first-person pronoun, dialect, catchphrases, relationships, key backstory and anything that changes behaviour.',
         keepExamples ? '- Keep quoted lines / example dialogue VERBATIM (you may drop some examples, but never rewrite a kept line).' : '- You may shorten example lines, but keep the character\'s voice.',
         positive ? '- Rewrite only VAGUE prohibitions ("don\'t be OOC", "never be boring") as positive statements. Keep specific prohibitions that name a replacement behavior or define the character exactly as they are.' : '- Keep prohibitions as they are.',
+        kind === 'lore' ? '- This is a lorebook entry: keep it about ONE topic, name its subject explicitly so it makes sense on its own, and keep it concise.' : '',
         isReference ? '- Focus on personality, speech, values, relationships, likes/dislikes and major events. Drop trivia (voice actors, merchandise, release dates, popularity polls).' : '- Do not invent anything new.',
-        (!isReference && protectFun) ? [
-            '- PROTECT (never remove or water down, even if it costs tokens): directorial narration cues (how to show a trait on the page), state-change beats, escalation tiers with their triggers and cooldown, per-language speech mechanics and sample lines, prohibitions that name a replacement behavior, nickname/suffix systems, running gags and anecdotes, signature lines, subtext tells, scene hooks.',
-            '- Cut ONLY: exact repetition, facts stated twice, wiki trivia that never affects a scene, filler words, over-long transitions.',
-            '- If reaching the target length would require cutting protected material, stop above the target instead.',
-            funGuard(charData),
-        ].join('\n') : '',
+        (!isReference && protectFun) ? funProtectRules(charData) : '',
         NO_SHIP_RULE,
         'Output format (no markdown fences):',
         '<compressed>',
@@ -3836,16 +3997,68 @@ async function compressText({ text, label, kind, level, keepExamples, positive, 
         '- one line per flavor/fun element that became weaker, in 한국어 (leave empty if none)',
         '</fun_risk>',
     ].filter(Boolean).join('\n');
-    const prompt = `[${label}]\n${text}`;
-    const raw = await callLLM({ system, prompt, profileId: s.evalProfile, maxTokens: Math.max(1500, Math.round(inTok * 1.3) + 600) });
+    const prompt = [
+        context ? `[Other parts of this card — context for spotting duplicates only, do NOT output them]\n${truncate(context, 6000)}` : '',
+        `[${label} — compress this]\n${text}`,
+    ].filter(Boolean).join('\n\n');
+    const raw = await requestTagged({ system, prompt, maxTokens: Math.round(inTok * 2) + 2500, lastTag: 'compressed', label: `✂️ ${label}` });
     const out = parseDietOutput(raw);
     if (!out.compressed) throw new Error('요약 결과가 비어 있어요');
-    return { ...out, before: inTok, after: await countTokens(out.compressed) };
+    return { ...out, mode: 'compress', before: inTok, after: await countTokens(out.compressed) };
+}
+
+/** Keeps the always-sent core in the field and moves situational details into keyword lorebook entries. */
+async function splitToLore({ text, label, level, keepExamples, protectFun = true, charData = null, context = '' }) {
+    const L = DIET_LEVELS[level] || DIET_LEVELS.normal;
+    const inTok = await countTokens(text);
+    const target = Math.max(60, Math.round(inTok * L.ratio));
+    const system = [
+        'You reorganize a SillyTavern character card field to save PERMANENT tokens without losing any roleplay quality.',
+        'The field below is sent to the model every single turn. Split it into:',
+        '1) CORE — stays in the field: who the character is, how they talk (voice mechanics, pronouns, dialect, catchphrases), how they act, how they treat {{user}}, the fun engines. Everything needed in almost every scene.',
+        '2) LORE ENTRIES — situational details needed only when a topic comes up: specific places, past events, side characters, items, organizations, hobbies in detail, abilities in detail. Each entry = one topic, with 2-6 trigger keywords people would actually type in chat (names, nicknames, in both the card language and common alternative spellings), and content written so it makes sense on its own (name the subject).',
+        `Target CORE length: about ${target} tokens (original ≈ ${inTok}). ${L.rule}`,
+        DIET_PRINCIPLES,
+        'Rules:',
+        '- Keep the SAME language as the original. Keep every macro exactly ({{char}}, {{user}}).',
+        '- Nothing may be lost: every fact is either in CORE or in a lore entry (or listed in <removed> as a true duplicate).',
+        '- Never move voice, personality core, relationship to {{user}}, or fun mechanics into lore — those must stay in CORE.',
+        keepExamples ? '- Keep quoted lines verbatim.' : '',
+        '- 0-6 entries. If nothing is situational, output an empty <lore></lore> and only tighten CORE.',
+        protectFun ? funProtectRules(charData) : '',
+        NO_SHIP_RULE,
+        'Output format (no markdown fences):',
+        '<core>',
+        'the text that stays in the field',
+        '</core>',
+        '<lore>',
+        '<entry><name>short title</name><keys>keyword1, keyword2</keys><content>entry text</content></entry>',
+        '</lore>',
+        '<removed>',
+        '- one line per duplicate you dropped (in 한국어)',
+        '</removed>',
+        '<fun_risk>',
+        '- one line per fun element that might become weaker, in 한국어 (leave empty if none)',
+        '</fun_risk>',
+    ].filter(Boolean).join('\n');
+    const prompt = [
+        context ? `[Other parts of this card — context only, do NOT output them]\n${truncate(context, 6000)}` : '',
+        `[${label} — split this]\n${text}`,
+    ].filter(Boolean).join('\n\n');
+    const raw = await requestTagged({ system, prompt, maxTokens: Math.round(inTok * 2.4) + 3000, isCut: splitCutOff, label: `🗂️ ${label}` });
+    const core = pickTag(raw, 'core');
+    if (!core) throw new Error('나누기 결과가 비어 있어요');
+    const lore = parseLoreEntries(raw);
+    for (const e of lore) e.tokens = await countTokens(e.content);
+    return {
+        mode: 'split', compressed: core, lore, removed: tagLines(raw, 'removed'), funRisk: tagLines(raw, 'fun_risk'),
+        before: inTok, after: await countTokens(core),
+    };
 }
 
 // --- replace-apply with backup ---
 
-async function applyReplace(item, newText) {
+async function applyReplace(item, newText, { tag = '요약', note = '' } = {}) {
     const char = getCurrentCharacter();
     if (!char) return;
     const c = ctx();
@@ -3856,7 +4069,8 @@ async function applyReplace(item, newText) {
         wrap.className = 'bt-apply-dialog';
         wrap.innerHTML = `
             <h3>${escapeHtml(item.label)} 바꾸기</h3>
-            <p class="bt-apply-note">지금 내용을 아래 요약본으로 <b>바꿔요</b>. 필요하면 직접 고친 뒤 <b>적용</b>을 누르세요. 원래 내용은 백업돼서 <b>진단 → 적용 기록</b>에서 되돌릴 수 있어요.</p>
+            <p class="bt-apply-note">지금 내용을 아래 <b>${escapeHtml(tag)}본</b>으로 <b>바꿔요</b>. 필요하면 직접 고친 뒤 <b>적용</b>을 누르세요. 원래 내용은 백업돼서 <b>진단 → 적용 기록</b>에서 되돌릴 수 있어요.</p>
+            ${note ? `<p class="bt-apply-reason">${escapeHtml(note)}</p>` : ''}
             <label>새 내용 <textarea class="bt-apply-text" rows="16"></textarea></label>`;
         wrap.querySelector('textarea').value = newText;
         const res = await c.callGenericPopup(wrap, c.POPUP_TYPE.CONFIRM, '', { okButton: '적용', cancelButton: '취소', wide: true, allowVerticalScrolling: true });
@@ -3872,14 +4086,14 @@ async function applyReplace(item, newText) {
             e.content = text;
             await c.saveWorldInfo(item.world, data, true);
             try { c.reloadWorldInfoEditor?.(item.world, true); } catch { /* optional */ }
-            await logApply(char, { kind: 'lore-edit', label: `${item.label} (요약)`, world: item.world, uid: item.uid, before, after: text });
+            await logApply(char, { kind: 'lore-edit', label: `${item.label} (${tag})`, world: item.world, uid: item.uid, before, after: text });
         } else {
             const before = readField(item.field);
             if (before === null) throw new Error('캐릭터 편집 칸을 찾지 못했어요. 캐릭터 편집 화면을 한 번 열었다가 다시 시도해 주세요.');
             writeField(item.field, text);
-            await logApply(char, { kind: 'field', field: item.field, label: `${item.label} (요약)`, before, after: text });
+            await logApply(char, { kind: 'field', field: item.field, label: `${item.label} (${tag})`, before, after: text });
         }
-        toastr.success(`${item.label}을(를) 요약본으로 바꿨어요 (원본 백업됨)`);
+        toastr.success(`${item.label}을(를) ${tag}본으로 바꿨어요 (원본 백업됨)`);
         return true;
     } catch (e) {
         toastr.error(`적용 실패: ${e.message}`);
@@ -3887,25 +4101,67 @@ async function applyReplace(item, newText) {
     }
 }
 
+/** Split apply: core → field (backup), each entry → new keyword lorebook entry (undoable). */
+async function applySplit(item, r) {
+    const char = getCurrentCharacter();
+    if (!char) return false;
+    const worldName = char?.data?.extensions?.world || '';
+    if (r.lore.length && !worldName) {
+        toastr.warning('이 캐릭터에 연결된 로어북이 없어요. 캐릭터 편집 화면의 🌐 버튼으로 로어북을 연결한 뒤 다시 적용하세요.');
+        return false;
+    }
+    const note = r.lore.length ? `적용하면 “${worldName}” 로어북에 키워드 항목 ${r.lore.length}개가 새로 생겨요. 적용 기록에서 하나씩 되돌릴 수 있어요.` : '';
+    const ok = await applyReplace(item, r.compressed, { tag: '핵심', note });
+    if (!ok) return false;
+    let added = 0;
+    for (const e of r.lore) {
+        try {
+            const uid = await addLoreEntry(worldName, { comment: e.name, keys: e.keys, content: e.content });
+            await logApply(char, { kind: 'lore', label: `로어북: ${e.name} (나누기)`, world: worldName, uid, after: e.content });
+            added++;
+        } catch (err) { toastr.error(`로어북 항목 추가 실패: ${err.message}`); }
+    }
+    if (added) toastr.success(`키워드 로어북 항목 ${added}개를 추가했어요`);
+    return true;
+}
+
 // --- UI ---
 
 let dietCache = [];      // current targets
 let dietResults = {};    // id -> result
 
+function dietTipsHtml() {
+    const tips = [
+        ['매번 들어가는 칸부터', 'Description·Personality·Scenario·Character Note는 답장마다 전부 다시 들어가요. 여기가 길수록 AI가 기억하는 채팅 길이가 줄어요. 첫 메시지는 한 번만, 예시 대사는 채팅이 길어지면 밀려나서 부담이 작아요.'],
+        ['장면을 바꾸지 않는 문장은 뺄 것', '이 문장이 없어도 캐릭터 답장이 똑같다면 토큰만 쓰는 문장이에요. 키·생일·설정 잡지식이 대표적이에요.'],
+        ['한 번만 말하기', '같은 성격을 Description과 Personality에 두 번 쓰지 않아도 돼요. 더 생생한 쪽 하나만 남겨요.'],
+        ['사실은 짧게, 연출은 문장으로', '외모·좋아하는 것 같은 단순 사실은 "좋아하는 것: A, B" 한 줄이면 충분해요. 말투·행동·연출 지시는 문장으로 남겨야 롤플이 살아요.'],
+        ['상황별 설정은 로어북으로', '특정 장소·사건·주변 인물·아이템은 키워드가 나올 때만 들어가게 로어북으로 옮기면 필요할 때만 토큰을 써요.'],
+        ['예시 대사는 2~3개면 충분', '비슷한 예시 여러 개보다, 서로 다른 모습을 보여주는 좋은 예시 2~3개가 성격 전달에 더 효과적이에요.'],
+        ['장식은 빼기', '═══, ★, 이모지 구분선, 반복되는 제목은 AI에게 의미 없이 토큰만 써요.'],
+    ];
+    return `<details class="bt-disclosure bt-disclosure-sm bt-diet-tips"><summary><span>${ico('lightbulb')} 롤플 품질 지키면서 줄이는 요령</span>${ico('chevron-down')}</summary>
+        <ol class="bt-diet-tiplist">${tips.map(([t, d]) => `<li><b>${t}</b><span>${d}</span></li>`).join('')}</ol></details>`;
+}
+
 function dietCardHtml() {
     return `
       <section class="bt-card" id="bt_diet_card">
-        ${cardHead('Token diet', '토큰 다이어트', '카드와 로어북을 캐릭터성은 살리고 길이만 줄여요. 줄인 결과와 빠진 내용을 확인한 뒤 원하는 것만 적용하세요.')}
+        ${cardHead('Token diet', '토큰 다이어트', '매번 들어가는 토큰부터 줄여서 채팅 기억을 늘려요. 캐릭터성과 재미는 그대로 두고, 결과를 확인한 뒤 원하는 것만 적용하세요.')}
+        <div class="bt-diet-perm" id="bt_diet_perm"></div>
         <div class="bt-diet-list" id="bt_diet_list"><p class="bt-note">불러오는 중…</p></div>
         <div class="bt-grid2">
+          ${field('방식', `<select id="bt_diet_mode" class="bt-input">${Object.entries(DIET_MODES).map(([k, v]) => `<option value="${k}">${v.label}</option>`).join('')}</select>`)}
           ${field('줄이는 정도', `<select id="bt_diet_level" class="bt-input">${Object.entries(DIET_LEVELS).map(([k, v]) => `<option value="${k}">${v.label}</option>`).join('')}</select>`)}
-          <div class="bt-field bt-diet-sum"><span class="bt-field-label">선택한 항목</span><b id="bt_diet_sum">0 토큰</b></div>
         </div>
+        <p class="bt-note" id="bt_diet_modenote"></p>
+        <div class="bt-field bt-diet-sum"><span class="bt-field-label">선택한 항목</span><b id="bt_diet_sum">0 토큰</b></div>
         <div class="bt-switches">
           ${toggle('diet_protect', '재미 요소 보호 (추천)', '연출 지시·모드 전환·트리거·개그·별명 규칙·샘플 대사는 줄이지 않아요')}
           ${toggle('diet_keepex', '대사는 그대로 두기', '예시 대사·인용 대사는 문장을 바꾸지 않고 개수만 줄여요')}
           ${toggle('diet_positive', '막연한 금지문만 긍정문으로', '대체 행동이 붙은 구체적인 금지문은 그대로 둬요')}
         </div>
+        ${dietTipsHtml()}
         <div class="bt-actions">
           <button type="button" id="bt_diet_run" class="bt-btn bt-btn-primary bt-btn-wide">${ico('scissors')}<span>선택한 항목 줄이기</span></button>
         </div>
@@ -3920,24 +4176,54 @@ function updateDietSum() {
     if (el) el.textContent = `${ids.length}개 · ${sum.toLocaleString()} 토큰`;
 }
 
+function updateDietModeNote() {
+    const mode = $id('diet_mode')?.value || 'compress';
+    const el = $id('diet_modenote');
+    if (!el) return;
+    const world = getCurrentCharacter()?.data?.extensions?.world;
+    el.textContent = mode === 'split'
+        ? `${DIET_MODES.split.desc}. Description·Personality·Scenario·Character Note에만 쓰여요 (다른 칸은 압축). ${world ? `적용하면 “${world}” 로어북에 항목이 생겨요.` : '⚠️ 연결된 로어북이 없어서 적용하려면 먼저 로어북을 연결해야 해요.'}`
+        : `${DIET_MODES.compress.desc}.`;
+}
+
+function isDefaultDietPick(t) {
+    if (t.cost === 'perm') return t.tokens >= 300;
+    if (t.cost === 'lorec') return t.tokens >= 200;
+    return false; // first message / examples / keyword lore are cheap — opt in manually
+}
+
 async function refreshDietList() {
     const list = $id('diet_list');
     const char = getCurrentCharacter();
     if (!list) return;
     if (!char) { list.innerHTML = '<p class="bt-note">캐릭터 채팅을 열어주세요.</p>'; return; }
     dietCache = await dietTargets(char);
+    const permEl = $id('diet_perm');
+    const permTok = dietCache.filter(t => t.cost === 'perm' || t.cost === 'lorec').reduce((a, t) => a + t.tokens, 0);
+    if (permEl) {
+        const lvl = permTok <= 1200 ? ['good', '가벼워요'] : permTok <= 2500 ? ['ok', '보통이에요'] : ['warn', '무거운 편이에요'];
+        permEl.innerHTML = dietCache.length ? `
+            <div class="bt-diet-permbox bt-diet-perm-${lvl[0]}">
+                <span class="bt-eyebrow">매번 들어가는 토큰</span>
+                <b>${permTok.toLocaleString()}</b>
+                <small>${lvl[1]} · 답장마다 이만큼이 채팅 기억 대신 쓰여요</small>
+            </div>` : '';
+    }
     if (!dietCache.length) { list.innerHTML = '<p class="bt-note">줄일 내용이 없어요.</p>'; return; }
+    const order = { perm: 0, lorec: 1, once: 2, fade: 3, lorek: 4 };
+    const sorted = [...dietCache].sort((a, b) => (order[a.cost] - order[b.cost]) || (b.tokens - a.tokens));
     const max = Math.max(...dietCache.map(t => t.tokens), 1);
-    list.innerHTML = dietCache.map(t => `
+    list.innerHTML = sorted.map(t => `
         <label class="bt-diet-row">
-            <input type="checkbox" class="bt-diet-check" value="${escapeHtml(t.id)}" ${t.tokens >= 300 && t.field !== 'mes_example' ? 'checked' : ''}>
+            <input type="checkbox" class="bt-diet-check" value="${escapeHtml(t.id)}" ${isDefaultDietPick(t) ? 'checked' : ''}>
             <span class="bt-checkmark" aria-hidden="true">${ico('check')}</span>
-            <span class="bt-diet-label">${escapeHtml(t.label)}</span>
+            <span class="bt-diet-label"><b>${escapeHtml(t.label)}</b><small class="bt-diet-kind bt-diet-kind-${t.cost}" title="${escapeHtml(DIET_COST[t.cost].desc)}">${DIET_COST[t.cost].label}</small></span>
             <span class="bt-tokrow-bar"><i style="width:${Math.max(2, t.tokens / max * 100)}%"></i></span>
             <span class="bt-tokrow-n">${t.tokens.toLocaleString()}</span>
         </label>`).join('');
     list.querySelectorAll('.bt-diet-check').forEach(cb => cb.addEventListener('change', updateDietSum));
     updateDietSum();
+    updateDietModeNote();
 }
 
 function renderDietResults() {
@@ -3957,25 +4243,37 @@ function renderDietResults() {
             const r = dietResults[t.id];
             if (r.error) return `<section class="bt-card bt-card-warn">${cardHead('', escapeHtml(t.label), `실패: ${escapeHtml(r.error)}`)}</section>`;
             const p = r.before ? Math.round((1 - r.after / r.before) * 100) : 0;
+            const lore = r.mode === 'split' && r.lore?.length ? `
+                <div class="bt-diet-lore">
+                    <span>${ico('book')} 키워드 로어북으로 옮길 항목 ${r.lore.length}개 <small>키워드가 나올 때만 들어가요</small></span>
+                    ${r.lore.map(e => `<details class="bt-disclosure bt-disclosure-sm"><summary><span><b>${escapeHtml(e.name)}</b> <small class="bt-muted">${escapeHtml(e.keys.join(', '))} · ${e.tokens ?? ''} 토큰</small></span>${ico('chevron-down')}</summary><pre class="bt-paste">${escapeHtml(e.content)}</pre></details>`).join('')}
+                </div>` : '';
             return `<section class="bt-card">
-                <div class="bt-diet-head"><h4>${escapeHtml(t.label)}</h4><span class="bt-diet-tok">${r.before.toLocaleString()} → <b>${r.after.toLocaleString()}</b> <span class="bt-delta ${p > 0 ? 'up' : 'down'}">−${p}%</span></span></div>
+                <div class="bt-diet-head"><h4>${escapeHtml(t.label)}${r.mode === 'split' ? ' <small class="bt-muted">· 나누기</small>' : ''}</h4><span class="bt-diet-tok">${r.before.toLocaleString()} → <b>${r.after.toLocaleString()}</b> <span class="bt-delta ${p > 0 ? 'up' : 'down'}">−${p}%</span></span></div>
                 ${r.funRisk?.length ? `<div class="bt-diet-removed bt-diet-funrisk"><span>${ico('masks-theater')} 재미가 줄어들 수 있는 부분</span>${renderList(r.funRisk)}</div>` : ''}
                 ${r.removed?.length ? `<div class="bt-diet-removed"><span>빠지거나 합쳐진 내용</span>${renderList(r.removed)}</div>` : ''}
                 <details class="bt-disclosure bt-disclosure-sm"><summary><span>원래 내용 보기</span>${ico('chevron-down')}</summary><pre class="bt-paste">${escapeHtml(r.original ?? t.text)}</pre></details>
+                ${r.mode === 'split' ? '<div class="bt-diet-sub">칸에 남는 핵심</div>' : ''}
                 <pre class="bt-paste bt-diet-out">${escapeHtml(r.compressed)}</pre>
+                ${lore}
                 <div class="bt-actions bt-actions-end">
                     <button type="button" class="bt-btn bt-btn-sm bt-diet-copy" data-id="${escapeHtml(t.id)}">${ico('copy')}<span>복사</span></button>
                     ${t.kind === 'lore' || t.field ? `<button type="button" class="bt-btn bt-btn-sm bt-btn-primary bt-diet-apply" data-id="${escapeHtml(t.id)}">${ico('file-import')}<span>적용</span></button>` : ''}
                 </div>
             </section>`;
         }).join('')}`;
-    el.querySelectorAll('.bt-diet-copy').forEach(b => b.addEventListener('click', () => copyText(dietResults[b.dataset.id]?.compressed || '')));
+    el.querySelectorAll('.bt-diet-copy').forEach(b => b.addEventListener('click', () => {
+        const r = dietResults[b.dataset.id];
+        if (!r) return;
+        const extra = r.mode === 'split' && r.lore?.length ? `\n\n${r.lore.map(e => `[로어북: ${e.name} | 키워드: ${e.keys.join(', ')}]\n${e.content}`).join('\n\n')}` : '';
+        copyText((r.compressed || '') + extra);
+    }));
     el.querySelectorAll('.bt-diet-apply').forEach(b => b.addEventListener('click', async () => {
         const r = dietResults[b.dataset.id];
         const t = r?.target;
         if (!t || !r) return;
-        const ok = await applyReplace(t, r.compressed);
-        if (ok) { b.classList.add('disabled'); b.querySelector('span').textContent = '적용됨'; runDoctorLocal(true); }
+        const ok = r.mode === 'split' ? await applySplit(t, r) : await applyReplace(t, r.compressed);
+        if (ok) { b.classList.add('disabled'); b.querySelector('span').textContent = '적용됨'; runDoctorLocal(true); refreshDietList(); }
     }));
 }
 
@@ -3985,10 +4283,14 @@ async function runDiet() {
     const targets = dietCache.filter(t => ids.includes(t.id));
     if (!targets.length) { toastr.warning('줄일 항목을 골라주세요'); return; }
     const level = $id('diet_level').value;
+    const mode = $id('diet_mode').value;
     const keepExamples = $id('diet_keepex').checked;
     const positive = $id('diet_positive').checked;
     const protectFun = $id('diet_protect').checked;
     const dietCharData = await loadCharData(getCurrentCharacter());
+    // other permanent parts as context so duplicates across fields can be merged
+    const contextFor = (t) => dietCache.filter(x => x.id !== t.id && (x.cost === 'perm' || x.cost === 'lorec'))
+        .map(x => `### ${x.label}\n${truncate(x.text, 1500)}`).join('\n\n');
     running = true;
     stopRequested = false;
     updateRunState();
@@ -3996,9 +4298,11 @@ async function runDiet() {
     try {
         for (const [i, t] of targets.entries()) {
             if (stopRequested) break;
+            const split = mode === 'split' && t.kind === 'field' && SPLITTABLE_FIELDS.includes(t.field);
             try {
-                dietResults[t.id] = await withTimer(`✂️ (${i + 1}/${targets.length}) ${t.label} 줄이는 중…`,
-                    compressText({ text: t.text, label: t.label, kind: t.kind, level, keepExamples: keepExamples || t.field === 'mes_example', positive, protectFun, charData: dietCharData }));
+                const common = { text: t.text, label: t.label, level, keepExamples: keepExamples || t.field === 'mes_example', protectFun, charData: dietCharData, context: contextFor(t) };
+                dietResults[t.id] = await withTimer(`${split ? '🗂️' : '✂️'} (${i + 1}/${targets.length}) ${t.label} ${split ? '나누는' : '줄이는'} 중…`,
+                    split ? splitToLore(common) : compressText({ ...common, kind: t.kind, positive }));
                 dietResults[t.id].original = t.text;
                 dietResults[t.id].target = { ...t };
             } catch (e) {
@@ -4008,7 +4312,7 @@ async function runDiet() {
         }
         const done = Object.values(dietResults).filter(r => !r.error);
         const saved = done.reduce((a, r) => a + (r.before - r.after), 0);
-        setStatus(`✅ 토큰 다이어트 완료 — ${saved.toLocaleString()} 토큰 줄일 수 있어요`);
+        setStatus(`✅ 토큰 다이어트 완료 — 매번 ${saved.toLocaleString()} 토큰 줄일 수 있어요`);
         toastr.success(`${saved.toLocaleString()} 토큰을 줄일 수 있어요. 확인 후 적용하세요.`);
         setMinimized(false);
         scrollPanelTo($id('diet_results'));
@@ -4066,9 +4370,187 @@ function bindDietUI() {
     $id('diet_keepex').checked = true;
     $id('diet_positive').checked = true;
     $id('diet_level').value = 'light';
+    $id('diet_mode').value = 'compress';
+    $id('diet_mode').addEventListener('change', updateDietModeNote);
     $id('diet_protect').checked = true;
     $id('ref_diet').addEventListener('click', runReferenceDiet);
     $id('ref_undo').addEventListener('click', undoReferenceDiet);
+    updateDietModeNote();
+    bindRestyleUI();
+}
+
+
+// ---------------------------------------------------------------------------
+// Restyle (기준 스타일로 고치기): rewrite this card in the creator's proven fun style
+// ---------------------------------------------------------------------------
+
+const RESTYLE_FIELDS = [
+    ['description', 'Description'],
+    ['personality', 'Personality'],
+    ['scenario', 'Scenario'],
+    ['first_mes', '첫 메시지'],
+    ['mes_example', '예시 대사'],
+    ['char_note', 'Character Note'],
+];
+
+const RESTYLE_LEVELS = {
+    light: { label: '살짝 — 연출·장치만 더하기', rule: 'Keep the existing structure and nearly all sentences. ADD the missing techniques from the style (directorial cues, visible state beats, replacement behaviors for prohibitions, running bits, a hook) and tighten wording. Length may grow by up to 25%.' },
+    normal: { label: '보통 — 스타일대로 다시 정리', rule: 'Reorganize the text so it follows the style\'s structure and techniques. Rewrite weak parts, keep strong parts. Length should stay within ±30% of the original.' },
+    bold: { label: '과감하게 — 새로 쓰기', rule: 'Rewrite from scratch in the style, using every fact of the original. Structure, order and phrasing may all change. Length within ±40%.' },
+};
+
+let restyleResults = {};
+
+function restyleSource() {
+    const s = getSettings();
+    if (s.funReference) return { kind: 'saved', text: s.funReference, samples: s.funReferenceSamples || '' };
+    return null;
+}
+
+function restyleCardHtml() {
+    return `
+      <section class="bt-card" id="bt_restyle_card">
+        ${cardHead('Restyle', '기준 스타일로 고치기', '재미 분석에서 저장한 기준 스타일대로 이 봇의 카드를 고쳐 써요. 원작 설정·말투·호칭은 이 캐릭터 그대로 두고, 재미를 만드는 형식만 가져와요.')}
+        <div id="bt_restyle_src" class="bt-restyle-src"></div>
+        <div class="bt-restyle-fields" id="bt_restyle_fields">
+          ${RESTYLE_FIELDS.map(([k, label]) => `<label class="bt-fixcheck bt-restyle-pick"><input type="checkbox" value="${k}" ${k === 'description' || k === 'first_mes' ? 'checked' : ''}><span class="bt-checkmark" aria-hidden="true">${ico('check')}</span><span>${label}</span></label>`).join('')}
+        </div>
+        ${field('고치는 정도', `<select id="bt_restyle_level" class="bt-input">${Object.entries(RESTYLE_LEVELS).map(([k, v]) => `<option value="${k}">${v.label}</option>`).join('')}</select>`)}
+        <div class="bt-actions">
+          <button type="button" id="bt_restyle_run" class="bt-btn bt-btn-primary bt-btn-wide">${ico('wand-magic-sparkles')}<span>기준 스타일로 고치기</span></button>
+        </div>
+      </section>
+      <div id="bt_restyle_results" class="bt-result"></div>`;
+}
+
+function renderRestyleSource() {
+    const el = $id('restyle_src');
+    if (!el) return;
+    const src = restyleSource();
+    const btn = $id('restyle_run');
+    if (!src) {
+        el.innerHTML = `<p class="bt-note">${ico('circle-info')} 아직 기준 스타일이 없어요. 재밌게 잘 되는 봇을 열고 <b>재미 분석</b> → <b>기준 스타일로 저장</b>을 먼저 눌러주세요.</p>`;
+        if (btn) btn.classList.add('disabled');
+        return;
+    }
+    if (btn) btn.classList.remove('disabled');
+    const first = src.text.split('\n')[0];
+    el.innerHTML = `<details class="bt-disclosure bt-disclosure-sm"><summary><span>${ico('star')} 기준 스타일 ${escapeHtml(first.startsWith('(') ? first : '')}</span>${ico('chevron-down')}</summary><div class="bt-prose">${prose(src.text.replace(/^\(.*\)\n/, ''), 99)}</div></details>`;
+}
+
+async function restyleText({ key, label, text, level, src, charData, context }) {
+    const L = RESTYLE_LEVELS[level] || RESTYLE_LEVELS.light;
+    const inTok = await countTokens(text);
+    const fieldRule = {
+        first_mes: 'This is the greeting: start in the middle of a small concrete situation with sensory detail, show the character\'s voice and a signature behavior, and end on something {{user}} can react to. Never speak or act for {{user}}.',
+        mes_example: 'These are example dialogues: keep the <START> blocks and {{user}}/{{char}} labels. Each example should show a DIFFERENT side of the character (normal mode, state change, gag, soft moment).',
+        scenario: 'This is the scenario: keep it short and situational.',
+        personality: 'This is the personality summary: behaviours and tells over adjectives.',
+    }[key] || '';
+    const system = [
+        'You are a roleplay-bot editor. Rewrite ONE field of a SillyTavern character card in the creator\'s proven FUN STYLE below.',
+        `[THE CREATOR'S FUN STYLE — rules to follow]\n${truncate(src.text, 2500)}`,
+        src.samples ? `[What those rules look like in the reference bot — FORMAT examples only, never copy their content]\n${truncate(src.samples, 1500)}` : '',
+        FUN_PRINCIPLES,
+        `How much to change: ${L.rule}`,
+        fieldRule,
+        'HARD RULES:',
+        '- This character stays THIS character: keep every canon fact, name, relationship, first-person pronoun, dialect, catchphrase, speech level and way of addressing others exactly as in the original. Borrow only FORMAT and TECHNIQUE from the style — never the reference character\'s personality, lines, habits or setting.',
+        '- Do not invent new canon facts. You may add HOW-TO-SHOW cues, beats, triggers and hooks built from facts already in the card.',
+        '- Keep the SAME language as the original. Keep every macro exactly ({{char}}, {{user}}, <START>).',
+        '- Keep existing fun elements; never flatten vivid prose into dry lists.',
+        funGuard(charData),
+        NO_SHIP_RULE,
+        'Output format (no markdown fences):',
+        '<rewritten>',
+        'the full new text of this field',
+        '</rewritten>',
+        '<changes>',
+        '- one line per change and which style rule it follows (in 한국어)',
+        '</changes>',
+    ].filter(Boolean).join('\n');
+    const prompt = [
+        context ? `[Rest of this card — context only, do NOT output]\n${truncate(context, 6000)}` : '',
+        `[${label} — rewrite this]\n${text}`,
+    ].filter(Boolean).join('\n\n');
+    const raw = await requestTagged({ system, prompt, maxTokens: Math.round(inTok * 3) + 3000, lastTag: 'rewritten', label: `🪄 ${label}` });
+    const rewritten = pickTag(raw, 'rewritten');
+    if (!rewritten) throw new Error('고친 결과가 비어 있어요');
+    return { rewritten, changes: tagLines(raw, 'changes'), before: inTok, after: await countTokens(rewritten) };
+}
+
+function renderRestyleResults() {
+    const el = $id('restyle_results');
+    if (!el) return;
+    const keys = Object.keys(restyleResults);
+    if (!keys.length) { el.innerHTML = ''; return; }
+    el.innerHTML = keys.map(k => {
+        const r = restyleResults[k];
+        if (r.error) return `<section class="bt-card bt-card-warn">${cardHead('', escapeHtml(r.label), `실패: ${escapeHtml(r.error)}`)}</section>`;
+        const d = r.after - r.before;
+        return `<section class="bt-card">
+            <div class="bt-diet-head"><h4>${ico('wand-magic-sparkles')} ${escapeHtml(r.label)}</h4><span class="bt-diet-tok">${r.before.toLocaleString()} → <b>${r.after.toLocaleString()}</b> 토큰 <span class="bt-delta ${d <= 0 ? 'up' : 'down'}">${d > 0 ? '+' : ''}${d}</span></span></div>
+            ${r.changes?.length ? `<div class="bt-restyle-changes"><span>바뀐 점</span>${renderList(r.changes)}</div>` : ''}
+            <details class="bt-disclosure bt-disclosure-sm"><summary><span>원래 내용 보기</span>${ico('chevron-down')}</summary><pre class="bt-paste">${escapeHtml(r.original)}</pre></details>
+            <pre class="bt-paste bt-diet-out">${escapeHtml(r.rewritten)}</pre>
+            <div class="bt-actions bt-actions-end">
+                <button type="button" class="bt-btn bt-btn-sm bt-restyle-copy" data-key="${k}">${ico('copy')}<span>복사</span></button>
+                <button type="button" class="bt-btn bt-btn-sm bt-btn-primary bt-restyle-apply" data-key="${k}">${ico('file-import')}<span>적용</span></button>
+            </div>
+        </section>`;
+    }).join('') + '<p class="bt-note">적용한 뒤 <b>A/B 비교</b>로 실제 롤플이 더 재밌어졌는지 확인해 보세요.</p>';
+    el.querySelectorAll('.bt-restyle-copy').forEach(b => b.addEventListener('click', () => copyText(restyleResults[b.dataset.key]?.rewritten || '')));
+    el.querySelectorAll('.bt-restyle-apply').forEach(b => b.addEventListener('click', async () => {
+        const r = restyleResults[b.dataset.key];
+        if (!r) return;
+        const ok = await applyReplace({ kind: 'field', field: b.dataset.key, label: r.label }, r.rewritten, { tag: '스타일 수정' });
+        if (ok) { b.classList.add('disabled'); b.querySelector('span').textContent = '적용됨'; runDoctorLocal(true); refreshDietList(); }
+    }));
+}
+
+async function runRestyle() {
+    if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
+    const char = getCurrentCharacter();
+    if (!char) { toastr.error('1:1 캐릭터 채팅을 열어주세요'); return; }
+    const src = restyleSource();
+    if (!src) { toastr.warning('먼저 재미 분석에서 기준 스타일을 저장해 주세요'); return; }
+    const keys = [...document.querySelectorAll('#bt_restyle_fields input:checked')].map(x => x.value);
+    if (!keys.length) { toastr.warning('고칠 칸을 골라주세요'); return; }
+    const level = $id('restyle_level').value;
+    const charData = await loadCharData(char);
+    const all = RESTYLE_FIELDS.map(([k, label]) => ({ k, label, text: rawCardValue(char, k) }));
+    running = true;
+    stopRequested = false;
+    updateRunState();
+    restyleResults = {};
+    try {
+        const picked = all.filter(f => keys.includes(f.k));
+        for (const [i, f] of picked.entries()) {
+            if (stopRequested) break;
+            if (!f.text.trim()) { restyleResults[f.k] = { label: f.label, error: '비어 있는 칸이에요' }; renderRestyleResults(); continue; }
+            const context = all.filter(x => x.k !== f.k && x.text.trim()).map(x => `### ${x.label}\n${truncate(x.text, 1500)}`).join('\n\n');
+            try {
+                const r = await withTimer(`🪄 (${i + 1}/${picked.length}) ${f.label} 기준 스타일로 고치는 중…`, restyleText({ key: f.k, label: f.label, text: f.text, level, src, charData, context }));
+                restyleResults[f.k] = { ...r, label: f.label, original: f.text };
+            } catch (e) {
+                restyleResults[f.k] = { label: f.label, error: e.message };
+            }
+            renderRestyleResults();
+        }
+        setStatus('✅ 기준 스타일로 고치기 완료 — 확인 후 적용하세요');
+        toastr.success('기준 스타일로 고친 결과가 나왔어요. 확인 후 적용하세요.');
+        setMinimized(false);
+        scrollPanelTo($id('restyle_results'));
+    } finally {
+        running = false;
+        updateRunState();
+    }
+}
+
+function bindRestyleUI() {
+    $id('restyle_run')?.addEventListener('click', runRestyle);
+    $id('restyle_level').value = 'light';
+    renderRestyleSource();
 }
 
 
@@ -4180,13 +4662,17 @@ function renderFunAnalysis(data) {
     }));
     $id('fun_saveref')?.addEventListener('click', () => {
         getSettings().funReference = `(${getCurrentCharacter()?.name || ''} 기준)\n${r.style_summary}`;
+        getSettings().funReferenceSamples = (fp.protect || []).filter(p => p.quote).slice(0, 10).map(p => `- ${p.what}: ${p.quote}`).join('\n');
         saveSettings();
+        renderRestyleSource();
         toastr.success('기준 재미 스타일로 저장했어요. 이제 모든 봇의 제안이 이 스타일을 따라요.');
         renderFunAnalysis(data);
     });
     $id('fun_clearref')?.addEventListener('click', () => {
         getSettings().funReference = '';
+        getSettings().funReferenceSamples = '';
         saveSettings();
+        renderRestyleSource();
         toastr.info('기준 재미 스타일을 지웠어요');
         renderFunAnalysis(data);
     });

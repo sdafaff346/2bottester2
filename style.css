@@ -909,3 +909,40 @@
 #bt_panel .bt-diet-funrisk { background: color-mix(in srgb, var(--bt-bad) 8%, transparent); }
 #bt_panel .bt-diet-funrisk > span { color: var(--bt-bad); }
 #bt_panel .bt-fun-ref { display: flex; gap: 7px; align-items: center; }
+
+/* ---------- v2.0: diet rework + restyle ---------- */
+#bt_panel .bt-diet-row { grid-template-columns: 18px minmax(0, 1fr) 64px 46px; }
+#bt_panel .bt-diet-label { display: flex; flex-direction: column; gap: 2px; min-width: 0; white-space: normal; overflow: visible; }
+#bt_panel .bt-diet-label b { font-size: 12.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#bt_panel .bt-diet-kind { align-self: flex-start; font-size: 10.5px; font-weight: 650; line-height: 1.5; padding: 0 7px; border-radius: 999px; background: var(--bt-surface-2); color: var(--bt-muted); }
+#bt_panel .bt-diet-kind-perm, #bt_panel .bt-diet-kind-lorec { background: color-mix(in srgb, var(--bt-warn) 14%, transparent); color: var(--bt-warn); }
+#bt_panel .bt-diet-kind-lorek { background: color-mix(in srgb, var(--bt-good) 12%, transparent); color: var(--bt-good); }
+#bt_panel .bt-diet-permbox { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: baseline; gap: 2px 12px; padding: 11px 13px; margin-bottom: 12px; border-radius: 12px; background: var(--bt-surface-2); border: 1px solid var(--bt-line); }
+#bt_panel .bt-diet-permbox .bt-eyebrow { grid-column: 1; }
+#bt_panel .bt-diet-permbox b { grid-column: 2; grid-row: 1 / span 2; font-size: 22px; font-weight: 750; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
+#bt_panel .bt-diet-permbox small { grid-column: 1; font-size: 11.5px; color: var(--bt-muted); overflow-wrap: anywhere; }
+#bt_panel .bt-diet-perm-good b { color: var(--bt-good); }
+#bt_panel .bt-diet-perm-ok b { color: var(--bt-fg); }
+#bt_panel .bt-diet-perm-warn b { color: var(--bt-warn); }
+#bt_panel .bt-diet-sum { margin: 4px 0 8px; display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+#bt_panel .bt-diet-sum b { padding: 0; }
+#bt_panel #bt_diet_modenote { margin: -2px 0 8px; }
+#bt_panel .bt-diet-tips { margin: 10px 0 4px; }
+#bt_panel .bt-diet-tiplist { margin: 8px 0 2px; padding-left: 20px; display: grid; gap: 8px; font-size: 12.5px; line-height: 1.6; }
+#bt_panel .bt-diet-tiplist li b { display: block; font-weight: 700; }
+#bt_panel .bt-diet-tiplist li span { color: var(--bt-muted); overflow-wrap: anywhere; }
+#bt_panel .bt-diet-sub { margin: 12px 0 6px; font-size: 11.5px; font-weight: 700; color: var(--bt-muted); }
+#bt_panel .bt-diet-lore { margin-top: 12px; padding: 10px 12px; border-radius: 10px; background: color-mix(in srgb, var(--bt-good) 7%, transparent); display: grid; gap: 6px; }
+#bt_panel .bt-diet-lore > span { font-size: 12px; font-weight: 700; color: var(--bt-good); display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; }
+#bt_panel .bt-diet-lore > span small { font-weight: 500; color: var(--bt-muted); }
+#bt_panel .bt-diet-lore summary span { min-width: 0; overflow-wrap: anywhere; }
+#bt_panel .bt-restyle-src { margin-bottom: 12px; }
+#bt_panel .bt-restyle-fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px 12px; margin-bottom: 12px; }
+#bt_panel .bt-restyle-pick { align-items: center; font-size: 12.5px; font-weight: 600; }
+#bt_panel .bt-restyle-changes { margin-top: 10px; padding: 9px 11px; border-radius: 9px; background: color-mix(in srgb, var(--bt-accent) 9%, transparent); }
+#bt_panel .bt-restyle-changes > span { display: block; margin-bottom: 4px; font-size: 11.5px; font-weight: 700; color: var(--bt-accent-ink, var(--bt-accent)); }
+#bt_panel .bt-restyle-changes .bt-list { font-size: 12.5px; }
+@media (max-width: 520px) {
+    #bt_panel .bt-diet-row { grid-template-columns: 18px minmax(0, 1fr) 44px; }
+    #bt_panel .bt-restyle-fields { grid-template-columns: 1fr 1fr; }
+}
