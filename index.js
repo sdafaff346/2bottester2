@@ -27,6 +27,12 @@ const defaultSettings = Object.freeze({
     genMode: 'batch',        // 'batch' = write all test messages in one call (fast), 'adaptive' = one call per turn
     testerMaxTokens: 4096,
     autoMinimize: true,
+    soundOn: true,          // 작업 완료 알림음
+    soundType: 'chime',     // chime | bell | pop | sparkle
+    soundVolume: 60,        // 0-100
+    soundOnError: true,
+    vibrateOn: true,        // 모바일 진동
+    notifyOn: false,        // 브라우저 알림 (다른 탭에 있을 때)
     funReference: '',       // creator's proven fun style (from 재미 분석)
     funReferenceSamples: '', // short quotes from the reference bot (format examples for restyle)
     accent: 'champagne',
@@ -359,6 +365,9 @@ async function callLLM({ system, prompt, profileId = '', maxTokens = 600 }) {
             return out;
         } catch (e) {
             lastErr = e;
+            // only a budget problem is worth retrying smaller (network / auth errors fail fast)
+            const msg = `${e?.message || e} ${e?.status || ''}`;
+            if (!/empty response|max.?(?:output.?)?tokens|max_completion|too (?:large|long|many)|exceed|limit|length|range|context|invalid|400|422/i.test(msg)) break;
             const next = TOKEN_STEPS.find(t => t < budget);
             if (!next || budget <= 4096) break;
             console.warn(LOG, `request with max ${budget} tokens failed, retrying with ${next}`, e);
@@ -1247,6 +1256,26 @@ ${doctorPageHtml()}
           ${toggle('automin', '모바일 테스트 중 패널 자동 접기')}
         </div>
       </section>
+
+      <section class="bt-card">
+        ${cardHead('Sound', '완료 알림', '테스트·평가·검증·진단처럼 오래 걸리는 작업이 끝나면 알려줘요.')}
+        <div class="bt-switches">
+          ${toggle('soundon', '완료 알림음')}
+        </div>
+        <div class="bt-grid2 bt-sound-grid">
+          ${field('소리', `<select id="bt_soundtype" class="bt-input">${Object.entries(SOUND_TYPES).map(([k, v]) => `<option value="${k}">${v.label}</option>`).join('')}</select>`)}
+          <div class="bt-field"><label class="bt-field-label">크기 <span class="bt-field-hint" id="bt_soundvol_n"></span></label><input id="bt_soundvol" class="bt-range" type="range" min="0" max="100" step="5"></div>
+        </div>
+        <div class="bt-actions">
+          <button type="button" id="bt_soundtest" class="bt-btn bt-btn-sm">${ico('volume-high')}<span>미리 듣기</span></button>
+          <button type="button" id="bt_soundtest_err" class="bt-btn bt-btn-sm">${ico('triangle-exclamation')}<span>실패음 듣기</span></button>
+        </div>
+        <div class="bt-switches">
+          ${toggle('soundonerror', '실패했을 때도 울리기', '실패는 낮은 두 음으로 구분돼요')}
+          ${toggle('vibrate', '진동 (모바일)', '안드로이드 크롬 등 진동을 지원하는 기기에서만')}
+          ${toggle('notify', '다른 탭에 있을 때 브라우저 알림', '처음 켤 때 브라우저가 허락을 물어봐요')}
+        </div>
+      </section>
     </div>
   </div>
 
@@ -1303,6 +1332,31 @@ function bindPanel() {
     bindNum('delay', 'delayMs');
     bindNum('testertokens', 'testerMaxTokens');
     bindCheck('automin', 'autoMinimize');
+    bindCheck('soundon', 'soundOn');
+    bindCheck('soundonerror', 'soundOnError');
+    bindCheck('vibrate', 'vibrateOn');
+    bindCheck('notify', 'notifyOn');
+    $id('notify').addEventListener('change', async (e) => {
+        if (!e.target.checked) return;
+        if (!('Notification' in window)) { toastr.warning('이 브라우저는 알림을 지원하지 않아요'); e.target.checked = false; s.notifyOn = false; saveSettings(); return; }
+        if (Notification.permission !== 'granted') {
+            const p = await Notification.requestPermission().catch(() => 'denied');
+            if (p !== 'granted') { toastr.warning('브라우저 알림이 허락되지 않았어요'); e.target.checked = false; s.notifyOn = false; saveSettings(); }
+        }
+    });
+    const st = $id('soundtype');
+    st.value = SOUND_TYPES[s.soundType] ? s.soundType : 'chime';
+    st.addEventListener('change', () => { s.soundType = st.value; saveSettings(); playSound('ok'); });
+    const sv = $id('soundvol');
+    const svn = $id('soundvol_n');
+    sv.value = s.soundVolume;
+    const paintVol = () => { svn.textContent = `${sv.value}%`; sv.style.setProperty('--bt-range', `${sv.value}%`); };
+    paintVol();
+    sv.addEventListener('input', () => { s.soundVolume = Number(sv.value); paintVol(); saveSettings(); });
+    sv.addEventListener('change', () => playSound('ok'));
+    $id('soundtest').addEventListener('click', () => playSound('ok'));
+    $id('soundtest_err').addEventListener('click', () => playSound('error'));
+    $id('panel').addEventListener('pointerdown', () => { if (s.soundOn) getAudio(); }, { passive: true });
     const ac = $id('accent');
     ac.value = s.accent;
     $id('panel').dataset.accent = s.accent;
@@ -1364,6 +1418,92 @@ function switchTab(name) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Completion sound (완료 알림음) — synthesized with Web Audio, no files needed
+// ---------------------------------------------------------------------------
+
+const SOUND_TYPES = {
+    chime: { label: '딩동 (차임)' },
+    bell: { label: '맑은 종소리' },
+    pop: { label: '톡톡 (마림바)' },
+    sparkle: { label: '반짝 (아르페지오)' },
+};
+let audioCtx = null;
+
+function getAudio() {
+    try {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+    } catch { audioCtx = null; }
+    return audioCtx;
+}
+
+/** One soft note: sine body + quiet overtone, fast attack, exponential decay. */
+function playNote(ac, out, { freq, start, dur = 0.9, gain = 0.5, type = 'sine', overtone = 2, overGain = 0.18 }) {
+    const t0 = ac.currentTime + start;
+    const env = ac.createGain();
+    env.gain.setValueAtTime(0.0001, t0);
+    env.gain.exponentialRampToValueAtTime(gain, t0 + 0.012);
+    env.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    env.connect(out);
+    const o1 = ac.createOscillator();
+    o1.type = type; o1.frequency.setValueAtTime(freq, t0);
+    o1.connect(env);
+    const og = ac.createGain();
+    og.gain.value = overGain;
+    og.connect(env);
+    const o2 = ac.createOscillator();
+    o2.type = 'sine'; o2.frequency.setValueAtTime(freq * overtone, t0);
+    o2.connect(og);
+    for (const o of [o1, o2]) { o.start(t0); o.stop(t0 + dur + 0.05); }
+}
+
+function playSound(kind = 'ok', type = getSettings().soundType, volume = getSettings().soundVolume) {
+    const ac = getAudio();
+    if (!ac) return;
+    const out = ac.createGain();
+    out.gain.value = Math.max(0, Math.min(1, (Number(volume) || 0) / 100)) * 0.55;
+    out.connect(ac.destination);
+    const N = (m) => 440 * Math.pow(2, (m - 69) / 12); // midi → Hz
+    if (kind === 'error') {
+        playNote(ac, out, { freq: N(72), start: 0, dur: 0.45, gain: 0.45 });
+        playNote(ac, out, { freq: N(67), start: 0.18, dur: 0.7, gain: 0.45 });
+        return;
+    }
+    const seq = {
+        chime: [[88, 0, 1.1], [83, 0.2, 1.5]],
+        bell: [[84, 0, 2.2, 'sine', 2.76, 0.3], [91, 0.02, 1.6, 'sine', 2.4, 0.12]],
+        pop: [[79, 0, 0.35, 'triangle', 4, 0.08], [84, 0.11, 0.35, 'triangle', 4, 0.08], [88, 0.22, 0.6, 'triangle', 4, 0.08]],
+        sparkle: [[84, 0, 0.7], [88, 0.08, 0.7], [91, 0.16, 0.7], [96, 0.24, 1.3]],
+    }[type] || [];
+    for (const [m, start, dur, wave = 'sine', overtone = 2, overGain = 0.18] of seq) {
+        playNote(ac, out, { freq: N(m), start, dur, gain: 0.5, type: wave, overtone, overGain });
+    }
+}
+
+function notifyFinish(kind, text) {
+    const s = getSettings();
+    if (kind === 'error' && !s.soundOnError) return;
+    if (s.soundOn) playSound(kind === 'error' ? 'error' : 'ok');
+    if (s.vibrateOn && navigator.vibrate) { try { navigator.vibrate(kind === 'error' ? [80, 60, 80] : [40, 50, 120]); } catch { /* ignore */ } }
+    if (s.notifyOn && document.hidden && 'Notification' in window && Notification.permission === 'granted') {
+        try { new Notification(kind === 'error' ? '봇 테스터 · 실패' : '봇 테스터 · 완료', { body: text || '작업이 끝났어요', tag: 'bot-tester', silent: true }); } catch { /* ignore */ }
+    }
+}
+
+let wasRunning = false;
+let runStartedAt = 0;
+let lastStatus = { kind: '', text: '' };
+
+/** Called from updateRunState: plays the sound when a long task finishes. */
+function trackRunForSound() {
+    if (running && !wasRunning) { runStartedAt = Date.now(); lastStatus = { kind: '', text: '' }; getAudio(); }
+    if (!running && wasRunning && Date.now() - runStartedAt > 1500 && lastStatus.kind !== 'stop') {
+        notifyFinish(lastStatus.kind === 'error' || lastStatus.kind === 'warn' ? 'error' : 'ok', lastStatus.text);
+    }
+    wasRunning = running;
+}
+
 const STATUS_ICONS = [
     [/^✅\s*/, 'ok'], [/^❌\s*/, 'error'], [/^⚠️?\s*/, 'warn'], [/^⏹\s*/, 'stop'],
     [/^(?:🧪|💬|📝|🔎|📥|🌐|🧠|🗣|✨|🧩|🤖|🧮|🩺|🎭|✂️?)\s*/u, 'busy'],
@@ -1375,6 +1515,7 @@ function setStatus(text) {
     for (const [re, st] of STATUS_ICONS) {
         if (re.test(t)) { t = t.replace(re, ''); state = st; break; }
     }
+    if (state === 'ok' || state === 'error' || state === 'warn' || state === 'stop') lastStatus = { kind: state, text: t };
     const el = $id('status');
     if (el) el.textContent = t || '대기 중';
     const footer = el?.closest('.bt-footer');
@@ -1579,6 +1720,7 @@ function makeDraggable() {
 }
 
 function updateRunState() {
+    trackRunForSound();
     const run = $id('run');
     if (!run) return;
     $id('stop').style.display = running ? '' : 'none';
