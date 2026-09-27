@@ -1,0 +1,13 @@
+{
+    "display_name": "Bot Tester (봇 테스터)",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "dependencies": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "koosean",
+    "version": "1.9.0",
+    "homePage": "",
+    "auto_update": false
+}
