@@ -86,7 +86,7 @@ function charKey(char) {
     return STORE_PREFIX + (char?.avatar || char?.name || 'unknown');
 }
 
-const emptyCharData = () => ({ urls: [], refText: '', authorNote: '', history: [], names: null, voiceProfile: null, voiceResults: {}, doctor: null, runs: [], abBaselineId: null, abLast: null, applyLog: [], funProfile: null, caehBase: '', caehCaution: '', anchorText: '', anchorTime: 0, contLast: null });
+const emptyCharData = () => ({ urls: [], refText: '', authorNote: '', history: [], names: null, voiceProfile: null, voiceResults: {}, doctor: null, runs: [], abBaselineId: null, abLast: null, applyLog: [], funProfile: null, caehBase: '', caehCaution: '', anchorText: '', anchorTime: 0, anchorBind: false, contLast: null });
 
 async function loadCharData(char) {
     if (!char) return emptyCharData();
@@ -447,22 +447,27 @@ const CHANGE_DISCIPLINE = [
     '- Never change voice (first person, how they address {{user}}, endings, dialect, tics), attitude toward {{user}} or relationship distance as a side effect of a canon fix.',
     '- Express every accuracy fix as playable behaviour (what the character does or says in a scene), not as a biography fact.',
     '- If canon disagrees with how the bot plays and the creator\'s characterization does not settle it, prefer the version that creates more scene energy (tension, comedy, gap) and state the trade-off.',
-    '- A change that would make the character feel like a different person in an ongoing chat is a BAD change, even if it is more canon-accurate.',
 ].join('\n');
+
+function changeDiscipline(cd) {
+    return cd?.anchorBind && String(cd?.anchorText || '').trim()
+        ? `${CHANGE_DISCIPLINE}\n- A change that would make the character feel like a different person in the ongoing chat is a BAD change, even if it is more canon-accurate.`
+        : `${CHANGE_DISCIPLINE}\n- The creator is allowed to change the character's personality on purpose. Do not refuse or water down a deliberate change; just make it play well.`;
+}
 
 /** The creator's own direction for this character — outranks canon, fanon and style rules. */
 function caehGuide(cd) {
     const parts = [];
     if (String(cd?.caehBase || '').trim()) parts.push(`CREATOR'S INTENDED CHARACTERIZATION — highest priority, above canon and fanon. Whatever matches this is correct: never "fix" it toward canon, never deduct score for it, and build suggestions on top of it:\n${truncate(cd.caehBase, 2000)}`);
     if (String(cd?.caehCaution || '').trim()) parts.push(`CREATOR'S CAUTIONS — hard rules. No score, suggestion, rewrite, compression or test message may go against these:\n${truncate(cd.caehCaution, 1500)}`);
-    if (String(cd?.anchorText || '').trim()) parts.push(`ESTABLISHED IN THE CREATOR'S ONGOING CHAT — they keep playing this chat after editing the card, so the character must stay recognizably the same there: same voice, same attitude and distance toward {{user}}, same running bits. Edits may sharpen or add, never re-characterize:\n${truncate(cd.anchorText, 1800)}`);
+    if (cd?.anchorBind && String(cd?.anchorText || '').trim()) parts.push(`ESTABLISHED IN THE CREATOR'S ONGOING CHAT — they keep playing this chat after editing the card, so the character must stay recognizably the same there: same voice, same attitude and distance toward {{user}}, same running bits. Edits may sharpen or add, never re-characterize:\n${truncate(cd.anchorText, 1800)}`);
     return parts.join('\n\n');
 }
 
 /** Extra guidance: the creator's direction + change discipline + proven style + protected parts. */
 function funGuard(charData) {
     const s = getSettings();
-    const parts = [caehGuide(charData), CHANGE_DISCIPLINE, FUN_PRINCIPLES].filter(Boolean);
+    const parts = [caehGuide(charData), changeDiscipline(charData), FUN_PRINCIPLES].filter(Boolean);
     if (s.funReference) parts.push(`CREATOR'S PROVEN FUN STYLE (their own bot that plays well — match this approach):\n${truncate(s.funReference, 1800)}`);
     const protect = charData?.funProfile?.protect || [];
     if (protect.length) {
@@ -1195,10 +1200,15 @@ function buildPanel() {
         ${field('원하는 캐해 (바탕)', '<textarea id="bt_caehbase" class="bt-input" rows="4" placeholder="예) 귀찮아하면서도 결국 챙겨주는 쪽&#10;{{user}}한테는 반말 + 장난, 진지해질 땐 말이 짧고 낮아짐&#10;원작보다 능글맞은 쪽으로 가져가고 싶음"></textarea>', '점수·제안의 기준')}
         ${field('주의사항', '<textarea id="bt_caehcaution" class="bt-input" rows="3" placeholder="예) 너무 다정하게 만들지 말 것&#10;원작 최종장 이후 설정은 쓰지 말 것&#10;말끝마다 ~ 붙이지 말 것"></textarea>', '절대 어기지 않을 것')}
         ${field('이어가는 채팅 기준', '<textarea id="bt_anchor" class="bt-input" rows="5" placeholder="하던 채팅을 연 상태에서 아래 버튼을 누르면, 그 채팅에서 캐릭터가 실제로 어떤 말투·태도·거리감으로 굴러가는지 정리해 넣어요. 직접 적어도 돼요."></textarea>', '<span id="bt_anchor_meta"></span>')}
-        <div class="bt-actions">
+        <div class="bt-actions bt-actions-split">
           <button type="button" id="bt_anchor_grab" class="bt-btn">${ico('link')}<span>지금 채팅에서 가져오기</span></button>
+          <button type="button" id="bt_anchor_pin" class="bt-btn bt-btn-primary">${ico('thumbtack')}<span>이 채팅 작가 노트에 넣기</span></button>
         </div>
-        <p class="bt-note">이어가는 채팅 기준을 채워두면, 수정 제안이 그 채팅의 성격·말투·{{user}}와의 거리감을 바꾸지 않아요. 바뀔 위험이 있는 제안에는 <b>이어하기 주의</b> 표시가 붙어요.</p>
+        <div id="bt_anchor_note" class="bt-anchor-note"></div>
+        <div class="bt-switches">
+          ${toggle('anchorbind', '수정 제안도 이 기준에 맞추기', '끄면 카드 성격은 자유롭게 바꿀 수 있어요. 하던 채팅은 작가 노트가 붙잡아 줘요.')}
+        </div>
+        <p class="bt-note"><b>작가 노트에 넣기</b>: 지금 열린 채팅의 Author's Note(채팅마다 따로 저장)에만 들어가요. 카드를 새 성격으로 고쳐도 이 채팅은 예전 말투·거리감으로 이어지고, 새 채팅은 고친 카드대로 시작해요.</p>
       </section>
     </div>
 
@@ -1763,7 +1773,7 @@ function updateRunState() {
     const run = $id('run');
     if (!run) return;
     $id('stop').style.display = running ? '' : 'none';
-    for (const id of ['run', 'evalchat', 'evalcard', 'fetch', 'buildprofile', 'autonames', 'diet_run', 'ref_diet', 'anchor_grab', 'cont_run']) {
+    for (const id of ['run', 'evalchat', 'evalcard', 'fetch', 'buildprofile', 'autonames', 'diet_run', 'ref_diet', 'anchor_grab', 'anchor_pin', 'cont_run']) {
         $id(id)?.classList.toggle('disabled', running);
     }
     document.querySelectorAll('#bt_panel .bt-vset-btn').forEach(b => b.classList.toggle('disabled', running));
@@ -1791,7 +1801,9 @@ async function refreshPanelForChar() {
     $id('caehbase').value = data.caehBase || '';
     $id('caehcaution').value = data.caehCaution || '';
     $id('anchor').value = data.anchorText || '';
+    $id('anchorbind').checked = !!data.anchorBind;
     renderAnchorMeta(data);
+    renderAnchorNote();
     renderContPick(data);
     renderContResult(data.contLast);
     updateRefCount();
@@ -1820,6 +1832,7 @@ async function saveSourceFromUI(notify) {
     data.authorNote = $id('authornote').value;
     data.caehBase = $id('caehbase').value;
     data.caehCaution = $id('caehcaution').value;
+    data.anchorBind = $id('anchorbind').checked;
     if (data.anchorText !== $id('anchor').value) { data.anchorText = $id('anchor').value; data.anchorTime = data.anchorText ? Date.now() : 0; }
     await saveCharData(char, data);
     if (notify) toastr.success(`${char.name}의 원작 자료를 저장했어요`);
@@ -4768,7 +4781,7 @@ async function runFunAnalysis() {
         const system = [
             'You are a veteran roleplay-bot designer. The creator says this bot is genuinely FUN to roleplay with. Analyze WHY, at the level of format and technique, so the fun can be protected and reused.',
             caehGuide(cdDir),
-            CHANGE_DISCIPLINE,
+            changeDiscipline(cdDir),
             FUN_PRINCIPLES,
             'Find the concrete fun engines in THIS card (quote them), rate each, list what must never be cut, and suggest a few additions that would make it even more fun without flattening anything.',
             'style_summary: write the creator\'s "fun formula" as 6-10 short, reusable rules (in 한국어) that could guide edits to OTHER bots by the same creator.',
@@ -4889,6 +4902,8 @@ function bindCaehUI() {
     const save = () => { clearTimeout(caehSaveTimer); caehSaveTimer = setTimeout(async () => { await saveSourceFromUI(false); const ch = getCurrentCharacter(); if (ch) renderAnchorMeta(await loadCharData(ch)); }, 600); };
     for (const id of ['caehbase', 'caehcaution', 'anchor']) $id(id).addEventListener('input', save);
     $id('anchor_grab').addEventListener('click', grabAnchor);
+    $id('anchor_pin').addEventListener('click', pinAnchorToChatNote);
+    $id('anchorbind').addEventListener('change', save);
     $id('cont_run').addEventListener('click', runContinuity);
 }
 
@@ -4944,6 +4959,98 @@ async function grabAnchor() {
         running = false;
         updateRunState();
     }
+}
+
+// --- per-chat Author's Note: keep an ongoing chat's character while the card changes ---
+
+const NOTE_START = '[봇 테스터 · 이 채팅의 {{char}}]';
+const NOTE_END = '[/봇 테스터]';
+
+function chatNoteBlockRe() {
+    const esc = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`\\n*${esc(NOTE_START)}[\\s\\S]*?${esc(NOTE_END)}\\n*`);
+}
+
+function currentChatNote() {
+    const md = ctx().chatMetadata;
+    return md ? String(md.note_prompt || '') : null;
+}
+
+/** Turns the anchor summary into a short in-character instruction for the note (drops the story-status part). */
+function anchorToNote(text) {
+    const lines = String(text || '').split('\n').map(x => x.trim()).filter(Boolean)
+        .filter(x => !/^(지금 상황|현재 상황)\s*[:：]/.test(x));
+    return [
+        '이 채팅에서는 {{char}}를 아래처럼 계속 연기할 것. 캐릭터 설명과 달라도 이 채팅에서는 이쪽이 우선이다.',
+        ...lines,
+    ].join('\n');
+}
+
+function syncNoteUI(md) {
+    const ta = document.querySelector('#extension_floating_prompt');
+    if (ta) ta.value = md.note_prompt || '';
+    const iv = document.querySelector('#extension_floating_interval');
+    if (iv) iv.value = md.note_interval ?? 1;
+    const dp = document.querySelector('#extension_floating_depth');
+    if (dp) dp.value = md.note_depth ?? 4;
+    const pos = document.querySelector(`input[name="extension_floating_position"][value="${md.note_position ?? 1}"]`);
+    if (pos) pos.checked = true;
+}
+
+async function renderAnchorNote() {
+    const el = $id('anchor_note');
+    if (!el) return;
+    const note = currentChatNote();
+    const m = note ? note.match(chatNoteBlockRe()) : null;
+    if (!m) { el.innerHTML = ''; return; }
+    const tok = await countTokens(m[0]).catch(() => 0);
+    el.innerHTML = `<div class="bt-anchor-pinned">${ico('thumbtack')}<span>이 채팅 작가 노트에 들어가 있어요${tok ? ` · ${tok.toLocaleString()} 토큰` : ''}</span>
+        <button type="button" id="bt_anchor_unpin" class="bt-btn bt-btn-sm">${ico('xmark')}<span>빼기</span></button></div>`;
+    $id('anchor_unpin').addEventListener('click', unpinAnchorFromChatNote);
+}
+
+async function pinAnchorToChatNote() {
+    if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
+    const c = ctx();
+    const char = getCurrentCharacter();
+    if (!char || !c.chatMetadata) { toastr.error('하던 채팅을 먼저 열어주세요'); return; }
+    let text = $id('anchor').value.trim();
+    if (!text) {
+        toastr.info('먼저 이 채팅의 캐릭터를 정리할게요');
+        await grabAnchor();
+        text = $id('anchor').value.trim();
+        if (!text) return;
+    }
+    const block = `${NOTE_START}\n${anchorToNote(text)}\n${NOTE_END}`;
+    const md = c.chatMetadata;
+    const old = String(md.note_prompt || '');
+    const re = chatNoteBlockRe();
+    const next = re.test(old) ? old.replace(re, () => (old.replace(re, '').trim() ? `\n\n${block}\n\n` : block)).trim() : (old.trim() ? `${old.trimEnd()}\n\n${block}` : block);
+    md.note_prompt = next;
+    let turnedOn = false;
+    if (!(Number(md.note_interval) > 0)) { md.note_interval = 1; turnedOn = true; }
+    if (md.note_depth === undefined) md.note_depth = 4;
+    if (md.note_position === undefined) md.note_position = 1; // in chat, at depth
+    try {
+        await c.saveMetadata?.();
+    } catch (e) { toastr.error(`작가 노트 저장 실패: ${e.message}`); return; }
+    syncNoteUI(md);
+    const tok = await countTokens(block).catch(() => 0);
+    toastr.success(`이 채팅 작가 노트에 넣었어요${tok ? ` (${tok}토큰)` : ''}. 새 채팅에는 들어가지 않아요.${turnedOn ? ' 꺼져 있던 작가 노트를 매 턴으로 켰어요.' : ''}`);
+    if (tok > 450) toastr.info('노트가 길어요. 매 턴 들어가니까 이어가는 채팅 기준을 조금 줄이면 토큰을 아낄 수 있어요.');
+    setStatus('✅ 이 채팅 작가 노트에 캐릭터 기준을 넣었어요');
+    renderAnchorNote();
+}
+
+async function unpinAnchorFromChatNote() {
+    const c = ctx();
+    const md = c.chatMetadata;
+    if (!md) return;
+    md.note_prompt = String(md.note_prompt || '').replace(chatNoteBlockRe(), '\n\n').trim();
+    try { await c.saveMetadata?.(); } catch (e) { toastr.error(`작가 노트 저장 실패: ${e.message}`); return; }
+    syncNoteUI(md);
+    toastr.success('이 채팅 작가 노트에서 뺐어요');
+    renderAnchorNote();
 }
 
 // --- continuity compare: same chat, pre-edit card vs current card ---
@@ -5013,7 +5120,7 @@ async function loreForVersions(char, picked, recentText) {
     return out;
 }
 
-async function generateNextReply({ fields, lore, history, userName, charName }) {
+async function generateNextReply({ fields, lore, history, userName, charName, note = '' }) {
     const f = (k) => fillNames(fields[k], userName, charName).trim();
     const system = [
         f('system_prompt') || `You are ${charName} in an ongoing roleplay with ${userName}. Stay fully in character.`,
@@ -5023,6 +5130,7 @@ async function generateNextReply({ fields, lore, history, userName, charName }) 
         lore.length ? `[World info]\n${fillNames(lore.join('\n'), userName, charName)}` : '',
         f('mes_example') ? `[Example dialogue]\n${f('mes_example')}` : '',
         f('char_note') ? `[Character note]\n${f('char_note')}` : '',
+        note.trim() ? `[Author's note for this chat]\n${fillNames(note, userName, charName)}` : '',
         f('post_history'),
         `Write ONLY ${charName}'s next reply to the last message. Match the length and format of ${charName}'s earlier replies in this chat. Never write ${userName}'s lines or actions.`,
     ].filter(Boolean).join('\n\n');
@@ -5048,6 +5156,7 @@ async function runContinuity() {
     const context = msgs.slice(Math.max(0, last - 15), last + 1);
     const history = context.map(m => `${m.is_user ? userName : charName}: ${truncate(m.mes, 1500)}`).join('\n\n');
     const actual = msgs.slice(last + 1).find(m => !m.is_user)?.mes || '';
+    const chatNote = currentChatNote() || ''; // the per-chat Author's Note is part of real play
 
     // current card vs card with the picked edits reverted (newest-first log → oldest "before" wins)
     const after = Object.fromEntries(CONT_FIELDS.map(k => [k, rawCardValue(char, k)]));
@@ -5064,17 +5173,17 @@ async function runContinuity() {
     stopRequested = false;
     updateRunState();
     try {
-        const replyBefore = await withTimer('🔗 수정 전 카드로 다음 답장 만드는 중…', generateNextReply({ fields: before, lore: lore.before, history, userName, charName }));
+        const replyBefore = await withTimer('🔗 수정 전 카드로 다음 답장 만드는 중…', generateNextReply({ fields: before, lore: lore.before, history, userName, charName, note: chatNote }));
         if (stopRequested) throw new Error('중단됨');
-        const replyAfter = await withTimer('🔗 지금 카드로 다음 답장 만드는 중…', generateNextReply({ fields: after, lore: lore.after, history, userName, charName }));
+        const replyAfter = await withTimer('🔗 지금 카드로 다음 답장 만드는 중…', generateNextReply({ fields: after, lore: lore.after, history, userName, charName, note: chatNote }));
         if (stopRequested) throw new Error('중단됨');
         const swap = Math.random() < 0.5; // hide which one is new from the judge
         const X = swap ? replyAfter : replyBefore;
         const Y = swap ? replyBefore : replyAfter;
         const system = [
             'You judge two candidate next replies in an ongoing roleplay. The creator edited the character card and keeps playing THIS chat, so the character must still feel like the same person the chat has established.',
-            caehGuide(cd),
-            CHANGE_DISCIPLINE,
+            caehGuide({ ...cd, anchorBind: true }),
+            changeDiscipline({ ...cd, anchorBind: true }),
             'Score each candidate 0-100 on: continuity (same voice, attitude and distance toward the user as earlier in the chat), fun (scene energy, hooks, personality on the page, gives the user something to react to), direction (fits the creator\'s intended characterization and cautions; if none are given, fits the character as established).',
             'In every Korean text, refer to the candidates ONLY as [X] and [Y] (with the square brackets).',
             'changed_ko: in Korean, what concretely differs between X and Y in personality, voice or distance (quote short bits). advice_ko: if one is weaker, what to change in the CARD so the edited version keeps continuity and fun (1-3 short points, Korean).',
@@ -5186,6 +5295,7 @@ function renderContResult(res) {
     if (document.getElementById('extensionsMenu')) setup();
     eventSource.on(event_types.APP_READY, setup);
     eventSource.on(event_types.CHAT_CHANGED, () => {
+        renderAnchorNote();
         if ($id('panel') && $id('panel').style.display !== 'none') refreshPanelForChar();
     });
 
