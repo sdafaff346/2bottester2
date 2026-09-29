@@ -86,7 +86,7 @@ function charKey(char) {
     return STORE_PREFIX + (char?.avatar || char?.name || 'unknown');
 }
 
-const emptyCharData = () => ({ urls: [], refText: '', authorNote: '', history: [], names: null, voiceProfile: null, voiceResults: {}, doctor: null, runs: [], abBaselineId: null, abLast: null, applyLog: [], funProfile: null });
+const emptyCharData = () => ({ urls: [], refText: '', authorNote: '', history: [], names: null, voiceProfile: null, voiceResults: {}, doctor: null, runs: [], abBaselineId: null, abLast: null, applyLog: [], funProfile: null, caehBase: '', caehCaution: '', anchorText: '', anchorTime: 0, contLast: null });
 
 async function loadCharData(char) {
     if (!char) return emptyCharData();
@@ -439,10 +439,30 @@ const FUN_PRINCIPLES = [
     'Rules for advice: prefer adding "how to show it" cues over wiki facts; never suggest deleting or flattening the items above; never turn vivid prose into dry lists; a change that is more canon-accurate but less playable is a bad change.',
 ].join('\n');
 
-/** Extra guidance: the creator's proven style + this character's protected parts. */
+/** Edits must make play more fun and must not turn the character into someone else. */
+const CHANGE_DISCIPLINE = [
+    'CHANGE DISCIPLINE — every edit must make the roleplay MORE fun and keep the character recognizably the same person:',
+    '- Keep what already plays well. Prefer small additive edits (a behaviour cue, a sample line, a trigger, a hook) over rewriting existing personality lines.',
+    '- Never soften, sanitize or normalize the character (nicer, more polite, more reasonable, more emotionally open, more generic, more "balanced") unless the creator asked for it.',
+    '- Never change voice (first person, how they address {{user}}, endings, dialect, tics), attitude toward {{user}} or relationship distance as a side effect of a canon fix.',
+    '- Express every accuracy fix as playable behaviour (what the character does or says in a scene), not as a biography fact.',
+    '- If canon disagrees with how the bot plays and the creator\'s characterization does not settle it, prefer the version that creates more scene energy (tension, comedy, gap) and state the trade-off.',
+    '- A change that would make the character feel like a different person in an ongoing chat is a BAD change, even if it is more canon-accurate.',
+].join('\n');
+
+/** The creator's own direction for this character — outranks canon, fanon and style rules. */
+function caehGuide(cd) {
+    const parts = [];
+    if (String(cd?.caehBase || '').trim()) parts.push(`CREATOR'S INTENDED CHARACTERIZATION — highest priority, above canon and fanon. Whatever matches this is correct: never "fix" it toward canon, never deduct score for it, and build suggestions on top of it:\n${truncate(cd.caehBase, 2000)}`);
+    if (String(cd?.caehCaution || '').trim()) parts.push(`CREATOR'S CAUTIONS — hard rules. No score, suggestion, rewrite, compression or test message may go against these:\n${truncate(cd.caehCaution, 1500)}`);
+    if (String(cd?.anchorText || '').trim()) parts.push(`ESTABLISHED IN THE CREATOR'S ONGOING CHAT — they keep playing this chat after editing the card, so the character must stay recognizably the same there: same voice, same attitude and distance toward {{user}}, same running bits. Edits may sharpen or add, never re-characterize:\n${truncate(cd.anchorText, 1800)}`);
+    return parts.join('\n\n');
+}
+
+/** Extra guidance: the creator's direction + change discipline + proven style + protected parts. */
 function funGuard(charData) {
     const s = getSettings();
-    const parts = [FUN_PRINCIPLES];
+    const parts = [caehGuide(charData), CHANGE_DISCIPLINE, FUN_PRINCIPLES].filter(Boolean);
     if (s.funReference) parts.push(`CREATOR'S PROVEN FUN STYLE (their own bot that plays well — match this approach):\n${truncate(s.funReference, 1800)}`);
     const protect = charData?.funProfile?.protect || [];
     if (protect.length) {
@@ -451,7 +471,11 @@ function funGuard(charData) {
     return parts.join('\n\n');
 }
 
-const FUN_IMPACT_DOC = '"fun_impact": "+"|"0"|"-" (does this change make the roleplay MORE fun, neutral, or LESS fun?), "fun_note": "<한 줄: 재미에 어떤 영향인지>"';
+const FUN_IMPACT_DOC = '"fun_impact": "+"|"0"|"-" (does this change make the roleplay MORE fun, neutral, or LESS fun?), "fun_note": "<한 줄: 재미에 어떤 영향인지>", "continuity": "safe"|"risk" (risk = the character would feel noticeably different in an ongoing chat: voice, attitude or distance toward {{user}} changes)';
+
+function contBadge(c) {
+    return String(c ?? '').trim() === 'risk' ? `<span class="bt-tag bt-cont-risk" title="적용하면 하던 채팅에서 성격·말투가 달라진 게 티 날 수 있어요">${ico('link-slash')}이어하기 주의</span>` : '';
+}
 
 function funBadge(impact, note = '') {
     const k = String(impact ?? '').trim();
@@ -578,6 +602,8 @@ function testerContextBlocks(charData, s) {
     return [
         charData.refText ? `[원작 참고 자료 (발췌)]\n${truncate(charData.refText, 3000)}` : '[원작 참고 자료 없음 — 일반적인 캐릭터 일관성 위주로 테스트]',
         charData.authorNote ? `[제작자 메모 — 의도한 AU/설정 변경]\n${charData.authorNote}` : '',
+        String(charData.caehBase || '').trim() ? `[제작자가 원하는 캐해 — 이 방향이 잘 드러나는지도 떠볼 것]\n${truncate(charData.caehBase, 1200)}` : '',
+        String(charData.caehCaution || '').trim() ? `[제작자 주의사항 — 테스트 메시지도 이걸 어기게 유도하지 말 것]\n${truncate(charData.caehCaution, 800)}` : '',
         s.customInstruction ? `[제작자 지시사항]\n${s.customInstruction}` : '',
     ].filter(Boolean);
 }
@@ -1163,6 +1189,17 @@ function buildPanel() {
           <button type="button" id="bt_savesrc" class="bt-btn">${ico('floppy-disk')}<span>저장</span></button>
         </div>
       </section>
+
+      <section class="bt-card bt-card-accent" id="bt_caeh_card">
+        ${cardHead('Direction', '캐해 방향', '여기 적은 내용이 원작·2차 캐해보다 우선이에요. 평가, 수정 제안, 토큰 다이어트, 스타일 고치기, 테스트 메시지가 모두 이걸 따라요. 캐릭터마다 따로 자동 저장돼요.')}
+        ${field('원하는 캐해 (바탕)', '<textarea id="bt_caehbase" class="bt-input" rows="4" placeholder="예) 귀찮아하면서도 결국 챙겨주는 쪽&#10;{{user}}한테는 반말 + 장난, 진지해질 땐 말이 짧고 낮아짐&#10;원작보다 능글맞은 쪽으로 가져가고 싶음"></textarea>', '점수·제안의 기준')}
+        ${field('주의사항', '<textarea id="bt_caehcaution" class="bt-input" rows="3" placeholder="예) 너무 다정하게 만들지 말 것&#10;원작 최종장 이후 설정은 쓰지 말 것&#10;말끝마다 ~ 붙이지 말 것"></textarea>', '절대 어기지 않을 것')}
+        ${field('이어가는 채팅 기준', '<textarea id="bt_anchor" class="bt-input" rows="5" placeholder="하던 채팅을 연 상태에서 아래 버튼을 누르면, 그 채팅에서 캐릭터가 실제로 어떤 말투·태도·거리감으로 굴러가는지 정리해 넣어요. 직접 적어도 돼요."></textarea>', '<span id="bt_anchor_meta"></span>')}
+        <div class="bt-actions">
+          <button type="button" id="bt_anchor_grab" class="bt-btn">${ico('link')}<span>지금 채팅에서 가져오기</span></button>
+        </div>
+        <p class="bt-note">이어가는 채팅 기준을 채워두면, 수정 제안이 그 채팅의 성격·말투·{{user}}와의 거리감을 바꾸지 않아요. 바뀔 위험이 있는 제안에는 <b>이어하기 주의</b> 표시가 붙어요.</p>
+      </section>
     </div>
 
     <div class="bt-page" data-page="test" style="display:none">
@@ -1195,6 +1232,7 @@ function buildPanel() {
         </div>
       </section>
 ${abPanelHtml()}
+${continuityCardHtml()}
     </div>
 
     <div class="bt-page" data-page="result" style="display:none">
@@ -1393,6 +1431,7 @@ function bindPanel() {
     // Source page
     $id('reftext').addEventListener('input', updateRefCount);
     $id('savesrc').addEventListener('click', () => saveSourceFromUI(true));
+    bindCaehUI();
     $id('fetch').addEventListener('click', onFetchClick);
 
     // Test page
@@ -1724,7 +1763,7 @@ function updateRunState() {
     const run = $id('run');
     if (!run) return;
     $id('stop').style.display = running ? '' : 'none';
-    for (const id of ['run', 'evalchat', 'evalcard', 'fetch', 'buildprofile', 'autonames', 'diet_run', 'ref_diet']) {
+    for (const id of ['run', 'evalchat', 'evalcard', 'fetch', 'buildprofile', 'autonames', 'diet_run', 'ref_diet', 'anchor_grab', 'cont_run']) {
         $id(id)?.classList.toggle('disabled', running);
     }
     document.querySelectorAll('#bt_panel .bt-vset-btn').forEach(b => b.classList.toggle('disabled', running));
@@ -1749,6 +1788,12 @@ async function refreshPanelForChar() {
     $id('urls').value = (data.urls || []).join('\n');
     $id('reftext').value = data.refText || '';
     $id('authornote').value = data.authorNote || '';
+    $id('caehbase').value = data.caehBase || '';
+    $id('caehcaution').value = data.caehCaution || '';
+    $id('anchor').value = data.anchorText || '';
+    renderAnchorMeta(data);
+    renderContPick(data);
+    renderContResult(data.contLast);
     updateRefCount();
     renderHistory(data.history || []);
     renderVoiceForChar(data);
@@ -1773,6 +1818,9 @@ async function saveSourceFromUI(notify) {
     data.urls = $id('urls').value.split('\n').map(x => x.trim()).filter(Boolean);
     data.refText = $id('reftext').value;
     data.authorNote = $id('authornote').value;
+    data.caehBase = $id('caehbase').value;
+    data.caehCaution = $id('caehcaution').value;
+    if (data.anchorText !== $id('anchor').value) { data.anchorText = $id('anchor').value; data.anchorTime = data.anchorText ? Date.now() : 0; }
     await saveCharData(char, data);
     if (notify) toastr.success(`${char.name}의 원작 자료를 저장했어요`);
 }
@@ -1840,7 +1888,7 @@ function suggestionHtml(sg, i, copyCls, applyCls = '') {
         <div class="bt-sugg-head">
             <span class="bt-tag">${escapeHtml(FIELD_LABEL[sg.field] || sg.field || '')}</span>
             <span class="bt-tag bt-tag-ghost">${escapeHtml(ACTION_LABEL[sg.action] || sg.action || '')}</span>
-            ${funBadge(sg.fun_impact, sg.fun_note)}
+            ${funBadge(sg.fun_impact, sg.fun_note)}${contBadge(sg.continuity)}
             <span class="bt-sugg-btns">${copyBtn(copyCls, i)}${applyCls ? applyBtn(applyCls, i) : ''}</span>
         </div>
         <pre class="bt-paste">${escapeHtml(sg.text || '')}</pre>
@@ -2945,7 +2993,7 @@ function renderVoiceResult(entry, prev) {
                 <span class="bt-tag bt-prio-${pr}">${PRIO_LABEL[pr]}</span>
                 ${codeTag(f.version)}
                 <span class="bt-tag bt-tag-ghost">${escapeHtml(WHERE_LABEL[f.where] || f.where || '')}</span>
-                ${funBadge(f.fun_impact, f.fun_note)}
+                ${funBadge(f.fun_impact, f.fun_note)}${contBadge(f.continuity)}
             </div>
             ${f.fun_note && String(f.fun_impact).trim() === '-' ? `<div class="bt-fun-note down">${ico('masks-theater')}<span>${escapeHtml(f.fun_note)}</span></div>` : ''}
             ${f.how ? `<div class="bt-prose bt-fixhow">${prose(f.how)}</div>` : ''}
@@ -3510,7 +3558,7 @@ function renderDoctorCard(entry) {
     }).join('');
     const issues = [...(r.issues || [])].sort((a, b) => (SEV_ORDER[a.severity] ?? 3) - (SEV_ORDER[b.severity] ?? 3)).map((it, i) => `
         <article class="bt-issue bt-sev-line-${SEV_ORDER[it.severity] !== undefined ? it.severity : 'low'}">
-            <div class="bt-issue-head">${sevTag(it.severity)}<span class="bt-issue-cat">${escapeHtml(it.category || '')}</span>${it.where ? `<span class="bt-tag bt-tag-ghost">${escapeHtml(it.where)}</span>` : ''}${funBadge(it.fun_impact, it.fun_note)}</div>
+            <div class="bt-issue-head">${sevTag(it.severity)}<span class="bt-issue-cat">${escapeHtml(it.category || '')}</span>${it.where ? `<span class="bt-tag bt-tag-ghost">${escapeHtml(it.where)}</span>` : ''}${funBadge(it.fun_impact, it.fun_note)}${contBadge(it.continuity)}</div>
             <div class="bt-prose">${prose(it.problem)}</div>
             ${it.evidence ? `<blockquote class="bt-quote">${escapeHtml(it.evidence)}</blockquote>` : ''}
             ${it.fix ? `<dl class="bt-dl"><dt>수정</dt><dd class="bt-accent-text">${escapeHtml(it.fix)}</dd></dl>` : ''}
@@ -3707,6 +3755,7 @@ async function logApply(char, item) {
     cd.applyLog = [{ id: Date.now(), time: Date.now(), ...item }, ...(cd.applyLog || [])].slice(0, 30);
     await saveCharData(char, cd);
     renderApplyLog(cd);
+    renderContPick(cd);
 }
 
 /** Opens an editable preview; the user confirms before anything is written. */
@@ -4127,6 +4176,7 @@ async function compressText({ text, label, kind, level, keepExamples, positive, 
         kind === 'lore' ? '- This is a lorebook entry: keep it about ONE topic, name its subject explicitly so it makes sense on its own, and keep it concise.' : '',
         isReference ? '- Focus on personality, speech, values, relationships, likes/dislikes and major events. Drop trivia (voice actors, merchandise, release dates, popularity polls).' : '- Do not invent anything new.',
         (!isReference && protectFun) ? funProtectRules(charData) : '',
+        (!isReference && !protectFun) ? caehGuide(charData) : '',
         NO_SHIP_RULE,
         'Output format (no markdown fences):',
         '<compressed>',
@@ -4167,7 +4217,7 @@ async function splitToLore({ text, label, level, keepExamples, protectFun = true
         '- Never move voice, personality core, relationship to {{user}}, or fun mechanics into lore — those must stay in CORE.',
         keepExamples ? '- Keep quoted lines verbatim.' : '',
         '- 0-6 entries. If nothing is situational, output an empty <lore></lore> and only tighten CORE.',
-        protectFun ? funProtectRules(charData) : '',
+        protectFun ? funProtectRules(charData) : caehGuide(charData),
         NO_SHIP_RULE,
         'Output format (no markdown fences):',
         '<core>',
@@ -4714,8 +4764,11 @@ async function runFunAnalysis() {
         const greetings = [char.first_mes || char.data?.first_mes || '', ...(char.data?.alternate_greetings || [])].filter(Boolean);
         const lore = stats.lore.filter(e => e.enabled).slice(0, 30)
             .map(e => `- ${e.constant ? '[상시]' : `[키: ${e.keys.slice(0, 4).join(', ')}]`} ${e.name}: ${truncate(e.content.replace(/\s+/g, ' '), e.constant ? 900 : 300)}`).join('\n');
+        const cdDir = await loadCharData(char);
         const system = [
             'You are a veteran roleplay-bot designer. The creator says this bot is genuinely FUN to roleplay with. Analyze WHY, at the level of format and technique, so the fun can be protected and reused.',
+            caehGuide(cdDir),
+            CHANGE_DISCIPLINE,
             FUN_PRINCIPLES,
             'Find the concrete fun engines in THIS card (quote them), rate each, list what must never be cut, and suggest a few additions that would make it even more fun without flattening anything.',
             'style_summary: write the creator\'s "fun formula" as 6-10 short, reusable rules (in 한국어) that could guide edits to OTHER bots by the same creator.',
@@ -4771,7 +4824,7 @@ function renderFunAnalysis(data) {
     const protect = (fp.protect || []).map(p => `<li><b>${escapeHtml(p.what)}</b>${p.where ? ` <span class="bt-muted">· ${escapeHtml(p.where)}</span>` : ''}${p.quote ? `<div class="bt-quote">${escapeHtml(p.quote)}</div>` : ''}</li>`).join('');
     const improve = (r.improve || []).map((x, i) => `
         <article class="bt-sugg">
-            <div class="bt-sugg-head"><span class="bt-tag">${escapeHtml(FIELD_LABEL[x.where] || x.where || '')}</span>${funBadge(x.fun_impact || '+', x.fun_note)}
+            <div class="bt-sugg-head"><span class="bt-tag">${escapeHtml(FIELD_LABEL[x.where] || x.where || '')}</span>${funBadge(x.fun_impact || '+', x.fun_note)}${contBadge(x.continuity)}
                 <span class="bt-sugg-btns">${copyBtn('bt-funcopy', i)}${applyBtn('bt-funapply', i)}</span></div>
             <div class="bt-fixwhat" style="margin-top:6px">${escapeHtml(x.idea || '')}</div>
             ${x.why ? `<div class="bt-prose bt-muted">${prose(x.why)}</div>` : ''}
@@ -4817,6 +4870,301 @@ function renderFunAnalysis(data) {
         renderRestyleSource();
         toastr.info('기준 재미 스타일을 지웠어요');
         renderFunAnalysis(data);
+    });
+}
+
+
+// ---------------------------------------------------------------------------
+// Characterization direction (캐해 방향) + continuity (이어하기)
+// ---------------------------------------------------------------------------
+
+let caehSaveTimer = null;
+
+function renderAnchorMeta(data) {
+    const el = $id('anchor_meta');
+    if (el) el.textContent = data?.anchorTime ? `${new Date(data.anchorTime).toLocaleDateString()} 기준` : '선택';
+}
+
+function bindCaehUI() {
+    const save = () => { clearTimeout(caehSaveTimer); caehSaveTimer = setTimeout(async () => { await saveSourceFromUI(false); const ch = getCurrentCharacter(); if (ch) renderAnchorMeta(await loadCharData(ch)); }, 600); };
+    for (const id of ['caehbase', 'caehcaution', 'anchor']) $id(id).addEventListener('input', save);
+    $id('anchor_grab').addEventListener('click', grabAnchor);
+    $id('cont_run').addEventListener('click', runContinuity);
+}
+
+/** Reads the chat that is open now and writes down how the character is actually being played. */
+async function grabAnchor() {
+    if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
+    const char = getCurrentCharacter();
+    if (!char) { toastr.error('캐릭터 채팅을 먼저 열어주세요'); return; }
+    const msgs = ctx().chat.filter(m => m && !m.is_system && typeof m.mes === 'string');
+    const botCount = msgs.filter(m => !m.is_user).length;
+    if (botCount < 3) { toastr.warning('이 채팅에 봇 답장이 너무 적어요. 실제로 하던 채팅을 연 상태에서 눌러주세요.'); return; }
+    const ta = $id('anchor');
+    if (ta.value.trim() && ctx().callGenericPopup) {
+        const c = ctx();
+        const r = await c.callGenericPopup('지금 적혀 있는 이어가는 채팅 기준을 새로 가져온 내용으로 바꿀까요?', c.POPUP_TYPE.CONFIRM);
+        if (r !== c.POPUP_RESULT.AFFIRMATIVE && r !== true && r !== 1) return;
+    }
+    const s = getSettings();
+    const { userName, charName } = testerNames();
+    const cd = await loadCharData(char);
+    running = true;
+    updateRunState();
+    try {
+        const system = [
+            `You read an ongoing roleplay chat and write down how ${charName} is ACTUALLY being played in it, so that later edits to the character card do not break continuity.`,
+            'Describe what the chat shows, not what canon says. Quote short real lines from the chat as evidence.',
+            'Write in natural 한국어 (quotes stay in the chat\'s language). Plain text, no markdown headers, at most about 1200 characters.',
+            'Use exactly these five labeled parts, each 1-3 lines:',
+            '말투: first person, how they address {{user}}, sentence endings, dialect, tics — with 2-3 short quotes',
+            `{{user}}와의 거리감: how close they are right now, how ${charName} treats {{user}} (teasing, guarded, protective, …)`,
+            '성격이 드러나는 방식: recurring reactions and behaviours',
+            '이 채팅의 재미: running bits, in-jokes, dynamics that make this chat fun',
+            '지금 상황: what is going on in the story right now (reference only)',
+            NO_SHIP_RULE,
+        ].join('\n');
+        const prompt = [
+            caehGuide({ caehBase: cd.caehBase, caehCaution: cd.caehCaution }),
+            `[채팅 — 최근 ${Math.min(msgs.length, 40)}개]\n${msgs.slice(-40).map(m => `${m.is_user ? userName : charName}: ${truncate(m.mes, 1200)}`).join('\n\n')}`,
+            'Now write the five parts.',
+        ].filter(Boolean).join('\n\n');
+        const out = stripReasoning(await withTimer('🔗 이 채팅의 캐릭터 정리 중…', callLLM({ system, prompt, profileId: s.evalProfile, maxTokens: 6000 })))
+            .replace(/^```[a-z]*\s*|```$/g, '').trim();
+        if (!out) throw new Error('결과가 비어 있어요');
+        ta.value = out;
+        await saveSourceFromUI(false);
+        renderAnchorMeta(await loadCharData(char));
+        setStatus('✅ 이어가는 채팅 기준을 저장했어요 — 이제 제안이 이 채팅의 성격을 지켜요');
+        toastr.success('이어가는 채팅 기준을 저장했어요. 필요하면 직접 고쳐도 돼요.');
+    } catch (e) {
+        setStatus(`❌ 채팅 기준 가져오기 실패: ${e.message}`);
+        toastr.error(`실패: ${e.message}`);
+    } finally {
+        running = false;
+        updateRunState();
+    }
+}
+
+// --- continuity compare: same chat, pre-edit card vs current card ---
+
+const CONT_FIELDS = ['description', 'personality', 'scenario', 'mes_example', 'system_prompt', 'post_history', 'char_note'];
+
+function continuityCardHtml() {
+    return `
+      <section class="bt-card" id="bt_cont_card">
+        ${cardHead('Continuity', '이어하기 비교', '실제로 하던 채팅을 연 상태에서 누르세요. 같은 채팅 흐름에서 수정 전 카드와 지금 카드로 다음 답장을 하나씩 만들어, 원래 하던 캐릭터처럼 이어지는지와 재미를 비교해요. 채팅에는 아무것도 남지 않아요.')}
+        <div id="bt_cont_pick" class="bt-cont-pick"></div>
+        <div class="bt-actions">
+          <button type="button" id="bt_cont_run" class="bt-btn bt-btn-primary bt-btn-wide">${ico('link')}<span>이어하기 비교</span></button>
+        </div>
+      </section>
+      <div id="bt_cont_result" class="bt-result"></div>`;
+}
+
+function contCandidates(data) {
+    return (data?.applyLog || []).filter(x => !x.undone && ['field', 'lore', 'lore-edit'].includes(x.kind)).slice(0, 10);
+}
+
+function renderContPick(data) {
+    const el = $id('cont_pick');
+    if (!el) return;
+    const items = contCandidates(data);
+    if (!items.length) {
+        el.innerHTML = '<p class="bt-note">아직 적용한 수정이 없어요. 제안을 카드에 <b>적용</b>한 뒤에 비교할 수 있어요.</p>';
+        $id('cont_run')?.classList.add('disabled');
+        return;
+    }
+    $id('cont_run')?.classList.toggle('disabled', running);
+    const newest = items[0].time;
+    el.innerHTML = `<span class="bt-field-label">비교할 수정 <span class="bt-field-hint">체크한 것만 되돌린 카드가 “수정 전”이에요</span></span>
+        <div class="bt-stack bt-cont-list">${items.map(x => `
+        <label class="bt-fixcheck bt-cont-item">
+            <input type="checkbox" value="${x.id}" ${newest - x.time < 24 * 3600e3 ? 'checked' : ''}>
+            <span class="bt-checkmark" aria-hidden="true">${ico('check')}</span>
+            <span class="bt-cont-text"><b>${escapeHtml(x.label || '')}</b><small>${escapeHtml(new Date(x.time).toLocaleString())}</small></span>
+        </label>`).join('')}</div>`;
+}
+
+function fillNames(text, userName, charName) {
+    return String(text || '').replace(/\{\{user\}\}/gi, userName).replace(/\{\{char\}\}/gi, charName);
+}
+
+async function loreForVersions(char, picked, recentText) {
+    const worldName = char?.data?.extensions?.world;
+    const out = { before: [], after: [] };
+    if (!worldName || typeof ctx().loadWorldInfo !== 'function') return out;
+    let data = null;
+    try { data = await ctx().loadWorldInfo(worldName); } catch { return out; }
+    const added = new Set(picked.filter(x => x.kind === 'lore' && x.world === worldName).map(x => String(x.uid)));
+    const edited = {};
+    // applyLog is newest-first; the oldest "before" of an entry is its pre-edit state
+    for (const x of picked) if (x.kind === 'lore-edit' && x.world === worldName) edited[String(x.uid)] = x.before ?? '';
+    const hay = recentText.toLowerCase();
+    for (const e of Object.values(data?.entries || {})) {
+        if (e.disable || !String(e.content || '').trim()) continue;
+        const hit = e.constant || (e.key || []).some(k => k && hay.includes(String(k).toLowerCase()));
+        if (!hit) continue;
+        const uid = String(e.uid);
+        out.after.push(`- ${e.comment || (e.key || [])[0] || ''}: ${e.content}`);
+        if (added.has(uid)) continue;
+        out.before.push(`- ${e.comment || (e.key || [])[0] || ''}: ${uid in edited ? edited[uid] : e.content}`);
+    }
+    return out;
+}
+
+async function generateNextReply({ fields, lore, history, userName, charName }) {
+    const f = (k) => fillNames(fields[k], userName, charName).trim();
+    const system = [
+        f('system_prompt') || `You are ${charName} in an ongoing roleplay with ${userName}. Stay fully in character.`,
+        f('description') ? `[${charName}]\n${f('description')}` : '',
+        f('personality') ? `[Personality]\n${f('personality')}` : '',
+        f('scenario') ? `[Scenario]\n${f('scenario')}` : '',
+        lore.length ? `[World info]\n${fillNames(lore.join('\n'), userName, charName)}` : '',
+        f('mes_example') ? `[Example dialogue]\n${f('mes_example')}` : '',
+        f('char_note') ? `[Character note]\n${f('char_note')}` : '',
+        f('post_history'),
+        `Write ONLY ${charName}'s next reply to the last message. Match the length and format of ${charName}'s earlier replies in this chat. Never write ${userName}'s lines or actions.`,
+    ].filter(Boolean).join('\n\n');
+    const prompt = `${history}\n\n${charName}:`;
+    const out = await callLLM({ system, prompt, profileId: '', maxTokens: Math.max(Number(getSettings().testerMaxTokens) || 0, 3000) });
+    return stripReasoning(out).replace(new RegExp(`^${charName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:\\s*`), '').trim();
+}
+
+async function runContinuity() {
+    if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
+    const char = getCurrentCharacter();
+    if (!char) { toastr.error('캐릭터 채팅을 먼저 열어주세요'); return; }
+    const cd = await loadCharData(char);
+    const ids = [...document.querySelectorAll('#bt_cont_pick input:checked')].map(x => Number(x.value));
+    const picked = contCandidates(cd).filter(x => ids.includes(x.id));
+    if (!picked.length) { toastr.warning('비교할 수정을 골라주세요'); return; }
+    const msgs = ctx().chat.filter(m => m && !m.is_system && typeof m.mes === 'string');
+    let last = -1;
+    for (let i = msgs.length - 1; i >= 0; i--) if (msgs[i].is_user) { last = i; break; }
+    if (last < 2 || msgs.slice(0, last).filter(m => !m.is_user).length < 2) { toastr.warning('이어서 비교할 채팅이 부족해요. 봇 답장이 몇 개 있는 실제 채팅을 열어주세요.'); return; }
+    const { userName, charName } = testerNames();
+    const s = getSettings();
+    const context = msgs.slice(Math.max(0, last - 15), last + 1);
+    const history = context.map(m => `${m.is_user ? userName : charName}: ${truncate(m.mes, 1500)}`).join('\n\n');
+    const actual = msgs.slice(last + 1).find(m => !m.is_user)?.mes || '';
+
+    // current card vs card with the picked edits reverted (newest-first log → oldest "before" wins)
+    const after = Object.fromEntries(CONT_FIELDS.map(k => [k, rawCardValue(char, k)]));
+    const before = { ...after };
+    for (const x of picked) if (x.kind === 'field' && CONT_FIELDS.includes(x.field)) before[x.field] = x.before ?? '';
+    const lore = await loreForVersions(char, picked, history);
+    const changedFields = CONT_FIELDS.filter(k => before[k] !== after[k]);
+    if (!changedFields.length && lore.before.join() === lore.after.join()) {
+        toastr.info('고른 수정이 답장에 들어가는 칸을 바꾸지 않아요 (첫 메시지만 바꿨거나 이미 되돌린 경우).');
+        return;
+    }
+
+    running = true;
+    stopRequested = false;
+    updateRunState();
+    try {
+        const replyBefore = await withTimer('🔗 수정 전 카드로 다음 답장 만드는 중…', generateNextReply({ fields: before, lore: lore.before, history, userName, charName }));
+        if (stopRequested) throw new Error('중단됨');
+        const replyAfter = await withTimer('🔗 지금 카드로 다음 답장 만드는 중…', generateNextReply({ fields: after, lore: lore.after, history, userName, charName }));
+        if (stopRequested) throw new Error('중단됨');
+        const swap = Math.random() < 0.5; // hide which one is new from the judge
+        const X = swap ? replyAfter : replyBefore;
+        const Y = swap ? replyBefore : replyAfter;
+        const system = [
+            'You judge two candidate next replies in an ongoing roleplay. The creator edited the character card and keeps playing THIS chat, so the character must still feel like the same person the chat has established.',
+            caehGuide(cd),
+            CHANGE_DISCIPLINE,
+            'Score each candidate 0-100 on: continuity (same voice, attitude and distance toward the user as earlier in the chat), fun (scene energy, hooks, personality on the page, gives the user something to react to), direction (fits the creator\'s intended characterization and cautions; if none are given, fits the character as established).',
+            'In every Korean text, refer to the candidates ONLY as [X] and [Y] (with the square brackets).',
+            'changed_ko: in Korean, what concretely differs between X and Y in personality, voice or distance (quote short bits). advice_ko: if one is weaker, what to change in the CARD so the edited version keeps continuity and fun (1-3 short points, Korean).',
+            NO_SHIP_RULE,
+            'JSON rules: straight double quotes, escape " inside strings, no trailing commas. Output ONE JSON object only:',
+            '{"x": {"continuity": 0, "fun": 0, "direction": 0}, "y": {"continuity": 0, "fun": 0, "direction": 0}, "better": "x"|"y"|"tie", "changed_ko": "", "verdict_ko": "<2-3문장>", "advice_ko": ["..."]}',
+        ].filter(Boolean).join('\n\n');
+        const prompt = [
+            `[채팅 흐름 — 여기까지가 지금까지의 롤플]\n${history}`,
+            `[후보 X]\n${X}`,
+            `[후보 Y]\n${Y}`,
+            'Now output the JSON.',
+        ].join('\n\n');
+        const j = await requestJsonComplete({ system, prompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: '⚖️ 어느 쪽이 더 이어지는지 비교 중…' });
+        const nameOf = (t) => String(t || '')
+            .replace(/\[X\]|(?<![A-Za-z])X(?![A-Za-z])/g, swap ? '[지금 카드]' : '[수정 전 카드]')
+            .replace(/\[Y\]|(?<![A-Za-z])Y(?![A-Za-z])/g, swap ? '[수정 전 카드]' : '[지금 카드]')
+            .replace(/후보\s*(?=\[)/g, '');
+        j.changed_ko = nameOf(j.changed_ko); j.verdict_ko = nameOf(j.verdict_ko);
+        if (Array.isArray(j.advice_ko)) j.advice_ko = j.advice_ko.map(nameOf); else if (j.advice_ko) j.advice_ko = nameOf(j.advice_ko);
+        const sc = (o) => ({ continuity: Number(o?.continuity) || 0, fun: Number(o?.fun) || 0, direction: Number(o?.direction) || 0 });
+        const res = {
+            time: Date.now(),
+            picked: picked.map(x => ({ id: x.id, label: x.label })),
+            changed: changedFields,
+            replyBefore, replyAfter, actual,
+            before: sc(swap ? j.y : j.x),
+            after: sc(swap ? j.x : j.y),
+            better: j.better === 'tie' ? 'tie' : ((j.better === 'x') !== swap ? 'before' : 'after'),
+            changed_ko: j.changed_ko || '', verdict_ko: j.verdict_ko || '',
+            advice: Array.isArray(j.advice_ko) ? j.advice_ko : (j.advice_ko ? [String(j.advice_ko)] : []),
+        };
+        const fresh = await loadCharData(char);
+        fresh.contLast = res;
+        await saveCharData(char, fresh);
+        renderContResult(res);
+        const d = (res.after.continuity + res.after.fun) - (res.before.continuity + res.before.fun);
+        setStatus(d >= 0 ? '✅ 이어하기 비교 완료 — 지금 카드가 괜찮아요' : '⚠️ 이어하기 비교 완료 — 수정 전 카드가 더 잘 이어져요');
+        setMinimized(false);
+        scrollPanelTo($id('cont_result'));
+    } catch (e) {
+        console.error(LOG, e);
+        setStatus(`❌ 이어하기 비교 실패: ${e.message}`);
+        toastr.error(`이어하기 비교 실패: ${e.message}`);
+    } finally {
+        running = false;
+        updateRunState();
+    }
+}
+
+function renderContResult(res) {
+    const el = $id('cont_result');
+    if (!el) return;
+    if (!res) { el.innerHTML = ''; return; }
+    const row = (label, a, b) => {
+        const d = b - a;
+        return `<div class="bt-cont-row"><span>${label}</span>
+            <span class="bt-cont-bars"><i style="width:${a}%"></i><i class="b" style="width:${b}%"></i></span>
+            <b>${a}</b><b class="b">${b}</b><span class="bt-delta ${d > 0 ? 'up' : d < 0 ? 'down' : ''}">${d === 0 ? '±0' : `${d > 0 ? '+' : ''}${d}`}</span></div>`;
+    };
+    const worse = res.better === 'before';
+    el.innerHTML = `
+        <section class="bt-card ${worse ? 'bt-card-warn' : 'bt-card-accent'}">
+            ${cardHead('Continuity', worse ? '수정 전이 더 잘 이어져요' : res.better === 'after' ? '지금 카드도 잘 이어져요' : '비슷해요', escapeHtml(new Date(res.time).toLocaleString()))}
+            <div class="bt-cont-legend"><span><i></i>수정 전</span><span><i class="b"></i>지금</span></div>
+            <div class="bt-cont-rows">
+                ${row('이어짐', res.before.continuity, res.after.continuity)}
+                ${row('재미', res.before.fun, res.after.fun)}
+                ${row('캐해 방향', res.before.direction, res.after.direction)}
+            </div>
+            ${res.verdict_ko ? `<div class="bt-prose" style="margin-top:12px">${prose(res.verdict_ko)}</div>` : ''}
+            ${res.changed_ko ? `<div class="bt-diet-removed"><span>달라진 점</span><div class="bt-prose bt-muted">${prose(res.changed_ko)}</div></div>` : ''}
+            ${res.advice?.length ? `<div class="bt-restyle-changes"><span>이어지게 고치려면</span>${renderList(res.advice)}</div>` : ''}
+            <div class="bt-ab-pair" style="margin-top:12px">
+                <div><span class="bt-ab-badge">수정 전</span><div class="bt-ab-reply">${escapeHtml(res.replyBefore)}</div></div>
+                <div><span class="bt-ab-badge bt-ab-badge-b">지금</span><div class="bt-ab-reply">${escapeHtml(res.replyAfter)}</div></div>
+            </div>
+            ${res.actual ? `<details class="bt-disclosure bt-disclosure-sm"><summary><span>채팅에 실제로 있던 답장</span>${ico('chevron-down')}</summary><div class="bt-ab-reply">${escapeHtml(res.actual)}</div></details>` : ''}
+            <div class="bt-actions">
+                ${worse ? `<button type="button" id="bt_cont_undo" class="bt-btn bt-btn-primary">${ico('rotate-left')}<span>비교한 수정 되돌리기</span></button>` : ''}
+                <button type="button" id="bt_cont_again" class="bt-btn">${ico('rotate')}<span>다시 비교</span></button>
+            </div>
+            <p class="bt-note">답장은 매번 조금씩 달라요. 결과가 애매하면 한 번 더 비교해 보세요.</p>
+        </section>`;
+    $id('cont_again')?.addEventListener('click', runContinuity);
+    $id('cont_undo')?.addEventListener('click', async () => {
+        for (const p of res.picked) await undoApply(p.id);
+        const ch = getCurrentCharacter();
+        if (ch) renderContPick(await loadCharData(ch));
+        toastr.success('비교한 수정을 되돌렸어요');
     });
 }
 
