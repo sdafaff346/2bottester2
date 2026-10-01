@@ -34,6 +34,7 @@ const defaultSettings = Object.freeze({
     vibrateOn: true,        // 모바일 진동
     notifyOn: false,        // 브라우저 알림 (다른 탭에 있을 때)
     funReference: '',       // creator's proven fun style (from 재미 분석)
+    loreAsReference: true,  // use linked lorebooks as reference material in evaluation
     funReferenceSamples: '', // short quotes from the reference bot (format examples for restyle)
     accent: 'champagne',
     panelPos: null,
@@ -954,8 +955,9 @@ async function runEvaluation({ useChat = true, messages = 0 } = {}) {
 
     const s = getSettings();
     const charData = await loadCharData(char);
-    if (!charData.refText?.trim()) {
-        toastr.warning('원작 자료가 없어요. “원작 자료” 탭에서 링크를 불러오거나 내용을 붙여넣어 주세요.');
+    const loreRef = s.loreAsReference ? await loreReferenceText(char, 8000).catch(() => '') : '';
+    if (!charData.refText?.trim() && !loreRef) {
+        toastr.warning('원작 자료가 없어요. “원작 자료” 탭에서 링크를 불러오거나 내용을 붙여넣어 주세요. 연결된 로어북이 있으면 그것만으로도 평가할 수 있어요.');
         switchTab('source');
         return;
     }
@@ -974,6 +976,7 @@ async function runEvaluation({ useChat = true, messages = 0 } = {}) {
         'You are a meticulous fandom expert and character-bot reviewer.',
         'Compare how a fan-made roleplay bot portrays a character against the ORIGINAL source material, and give actionable feedback to the bot creator.',
         'Judge ONLY against the provided reference material. If the reference does not cover something, do not invent canon — say the reference lacks it.',
+        loreRef ? 'The linked lorebook is also reference material: it defines THIS bot\'s world, relationships and rules (it may contain deliberate AU changes that override the wiki). When the bot contradicts or ignores the lorebook, report it as an issue with category and say which entry.' : '',
         'Differences the creator explicitly marked as intentional (AU / 설정 변경) must NOT reduce the score; mention them as "의도된 변경" at most.',
         `Write every human-readable string in ${s.language}.`,
         'JSON rules: straight double quotes for keys/strings, escape any " inside strings as \\", no trailing commas, no comments. Keep lists short (max 6 issues, 5 card_suggestions).',
@@ -997,7 +1000,8 @@ async function runEvaluation({ useChat = true, messages = 0 } = {}) {
     ].join('\n');
 
     const prompt = [
-        `[원작 자료: ${char.name}]\n${truncate(charData.refText, Number(s.refMaxChars) || 15000)}`,
+        charData.refText?.trim() ? `[원작 자료: ${char.name}]\n${truncate(charData.refText, Number(s.refMaxChars) || 15000)}` : '[원작 자료 없음 — 아래 로어북을 기준 자료로 사용]',
+        loreRef ? `[연결된 로어북 — 이 봇 세계관의 기준 설정]\n${loreRef}` : '',
         charData.authorNote ? `[제작자 메모 — 의도한 AU/설정 변경 (감점 금지)]\n${charData.authorNote}` : '',
         `[캐릭터 카드]\n${collectCard(char)}`,
         useChat ? `[테스트 대화 로그 (최근 ${s.evalMessages}개)]\n${chatLog}` : '',
@@ -1284,6 +1288,7 @@ ${doctorPageHtml()}
           </select>`)}
         <div class="bt-switches">
           ${toggle('lorebook', '내장 로어북도 평가에 포함')}
+          ${toggle('loreref', '연결된 로어북을 기준 자료로 쓰기', '평가할 때 로어북 설정과 어긋나는 답장도 찾아요. 원작 자료가 없어도 로어북만으로 평가할 수 있어요.')}
         </div>
       </section>
 
@@ -1426,6 +1431,7 @@ function bindPanel() {
     bindCheck('newchat', 'newChat');
     bindCheck('autoeval', 'autoEvalAfterTest');
     bindCheck('lorebook', 'includeLorebook');
+    bindCheck('loreref', 'loreAsReference');
 
     const scen = $id('scenario');
     scen.value = s.scenario;
@@ -1888,7 +1894,7 @@ const SEV_ORDER = { high: 0, medium: 1, low: 2 };
 const ACTION_LABEL = { add: '추가', edit: '수정', remove: '삭제' };
 const FIELD_LABEL = {
     description: 'Description', personality: 'Personality', scenario: 'Scenario', first_mes: '첫 메시지',
-    mes_example: '예시 대사', lorebook: '로어북', system_prompt: '시스템 프롬프트', post_history: 'Post-History', author_note: '작가 노트',
+    mes_example: '예시 대사', lorebook: '로어북', system_prompt: '시스템 프롬프트', post_history: 'Post-History', author_note: '작가 노트', char_note: 'Character Note',
 };
 
 function sevTag(sev) {
@@ -3495,6 +3501,10 @@ function doctorPageHtml() {
             <span class="bt-doc-ico">${ico('calculator')}</span>
             <span class="bt-vset-text"><b>토큰·구조 검사</b><small>AI를 쓰지 않아서 바로 끝나요. 금지문 비율, 중복, 로어북 키워드까지 봐요.</small></span>${ico('chevron-right')}
           </button>
+          <button type="button" class="bt-vset-btn" id="bt_docbtn_lore">
+            <span class="bt-doc-ico">${ico('book-atlas')}</span>
+            <span class="bt-vset-text"><b>로어북 검사</b><small>연결된 로어북 전부를 검사하고, 로어북을 기준으로 채팅과 카드도 검사해요.</small></span>${ico('chevron-right')}
+          </button>
           <button type="button" class="bt-vset-btn" id="bt_docbtn_card">
             <span class="bt-doc-ico">${ico('stethoscope')}</span>
             <span class="bt-vset-text"><b>AI 심층 진단</b><small>GPT·Claude·Gemini 적합도, 금지문·모순·모호한 설정, 고쳐 쓴 예시</small></span>${ico('chevron-right')}
@@ -3509,6 +3519,7 @@ function doctorPageHtml() {
       <div id="bt_doc_fun" class="bt-result"></div>
 ${restyleCardHtml()}
       <div id="bt_doc_local_view" class="bt-result"></div>
+      <div id="bt_doc_lore" class="bt-result"></div>
       <div id="bt_doc_card" class="bt-result"></div>
       <div id="bt_doc_chat" class="bt-result"></div>
 ${dietCardHtml()}
@@ -3668,6 +3679,8 @@ async function runDoctorLocal(silent = false) {
 
 function renderDoctorForChar(data) {
     if ($id('doc_local_view')) $id('doc_local_view').innerHTML = '';
+    if (loreCheckCache && loreCheckCache.char !== getCurrentCharacter()?.avatar) loreCheckCache = null;
+    renderLoreCheck();
     renderFunAnalysis(data);
     renderDoctorCard(data?.doctor?.card);
     renderDoctorChat(data?.doctor?.chat);
@@ -3680,6 +3693,7 @@ function bindDoctorPage() {
     $id('docbtn_card').addEventListener('click', runCardDoctor);
     $id('docbtn_chat').addEventListener('click', runChatDoctor);
     $id('docbtn_fun').addEventListener('click', runFunAnalysis);
+    $id('docbtn_lore').addEventListener('click', runLoreCheck);
 }
 
 // ---------------------------------------------------------------------------
@@ -3861,6 +3875,11 @@ async function undoApply(id) {
             const e = data?.entries?.[item.uid];
             if (!e) { toastr.info('그 로어북 항목은 이미 없어요'); }
             else { e.content = item.before ?? ''; await c.saveWorldInfo(item.world, data, true); try { c.reloadWorldInfoEditor?.(item.world, true); } catch { /* optional */ } toastr.success('로어북 항목을 요약 전으로 되돌렸어요'); }
+        } else if (item.kind === 'lore-keys') {
+            const data = await c.loadWorldInfo(item.world);
+            const e = data?.entries?.[item.uid];
+            if (!e) { toastr.info('그 로어북 항목은 이미 없어요'); }
+            else { e.key = [...(item.before || [])]; await c.saveWorldInfo(item.world, data, true); try { c.reloadWorldInfoEditor?.(item.world, true); } catch { /* optional */ } toastr.success('로어북 키워드를 되돌렸어요'); }
         } else if (item.kind === 'lore') {
             const ok = await removeLoreEntry(item.world, item.uid);
             toastr[ok ? 'success' : 'info'](ok ? '추가했던 로어북 항목을 지웠어요' : '그 로어북 항목은 이미 없어요');
@@ -5275,6 +5294,643 @@ function renderContResult(res) {
         if (ch) renderContPick(await loadCharData(ch));
         toastr.success('비교한 수정을 되돌렸어요');
     });
+}
+
+
+// ---------------------------------------------------------------------------
+// Lorebook check (로어북 검사): every lorebook linked to this character/chat
+// ---------------------------------------------------------------------------
+
+const BOOK_KIND = {
+    char: { label: '캐릭터 기본', order: 0 },
+    extra: { label: '캐릭터 추가', order: 1 },
+    chat: { label: '이 채팅 전용', order: 2 },
+    global: { label: '전역', order: 3 },
+};
+
+let loreCheckCache = null; // { books, entries, findings, sim, ai }
+
+async function worldInfoModule() {
+    try { return await import('../../../world-info.js'); } catch { return null; }
+}
+
+/** Every lorebook that can fire in this chat, with where it is linked from. */
+async function getLinkedBooks(char) {
+    const wi = await worldInfoModule();
+    const out = [];
+    const push = (name, kind) => { if (name && !out.some(b => b.name === name)) out.push({ name, kind }); };
+    push(char?.data?.extensions?.world, 'char');
+    const file = String(char?.avatar || '').replace(/\.[^.]+$/, '');
+    const charLore = wi?.world_info?.charLore || ctx().worldInfo?.charLore || [];
+    for (const name of charLore.find(x => x?.name === file)?.extraBooks || []) push(name, 'extra');
+    push(ctx().chatMetadata?.[wi?.METADATA_KEY || 'world_info'], 'chat');
+    for (const name of wi?.selected_world_info || []) push(name, 'global');
+    return out;
+}
+
+function wiGlobals(wi) {
+    return {
+        depth: Number(wi?.world_info_depth ?? 2) || 2,
+        wholeWords: !!wi?.world_info_match_whole_words,
+        caseSensitive: !!wi?.world_info_case_sensitive,
+        recursive: wi?.world_info_recursive !== false,
+    };
+}
+
+const HANGUL_RE = /[가-힯]/;
+
+function parseRegexKey(k) {
+    const m = String(k).match(/^\/([\s\S]+)\/([a-z]*)$/i);
+    if (!m) return null;
+    try { return { re: new RegExp(m[1], m[2]) }; } catch (e) { return { error: e.message }; }
+}
+
+/** Mirrors SillyTavern's keyword matching closely enough to predict what fires. */
+function keyMatches(key, text, { wholeWords, caseSensitive }) {
+    const k = String(key || '').trim();
+    if (!k) return false;
+    const rx = parseRegexKey(k);
+    if (rx) return !!rx.re && rx.re.test(text);
+    const hay = caseSensitive ? text : text.toLowerCase();
+    const needle = caseSensitive ? k : k.toLowerCase();
+    if (!wholeWords || needle.includes(' ')) return hay.includes(needle);
+    const esc = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`(?:^|\\W)(${esc})(?:$|\\W)`, caseSensitive ? '' : 'i').test(hay);
+}
+
+function entryFires(e, text, g) {
+    if (e.disable) return false;
+    if (e.constant) return true;
+    const opt = { wholeWords: e.matchWholeWords ?? g.wholeWords, caseSensitive: e.caseSensitive ?? g.caseSensitive };
+    const primary = (e.key || []).some(k => keyMatches(k, text, opt));
+    if (!primary) return false;
+    const sec = (e.keysecondary || []).filter(Boolean);
+    if (!e.selective || !sec.length) return true;
+    const hits = sec.map(k => keyMatches(k, text, opt));
+    switch (Number(e.selectiveLogic) || 0) {
+        case 1: return !hits.every(Boolean); // NOT ALL
+        case 2: return !hits.some(Boolean);  // NOT ANY
+        case 3: return hits.every(Boolean);  // AND ALL
+        default: return hits.some(Boolean);  // AND ANY
+    }
+}
+
+async function collectLoreForCheck(char) {
+    const books = await getLinkedBooks(char);
+    const entries = [];
+    for (const b of books) {
+        try {
+            const data = await ctx().loadWorldInfo(b.name);
+            const list = Object.values(data?.entries || {});
+            b.count = list.length;
+            for (const e of list) {
+                entries.push({
+                    ...e,
+                    book: b.name, bookKind: b.kind,
+                    name: e.comment || (e.key || []).slice(0, 3).join(', ') || `#${e.uid}`,
+                    key: (e.key || []).map(String).filter(x => x.trim()),
+                    keysecondary: (e.keysecondary || []).map(String).filter(x => x.trim()),
+                    content: String(e.content || ''),
+                    tokens: e.disable ? 0 : await countTokens(String(e.content || '')),
+                });
+            }
+        } catch (err) {
+            b.error = err.message;
+        }
+    }
+    books.sort((a, b) => BOOK_KIND[a.kind].order - BOOK_KIND[b.kind].order);
+    return { books, entries };
+}
+
+function lintLore({ books, entries }, char, g, chatText, chatIsKorean) {
+    const findings = [];
+    const add = (severity, category, title, detail, examples = []) => findings.push({ severity, category, title, detail, examples });
+    const label = (e) => `${e.name}${books.length > 1 ? ` · ${e.book}` : ''}`;
+    const active = entries.filter(e => !e.disable);
+
+    if (!books.length) {
+        const embedded = char?.data?.character_book?.entries?.length || 0;
+        add(embedded ? 'high' : 'low', '연결', embedded ? `카드에 내장 로어북(${embedded}개 항목)이 있지만 연결돼 있지 않아요` : '연결된 로어북이 없어요',
+            embedded ? '내장 로어북은 가져오기 전에는 롤플에 들어가지 않아요. 캐릭터 편집 화면의 🌐 버튼으로 로어북을 가져와 연결하세요.' : '캐릭터 편집 화면의 🌐 버튼에서 기본 로어북이나 추가 로어북을 연결할 수 있어요.');
+        return findings;
+    }
+    for (const b of books.filter(x => x.error)) add('high', '연결', `“${b.name}” 로어북을 불러오지 못했어요`, `파일이 지워졌거나 이름이 바뀌었을 수 있어요. (${b.error})`);
+
+    const never = active.filter(e => !e.constant && !e.key.length && !e.vectorized);
+    if (never.length) add('high', '발동 안 됨', `절대 켜지지 않는 항목이 ${never.length}개 있어요`, '상시도 아니고 키워드도 없어서 롤플에 한 번도 들어가지 않아요. 키워드를 넣거나 상시로 바꾸세요.', never.slice(0, 6).map(label));
+
+    const empty = active.filter(e => !e.content.trim());
+    if (empty.length) add('medium', '내용', `내용이 빈 항목이 ${empty.length}개 있어요`, '켜져도 아무것도 들어가지 않아요. 지우거나 내용을 채우세요.', empty.slice(0, 6).map(label));
+
+    const badRegex = active.flatMap(e => e.key.concat(e.keysecondary).map(k => ({ e, k, r: parseRegexKey(k) })).filter(x => x.r?.error));
+    if (badRegex.length) add('high', '키워드', `정규식 키워드가 잘못 써져 있어요 (${badRegex.length}개)`, '정규식 문법이 틀리면 그 키워드는 아예 동작하지 않아요.', badRegex.slice(0, 5).map(x => `${label(x.e)}: ${x.k}`));
+
+    const commonKeys = new Set(['나', '너', '그', '그녀', '우리', '사람', '말', '것', '오늘', 'the', 'a', 'i', 'you', 'he', 'she', 'it', 'and', 'is', '私', '俺', '僕', 'の', 'は', 'が']);
+    const weak = active.flatMap(e => e.key.filter(k => !parseRegexKey(k) && (k.trim().length <= 1 || commonKeys.has(k.trim().toLowerCase()))).map(k => `${label(e)}: “${k}”`));
+    if (weak.length) add('medium', '키워드', `너무 흔한 키워드가 있어요 (${weak.length}개)`, '한 글자나 흔한 단어가 키워드면 거의 매번 켜져서 상시 항목처럼 토큰을 먹어요.', weak.slice(0, 6));
+
+    const names = [char?.name, ctx().name2, ctx().name1].filter(Boolean).flatMap(n => [n, ...String(n).split(/\s+/)]).map(x => x.trim().toLowerCase()).filter(x => x.length >= 2);
+    const nameKeyed = active.filter(e => !e.constant && e.key.some(k => names.includes(k.trim().toLowerCase())));
+    if (nameKeyed.length) add('medium', '키워드', `캐릭터·유저 이름이 키워드인 항목이 ${nameKeyed.length}개 있어요`, '이름은 거의 매 턴 나와서 사실상 상시 항목이 돼요. 정말 늘 필요하면 상시로 두고, 아니면 그 항목만의 단어(장소·사건·물건 이름)를 키워드로 쓰세요.', nameKeyed.slice(0, 6).map(label));
+
+    if (chatIsKorean) {
+        const noKo = active.filter(e => !e.constant && e.key.length && !e.key.some(k => HANGUL_RE.test(k) || parseRegexKey(k)));
+        if (noKo.length) add('medium', '키워드', `한국어로 롤플하는데 한국어 키워드가 없는 항목이 ${noKo.length}개 있어요`, '키워드가 일본어·영어로만 돼 있으면 한국어 채팅에서는 안 켜져요. 한국어 이름·별명도 키워드에 넣으세요.', noKo.slice(0, 6).map(e => `${label(e)} (${e.key.slice(0, 3).join(', ')})`));
+    }
+
+    const keyMap = new Map();
+    for (const e of active) for (const k of e.key) { const kk = k.trim().toLowerCase(); keyMap.set(kk, [...(keyMap.get(kk) || []), label(e)]); }
+    const dup = [...keyMap.entries()].filter(([, v]) => v.length > 1);
+    if (dup.length) add('low', '키워드', `여러 항목이 같은 키워드를 써요 (${dup.length}개)`, '같은 키워드에 여러 항목이 한꺼번에 켜져서 토큰이 튈 수 있어요. 의도한 게 아니면 정리하세요.', dup.slice(0, 5).map(([k, v]) => `“${k}” → ${v.join(', ')}`));
+
+    const constTok = active.filter(e => e.constant).reduce((a, e) => a + e.tokens, 0);
+    if (constTok > 1500) add('medium', '토큰', `상시 항목이 매 턴 ${constTok.toLocaleString()} 토큰을 써요`, '상시 항목은 카드 본문처럼 매번 들어가요. 늘 필요한 것만 상시로 두고 나머지는 키워드 항목으로 바꾸세요.', active.filter(e => e.constant).sort((a, b) => b.tokens - a.tokens).slice(0, 5).map(e => `${label(e)} (${e.tokens})`));
+    const big = active.filter(e => e.tokens > 600);
+    if (big.length) add('low', '토큰', `아주 긴 항목이 ${big.length}개 있어요`, '켜질 때마다 토큰이 크게 늘어요. 주제별로 쪼개면 필요한 부분만 들어가요.', big.slice(0, 5).map(e => `${label(e)} (${e.tokens} 토큰)`));
+
+    const rare = active.filter(e => e.useProbability !== false && Number(e.probability ?? 100) < 100);
+    if (rare.length) add('low', '설정', `확률이 100%가 아닌 항목이 ${rare.length}개 있어요`, '키워드가 나와도 가끔만 들어가요. 의도한 게 아니면 확률을 100으로 바꾸세요.', rare.slice(0, 5).map(e => `${label(e)} (${e.probability}%)`));
+
+    // overlap with the card → paid twice
+    const card = normText(collectCard(char));
+    const overlap = active.map(e => {
+        const sents = e.content.split(/(?<=[.!?。！？\n])/).map(normText).filter(x => x.length >= 14);
+        const hit = sents.filter(x => card.includes(x)).length;
+        return { e, ratio: sents.length ? hit / sents.length : 0 };
+    }).filter(x => x.ratio >= 0.4);
+    if (overlap.length) add('medium', '중복', `카드 본문과 내용이 겹치는 항목이 ${overlap.length}개 있어요`, '같은 내용이 카드와 로어북에 둘 다 있으면 켜질 때 토큰을 두 번 써요. 한쪽에만 남기세요.', overlap.slice(0, 5).map(x => `${label(x.e)} (${Math.round(x.ratio * 100)}% 겹침)`));
+
+    // recursion chains: an entry whose content contains other entries' keys pulls them in too
+    if (g.recursive) {
+        const pulls = active.filter(e => !e.preventRecursion).map(e => ({ e, n: active.filter(o => o !== e && !o.constant && !o.excludeRecursion && o.key.some(k => keyMatches(k, e.content, { wholeWords: false, caseSensitive: false }))).length }))
+            .filter(x => x.n >= 3).sort((a, b) => b.n - a.n);
+        if (pulls.length) add('low', '재귀', `다른 항목을 줄줄이 불러오는 항목이 ${pulls.length}개 있어요`, '내용 안에 다른 항목의 키워드가 있으면 그 항목도 같이 켜져요(재귀). 의도한 게 아니면 “재귀 방지”를 켜세요.', pulls.slice(0, 5).map(x => `${label(x.e)} → ${x.n}개`));
+    }
+
+    if (chatText) {
+        const silent = active.filter(e => !e.constant && e.key.length && !entryFires({ ...e, selective: false }, chatText, g));
+        if (silent.length && silent.length < active.length) add('low', '발동 안 됨', `이 채팅 전체에서 한 번도 안 켜진 항목이 ${silent.length}개 있어요`, '아직 그 이야기가 안 나왔을 수도 있지만, 실제로 쓰는 호칭·표기와 키워드가 다르면 계속 안 켜져요. 키워드를 확인해 보세요.', silent.slice(0, 6).map(e => `${label(e)} (${e.key.slice(0, 3).join(', ')})`));
+    }
+
+    const order = { high: 0, medium: 1, low: 2 };
+    return findings.sort((a, b) => order[a.severity] - order[b.severity]);
+}
+
+function normText(t) {
+    return String(t || '').toLowerCase().replace(/\s+/g, ' ').replace(/[“”"'‘’]/g, '').trim();
+}
+
+async function runLoreCheck() {
+    if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
+    const char = getCurrentCharacter();
+    if (!char) { toastr.error('1:1 캐릭터 채팅을 열어주세요'); return; }
+    try {
+        const wi = await worldInfoModule();
+        const g = wiGlobals(wi);
+        const data = await collectLoreForCheck(char);
+        const msgs = ctx().chat.filter(m => m && !m.is_system && typeof m.mes === 'string');
+        const chatText = msgs.map(m => m.mes).join('\n');
+        const hangul = (chatText.match(/[가-힯]/g) || []).length;
+        const chatIsKorean = msgs.length >= 2 && hangul > chatText.length * 0.15;
+        const findings = lintLore(data, char, g, msgs.length >= 4 ? chatText : '', chatIsKorean);
+        // what fires right now: constant + keyword hits within each entry's scan depth
+        const recent = (d) => msgs.slice(-d).map(m => m.mes).join('\n');
+        const now = data.entries.filter(e => !e.disable && entryFires(e, recent(Number(e.scanDepth) || g.depth), g));
+        loreCheckCache = { ...data, findings, now, g, time: Date.now(), ...(loreCheckCache?.char === char.avatar ? { ai: loreCheckCache.ai, chatAi: loreCheckCache.chatAi, cardAi: loreCheckCache.cardAi } : {}), char: char.avatar };
+        renderLoreCheck();
+        setStatus(`✅ 로어북 검사 완료 — 로어북 ${data.books.length}개 · 항목 ${data.entries.length}개 · 찾은 문제 ${findings.length}가지`);
+        setMinimized(false);
+        scrollPanelTo($id('doc_lore'));
+    } catch (e) {
+        console.error(LOG, e);
+        setStatus(`❌ 로어북 검사 실패: ${e.message}`);
+        toastr.error(`로어북 검사 실패: ${e.message}`);
+    }
+}
+
+async function runLoreAi() {
+    if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
+    const char = getCurrentCharacter();
+    if (!char || !loreCheckCache?.entries?.length) { toastr.warning('먼저 로어북 검사를 해주세요'); return; }
+    const s = getSettings();
+    const cd = await loadCharData(char);
+    const active = loreCheckCache.entries.filter(e => !e.disable).slice(0, 60);
+    const list = active.map((e, i) => `#${i} [${e.book}] ${e.constant ? '상시' : `키워드: ${e.key.join(', ') || '(없음)'}${e.keysecondary.length ? ` / 보조: ${e.keysecondary.join(', ')}` : ''}`} · ${e.tokens}tok\n이름: ${e.name}\n${truncate(e.content, 700)}`).join('\n\n');
+    running = true;
+    updateRunState();
+    try {
+        const system = [
+            'You are an expert SillyTavern lorebook (World Info) designer reviewing the lorebooks linked to a character roleplay bot.',
+            'Check each entry for: contradictions with the card, the reference material or the creator\'s direction; info-dumps that will be pasted into replies instead of played; vague prohibitions; facts that never matter in a scene; missing trigger keywords (nicknames, short forms, other languages/scripts the chat may use, word stems without particles); entries that should be constant vs keyword; entries to merge or split; and chances to make an entry play better (how to SHOW it in a scene).',
+            'Keyword advice: keys should be words people actually type in chat. For Korean/Japanese chats include the forms used there. Never suggest the character\'s or user\'s name alone as a key.',
+            funGuard(cd),
+            NO_SHIP_RULE,
+            'Everything human-readable in natural 한국어; paste/content stays in the language the lorebook uses.',
+            'Limits: issues ≤ 10, missing ≤ 4. "idx" is the #number of the entry. "paste" = full replacement content for that entry, or empty string if only keys change.',
+            'JSON rules: straight double quotes, escape " inside strings, no trailing commas. Output ONE JSON object only:',
+            `{"score": <0-100 how well the lorebooks support fun, accurate roleplay>, "summary": "<2-3문장>",`,
+            ` "issues": [{"idx": 0, "severity": "high"|"medium"|"low", "category": "키워드|내용|모순|구조|토큰|재미", "problem": "", "fix": "", "add_keys": ["..."], "paste": "", ${FUN_IMPACT_DOC}}],`,
+            ' "missing": [{"name": "", "keys": ["..."], "content": "<새 항목 내용>", "why": ""}]}',
+        ].join('\n');
+        const prompt = [
+            `[캐릭터 카드]\n${truncate(collectCard(char), 6000)}`,
+            cd.refText ? `[원작 자료 발췌]\n${truncate(cd.refText, 3500)}` : '',
+            cd.authorNote ? `[제작자 메모]\n${cd.authorNote}` : '',
+            `[로어북 항목 ${active.length}개]\n${list}`,
+            'Now output the JSON.',
+        ].filter(Boolean).join('\n\n');
+        const r = await requestJsonComplete({ system, prompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: '📚 로어북 내용 점검 중…' });
+        r.issues = (r.issues || []).filter(x => x && !hasShip(`${x.problem} ${x.fix} ${x.paste}`)).map(x => ({ ...x, entry: active[Number(x.idx)] ? { book: active[Number(x.idx)].book, uid: active[Number(x.idx)].uid, name: active[Number(x.idx)].name } : null }));
+        r.missing = (r.missing || []).filter(x => x && x.content && !hasShip(`${x.name} ${x.content}`));
+        loreCheckCache.ai = { time: Date.now(), result: r };
+        renderLoreCheck();
+        setStatus(`✅ 로어북 내용 점검 완료 — ${r.score ?? '?'}점`);
+        scrollPanelTo($id('lore_ai_view'));
+    } catch (e) {
+        console.error(LOG, e);
+        setStatus(`❌ 로어북 내용 점검 실패: ${e.message}`);
+        toastr.error(`로어북 내용 점검 실패: ${e.message}`);
+    } finally {
+        running = false;
+        updateRunState();
+    }
+}
+
+async function applyLoreKeys(entryRef, addKeys) {
+    const char = getCurrentCharacter();
+    const c = ctx();
+    const data = await c.loadWorldInfo(entryRef.book);
+    const e = data?.entries?.[entryRef.uid];
+    if (!e) { toastr.error('로어북 항목을 찾지 못했어요'); return false; }
+    const before = [...(e.key || [])];
+    const have = new Set(before.map(k => String(k).trim().toLowerCase()));
+    const add = addKeys.map(k => String(k).trim()).filter(k => k && !have.has(k.toLowerCase()));
+    if (!add.length) { toastr.info('이미 다 들어 있는 키워드예요'); return false; }
+    e.key = [...before, ...add];
+    await c.saveWorldInfo(entryRef.book, data, true);
+    try { c.reloadWorldInfoEditor?.(entryRef.book, true); } catch { /* optional */ }
+    await logApply(char, { kind: 'lore-keys', label: `로어북 키워드: ${entryRef.name} (+${add.join(', ')})`, world: entryRef.book, uid: entryRef.uid, before, after: e.key });
+    toastr.success(`키워드 ${add.length}개를 추가했어요`);
+    return true;
+}
+
+function renderLoreCheck() {
+    const el = $id('doc_lore');
+    if (!el) return;
+    const d = loreCheckCache;
+    if (!d) { el.innerHTML = ''; return; }
+    const active = d.entries.filter(e => !e.disable);
+    const constTok = active.filter(e => e.constant).reduce((a, e) => a + e.tokens, 0);
+    const nowTok = d.now.reduce((a, e) => a + e.tokens, 0);
+    const books = d.books.map(b => `<div class="bt-lore-book"><span class="bt-tag bt-lore-kind-${b.kind}">${BOOK_KIND[b.kind].label}</span><b>${escapeHtml(b.name)}</b><small>${b.error ? '불러오기 실패' : `${b.count ?? 0}개 항목`}</small></div>`).join('');
+    const findings = d.findings.map(f => `
+        <article class="bt-issue bt-sev-line-${f.severity}">
+            <div class="bt-issue-head">${sevTag(f.severity)}<span class="bt-issue-cat">${escapeHtml(f.category)}</span></div>
+            <div class="bt-fixwhat">${escapeHtml(f.title)}</div>
+            <div class="bt-prose bt-muted">${prose(f.detail)}</div>
+            ${f.examples?.length ? `<ul class="bt-list bt-examples">${f.examples.map(x => `<li>${escapeHtml(x)}</li>`).join('')}</ul>` : ''}
+        </article>`).join('');
+    const nowList = d.now.length ? `<ul class="bt-list bt-lore-now">${d.now.slice(0, 20).map(e => `<li><b>${escapeHtml(e.name)}</b> <small class="bt-muted">${e.constant ? '상시' : escapeHtml(e.key.slice(0, 3).join(', '))} · ${e.tokens}토큰</small></li>`).join('')}</ul>` : '<p class="bt-note">지금은 켜지는 항목이 없어요.</p>';
+    const ai = d.ai?.result;
+    const aiIssues = (ai?.issues || []).map((x, i) => `
+        <article class="bt-issue bt-sev-line-${escapeHtml(x.severity || 'low')}">
+            <div class="bt-issue-head">${sevTag(x.severity)}<span class="bt-issue-cat">${escapeHtml(x.category || '')}</span>${x.entry ? `<span class="bt-tag bt-tag-ghost">${escapeHtml(x.entry.name)}</span>` : ''}${funBadge(x.fun_impact, x.fun_note)}${contBadge(x.continuity)}</div>
+            <div class="bt-fixwhat">${escapeHtml(x.problem || '')}</div>
+            ${x.fix ? `<div class="bt-prose bt-muted">${prose(x.fix)}</div>` : ''}
+            ${x.add_keys?.length ? `<div class="bt-lore-keys">${x.add_keys.map(k => `<span class="bt-tag">+ ${escapeHtml(k)}</span>`).join('')}</div>` : ''}
+            ${x.paste ? `<pre class="bt-paste">${escapeHtml(x.paste)}</pre>` : ''}
+            ${x.entry ? `<div class="bt-actions bt-actions-end">
+                ${x.add_keys?.length ? `<button type="button" class="bt-btn bt-btn-sm bt-lore-addkeys" data-i="${i}">${ico('key')}<span>키워드 추가</span></button>` : ''}
+                ${x.paste ? `<button type="button" class="bt-btn bt-btn-sm bt-btn-primary bt-lore-replace" data-i="${i}">${ico('file-import')}<span>내용 바꾸기</span></button>` : ''}
+            </div>` : ''}
+        </article>`).join('');
+    const missing = (ai?.missing || []).map((m, i) => `
+        <article class="bt-sugg">
+            <div class="bt-sugg-head"><b>${escapeHtml(m.name || '새 항목')}</b><span class="bt-sugg-btns">${copyBtn('bt-lore-mcopy', i)}${applyBtn('bt-lore-madd', i)}</span></div>
+            ${m.why ? `<div class="bt-prose bt-muted">${prose(m.why)}</div>` : ''}
+            <div class="bt-lore-keys">${(m.keys || []).map(k => `<span class="bt-tag">${escapeHtml(k)}</span>`).join('')}</div>
+            <pre class="bt-paste">${escapeHtml(m.content)}</pre>
+        </article>`).join('');
+    el.innerHTML = `
+        <section class="bt-card">
+            ${cardHead('Lorebook', '로어북 검사', `${escapeHtml(new Date(d.time).toLocaleString())}`)}
+            ${d.books.length ? `<div class="bt-lore-books">${books}</div>` : ''}
+            <div class="bt-lore-stats">
+                <div><b>${active.length}</b><span>켜진 항목</span></div>
+                <div><b>${constTok.toLocaleString()}</b><span>상시 토큰 (매 턴)</span></div>
+                <div><b>${nowTok.toLocaleString()}</b><span>지금 켜지는 토큰</span></div>
+            </div>
+            <details class="bt-disclosure bt-disclosure-sm"><summary><span>지금 채팅에서 켜지는 항목 ${d.now.length}개</span>${ico('chevron-down')}</summary>${nowList}<p class="bt-note">최근 메시지 ${d.g.depth}개(항목별 검색 깊이)를 기준으로 키워드를 찾은 예상이에요. 그룹·확률·타이머 설정은 빼고 계산해요.</p></details>
+        </section>
+        <section class="bt-card">
+            ${cardHead('Check', '구조·키워드 검사', d.findings.length ? `${d.findings.length}가지를 찾았어요.` : '')}
+            ${findings ? `<div class="bt-stack">${findings}</div>` : `<div class="bt-callout">${ico('circle-check')}<div class="bt-prose"><p>키워드, 상시 항목, 중복 모두 괜찮아요.</p></div></div>`}
+        </section>
+        ${active.length ? `<section class="bt-card">
+            ${cardHead('AI check', '로어북으로 AI 검사', '연결된 로어북을 기준으로 삼아서 검사해요.')}
+            <div class="bt-vset-btns">
+                <button type="button" class="bt-vset-btn" id="bt_lore_ai"><span class="bt-doc-ico">${ico('wand-magic-sparkles')}</span><span class="bt-vset-text"><b>로어북 내용 점검</b><small>모순·빠진 키워드·설명 나열·새로 있으면 좋은 항목</small></span>${ico('chevron-right')}</button>
+                <button type="button" class="bt-vset-btn" id="bt_lore_chat"><span class="bt-doc-ico">${ico('comments')}</span><span class="bt-vset-text"><b>로어북 기준으로 채팅 검사</b><small>지금 채팅의 봇 답장이 로어북 설정·지시를 따르고, 켜진 항목을 장면에 살리는지 봐요.</small></span>${ico('chevron-right')}</button>
+                <button type="button" class="bt-vset-btn" id="bt_lore_card"><span class="bt-doc-ico">${ico('id-card')}</span><span class="bt-vset-text"><b>로어북 지시에 맞게 카드 검사</b><small>로어북에 적힌 지시사항을 찾아서, 카드가 부딪히거나 못 받쳐주는 곳을 고쳐요.</small></span>${ico('chevron-right')}</button>
+            </div>
+        </section>` : ''}
+        <div id="bt_lore_chat_view" class="bt-result">${loreChatHtml(d.chatAi)}</div>
+        <div id="bt_lore_card_view" class="bt-result">${loreCardHtml(d.cardAi)}</div>
+        <div id="bt_lore_ai_view" class="bt-result">${ai ? `
+            <section class="bt-card bt-hero">
+                ${ringHtml(Math.max(0, Math.min(100, Number(ai.score) || 0)))}
+                <div class="bt-hero-meta"><span class="bt-eyebrow">Lorebook review</span><h3>로어북 내용 점검</h3><div class="bt-hero-sub"><span>${escapeHtml(new Date(d.ai.time).toLocaleString())}</span></div></div>
+            </section>
+            ${ai.summary ? `<section class="bt-card bt-summary">${ico('book')}<div class="bt-prose">${prose(ai.summary)}</div></section>` : ''}
+            ${aiIssues ? `<section class="bt-card">${cardHead('Issues', '고칠 곳', '키워드 추가와 내용 바꾸기는 원본이 백업돼서 적용 기록에서 되돌릴 수 있어요.')}<div class="bt-stack">${aiIssues}</div></section>` : ''}
+            ${missing ? `<section class="bt-card">${cardHead('Missing', '있으면 좋은 항목')}<div class="bt-stack">${missing}</div></section>` : ''}` : ''}</div>`;
+    $id('lore_ai')?.addEventListener('click', runLoreAi);
+    $id('lore_chat')?.addEventListener('click', runLoreChatCheck);
+    $id('lore_card')?.addEventListener('click', runLoreCardCheck);
+    bindLoreAiViews(d);
+    el.querySelectorAll('.bt-lore-addkeys').forEach(b => b.addEventListener('click', async () => {
+        const x = ai.issues[Number(b.dataset.i)];
+        if (x?.entry && await applyLoreKeys(x.entry, x.add_keys || [])) { b.classList.add('disabled'); b.querySelector('span').textContent = '추가됨'; }
+    }));
+    el.querySelectorAll('.bt-lore-replace').forEach(b => b.addEventListener('click', async () => {
+        const x = ai.issues[Number(b.dataset.i)];
+        if (!x?.entry) return;
+        const ok = await applyReplace({ kind: 'lore', world: x.entry.book, uid: x.entry.uid, label: `로어북: ${x.entry.name}` }, x.paste, { tag: '수정' });
+        if (ok) { b.classList.add('disabled'); b.querySelector('span').textContent = '적용됨'; }
+    }));
+    el.querySelectorAll('.bt-lore-mcopy').forEach(b => b.addEventListener('click', () => { const m = ai.missing[Number(b.dataset.idx)]; if (m) copyText(`[${(m.keys || []).join(', ')}]\n${m.content}`); }));
+    el.querySelectorAll('.bt-lore-madd').forEach(b => b.addEventListener('click', async () => {
+        const m = ai.missing[Number(b.dataset.idx)];
+        const book = d.books.find(x => x.kind === 'char' && !x.error)?.name || d.books.find(x => !x.error)?.name;
+        if (!m || !book) { toastr.warning('항목을 넣을 로어북이 없어요'); return; }
+        const char = getCurrentCharacter();
+        const uid = await addLoreEntry(book, { comment: m.name, keys: (m.keys || []).filter(Boolean), content: m.content });
+        await logApply(char, { kind: 'lore', label: `로어북: ${m.name} (로어북 검사)`, world: book, uid, after: m.content });
+        toastr.success(`“${book}”에 새 항목을 추가했어요`);
+        b.classList.add('disabled');
+    }));
+}
+
+
+// --- lorebook as reference: lore-grounded chat check + card-vs-lore-instructions check ---
+
+/** Plain text of every enabled entry in the linked lorebooks (constant entries first). */
+async function loreReferenceText(char, maxChars = 8000) {
+    const books = await getLinkedBooks(char);
+    const items = [];
+    for (const b of books) {
+        try {
+            const data = await ctx().loadWorldInfo(b.name);
+            for (const e of Object.values(data?.entries || {})) {
+                if (e.disable || !String(e.content || '').trim()) continue;
+                items.push({ constant: !!e.constant, text: `- [${e.comment || (e.key || []).slice(0, 3).join(', ') || `#${e.uid}`}${e.constant ? ' · 상시' : ` · 키워드: ${(e.key || []).slice(0, 4).join(', ')}`}] ${String(e.content).trim()}` });
+            }
+        } catch { /* skip broken book */ }
+    }
+    items.sort((a, b) => Number(b.constant) - Number(a.constant));
+    return truncate(items.map(x => x.text).join('\n'), maxChars);
+}
+
+async function ensureLoreCache(char) {
+    if (loreCheckCache?.char === char.avatar && loreCheckCache.entries) return loreCheckCache;
+    await runLoreCheck();
+    return loreCheckCache;
+}
+
+function loreIndexList(active, maxEach = 700) {
+    return active.map((e, i) => `#${i} [${e.book}] ${e.constant ? '상시' : `키워드: ${e.key.join(', ') || '(없음)'}`} — ${e.name}\n${truncate(e.content, maxEach)}`).join('\n\n');
+}
+
+/** Finds a quoted passage in text, tolerating line-break and spacing differences. Returns [start, end] or null. */
+function findQuote(text, quote) {
+    const q = String(quote || '').replace(/\r\n?/g, '\n').trim().replace(/^["“”'‘’]+|["“”'‘’]+$/g, '').trim();
+    if (q.length < 4) return null;
+    const i = text.indexOf(q);
+    if (i !== -1) return [i, i + q.length];
+    const pattern = q.split(/\s+/).map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\s+');
+    const m = new RegExp(pattern).exec(text);
+    return m ? [m.index, m.index + m[0].length] : null;
+}
+
+/** Replaces one quoted passage in a card field (falls back to the normal apply dialog). */
+async function applyQuoteReplace(field, quote, paste, reason) {
+    const key = normalizeField(field);
+    if (!APPLY_FIELDS[key] || key === 'lorebook') return openApplyDialog({ field: key, text: paste, reason });
+    const cur = readField(key);
+    const span = cur === null ? null : findQuote(cur, quote);
+    if (span) {
+        return applyReplace({ kind: 'field', field: key, label: APPLY_FIELDS[key].label }, cur.slice(0, span[0]) + paste + cur.slice(span[1]), { tag: '로어북 맞춤', note: reason });
+    }
+    return openApplyDialog({ field: key, text: paste, reason });
+}
+
+async function runLoreChatCheck() {
+    if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
+    const char = getCurrentCharacter();
+    if (!char) { toastr.error('1:1 캐릭터 채팅을 열어주세요'); return; }
+    const d = await ensureLoreCache(char);
+    const active = (d?.entries || []).filter(e => !e.disable && e.content.trim()).slice(0, 60);
+    if (!active.length) { toastr.warning('검사할 로어북 항목이 없어요'); return; }
+    const s = getSettings();
+    const msgs = ctx().chat.filter(m => m && !m.is_system && typeof m.mes === 'string').slice(-Math.max(Number(s.evalMessages) || 20, 10));
+    if (msgs.filter(m => !m.is_user).length < 2) { toastr.warning('봇 답장이 있는 채팅을 열어주세요'); return; }
+    const { userName, charName } = testerNames();
+    const g = d.g || { depth: 2, wholeWords: false, caseSensitive: false };
+    // annotate every bot reply with the entries that were active when it was written
+    let k = 0;
+    const log = msgs.map((m, i) => {
+        if (m.is_user) return `${userName}: ${truncate(m.mes, 1200)}`;
+        const fired = active.map((e, idx) => ({ e, idx })).filter(({ e }) => entryFires(e, msgs.slice(Math.max(0, i - (Number(e.scanDepth) || g.depth)), i).map(x => x.mes).join('\n'), g)).map(x => `#${x.idx}`);
+        k++;
+        return `[BOT ${k}] (켜져 있던 로어북: ${fired.join(', ') || '없음'})\n${charName}: ${truncate(m.mes, 1500)}`;
+    }).join('\n\n');
+    const cd = await loadCharData(char);
+    running = true;
+    updateRunState();
+    try {
+        const system = [
+            'You check whether a roleplay bot\'s replies follow its linked lorebook (World Info). The lorebook is the reference for this bot\'s world: facts, relationships, places, rules and instructions.',
+            'Each bot reply lists which lorebook entries were active (inserted into the prompt) when it was written. Judge three things:',
+            '- facts: does the bot contradict lorebook facts (names, relationships, places, history, abilities, setting rules)?',
+            '- rules: does the bot follow instructions written inside lorebook entries (style, behaviour, "always/never" rules)?',
+            '- use: when an entry was active and relevant, did the bot actually USE it in the scene (or ignore it / info-dump it verbatim)?',
+            'Quote the exact bot line for every violation. Fix it at the source: either rewrite the lore entry so the model follows it (where="lore", paste = FULL new content of that entry), or add/adjust the card (where = card field, paste = sentence(s) to add).',
+            'Info-dumping lore text verbatim into a reply is also a problem: the lore should be SHOWN in the scene.',
+            funGuard(cd),
+            NO_SHIP_RULE,
+            'Everything human-readable in natural 한국어; quotes and paste stay in the original language.',
+            'Limits: violations ≤ 8, unused ≤ 5, good ≤ 4. "idx" = lorebook entry #number, "reply" = BOT number.',
+            'JSON rules: straight double quotes, escape " inside strings, no trailing commas. Output ONE JSON object only:',
+            '{"score": <0-100>, "scores": {"facts": 0, "rules": 0, "use": 0}, "summary": "<2-3문장>",',
+            ` "violations": [{"reply": 1, "quote": "", "idx": 0, "kind": "facts"|"rules"|"use"|"dump", "problem": "", "fix": "", "where": "lore"|"description"|"personality"|"mes_example"|"system_prompt"|"post_history", "paste": "", ${FUN_IMPACT_DOC}}],`,
+            ' "unused": [{"idx": 0, "why": "", "fix": ""}],',
+            ' "good": ["<로어북을 잘 살린 장면>"]}',
+        ].join('\n');
+        const prompt = [
+            `[로어북 항목 ${active.length}개]\n${loreIndexList(active)}`,
+            `[캐릭터 카드]\n${truncate(collectCard(char), 5000)}`,
+            `[채팅 — 최근 ${msgs.length}개]\n${log}`,
+            'Now output the JSON.',
+        ].join('\n\n');
+        const r = await requestJsonComplete({ system, prompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: '📚 로어북 기준으로 채팅 검사 중…' });
+        const ref = (i) => active[Number(i)] ? { book: active[Number(i)].book, uid: active[Number(i)].uid, name: active[Number(i)].name } : null;
+        r.violations = (r.violations || []).filter(x => x && !hasShip(`${x.problem} ${x.fix} ${x.paste}`)).map(x => ({ ...x, entry: ref(x.idx) }));
+        r.unused = (r.unused || []).filter(Boolean).map(x => ({ ...x, entry: ref(x.idx) }));
+        d.chatAi = { time: Date.now(), result: r };
+        renderLoreCheck();
+        setStatus(`✅ 로어북 기준 채팅 검사 완료 — ${r.score ?? '?'}점`);
+        scrollPanelTo($id('lore_chat_view'));
+    } catch (e) {
+        console.error(LOG, e);
+        if (e.raw) toastr.error('결과 형식이 깨졌어요. 한 번 더 눌러주세요.');
+        setStatus(`❌ 로어북 기준 채팅 검사 실패: ${e.message}`);
+    } finally {
+        running = false;
+        updateRunState();
+    }
+}
+
+async function runLoreCardCheck() {
+    if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
+    const char = getCurrentCharacter();
+    if (!char) { toastr.error('1:1 캐릭터 채팅을 열어주세요'); return; }
+    const d = await ensureLoreCache(char);
+    const active = (d?.entries || []).filter(e => !e.disable && e.content.trim()).slice(0, 60);
+    if (!active.length) { toastr.warning('검사할 로어북 항목이 없어요'); return; }
+    const s = getSettings();
+    const cd = await loadCharData(char);
+    running = true;
+    updateRunState();
+    try {
+        const system = [
+            'You check a SillyTavern character card against the instructions and settings written in its linked lorebooks (World Info).',
+            'Step 1 — rules: find the lorebook entries that contain INSTRUCTIONS or binding settings (writing style, behaviour rules, "always/never", world rules, how {{char}} treats {{user}}, format rules). Summarize each rule briefly.',
+            'Step 2 — conflicts: find card text that contradicts or overrides those rules (quote the exact card passage, give its field). Provide paste = a rewritten version of exactly that quoted passage that agrees with the lorebook.',
+            'Step 3 — missing: rules the card should support but does not (e.g. the lore says he calls the user by a nickname but the example dialogue never does). Provide paste = sentence(s) to add to the given field.',
+            'Step 4 — overrides: card instructions that will make the model ignore the lorebook (e.g. "ignore other info", constant rules that clash). Also flag lore rules that are so vague the card cannot follow them.',
+            'Fix toward the lorebook, but keep the card fun and in the creator\'s direction. If a lore rule itself is the problem, say so in "problem" instead of bending the card.',
+            funGuard(cd),
+            NO_SHIP_RULE,
+            'Everything human-readable in natural 한국어; card quotes and paste stay in the card\'s language.',
+            'Limits: rules ≤ 12, conflicts ≤ 8, missing ≤ 6, overrides ≤ 4. "idx" = lorebook entry #number.',
+            'JSON rules: straight double quotes, escape " inside strings, no trailing commas. Output ONE JSON object only:',
+            '{"score": <0-100 how well the card follows the lorebook>, "summary": "<2-3문장>",',
+            ' "rules": [{"idx": 0, "rule": ""}],',
+            ` "conflicts": [{"idx": 0, "rule": "", "field": "description"|"personality"|"scenario"|"first_mes"|"mes_example"|"system_prompt"|"post_history"|"char_note", "card_quote": "", "problem": "", "fix": "", "paste": "", ${FUN_IMPACT_DOC}}],`,
+            ` "missing": [{"idx": 0, "rule": "", "field": "", "paste": "", "why": "", ${FUN_IMPACT_DOC}}],`,
+            ' "overrides": [{"field": "", "card_quote": "", "problem": ""}]}',
+        ].join('\n');
+        const fields = ['description', 'personality', 'scenario', 'first_mes', 'mes_example', 'system_prompt', 'post_history', 'char_note']
+            .map(k => [k, rawCardValue(char, k)]).filter(([, v]) => String(v).trim())
+            .map(([k, v]) => `### field: ${k}\n${truncate(v, 5000)}`).join('\n\n');
+        const prompt = [
+            `[로어북 항목 ${active.length}개]\n${loreIndexList(active, 900)}`,
+            `[캐릭터 카드 — 필드별]\n${fields}`,
+            'Now output the JSON.',
+        ].join('\n\n');
+        const r = await requestJsonComplete({ system, prompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: '📚 로어북 지시에 맞게 카드 검사 중…' });
+        const ref = (i) => active[Number(i)] ? { book: active[Number(i)].book, uid: active[Number(i)].uid, name: active[Number(i)].name } : null;
+        for (const key of ['rules', 'conflicts', 'missing']) r[key] = (r[key] || []).filter(x => x && !hasShip(JSON.stringify(x))).map(x => ({ ...x, entry: ref(x.idx) }));
+        r.overrides = (r.overrides || []).filter(Boolean);
+        d.cardAi = { time: Date.now(), result: r };
+        renderLoreCheck();
+        setStatus(`✅ 로어북 지시 기준 카드 검사 완료 — ${r.score ?? '?'}점`);
+        scrollPanelTo($id('lore_card_view'));
+    } catch (e) {
+        console.error(LOG, e);
+        if (e.raw) toastr.error('결과 형식이 깨졌어요. 한 번 더 눌러주세요.');
+        setStatus(`❌ 로어북 지시 기준 카드 검사 실패: ${e.message}`);
+    } finally {
+        running = false;
+        updateRunState();
+    }
+}
+
+const LORE_KIND_LABEL = { facts: '설정 어긋남', rules: '지시 안 따름', use: '활용 안 함', dump: '설정 나열' };
+
+function loreChatHtml(ai) {
+    if (!ai?.result) return '';
+    const r = ai.result;
+    const sc = r.scores || {};
+    const meter = (label, v) => meterHtml(label, v ?? null);
+    const v = (r.violations || []).map((x, i) => `
+        <article class="bt-issue bt-sev-line-${x.kind === 'facts' ? 'high' : x.kind === 'rules' ? 'medium' : 'low'}">
+            <div class="bt-issue-head"><span class="bt-tag">${escapeHtml(LORE_KIND_LABEL[x.kind] || x.kind || '')}</span>${x.reply ? `<span class="bt-tag bt-tag-ghost">답장 ${escapeHtml(String(x.reply))}</span>` : ''}${x.entry ? `<span class="bt-tag bt-tag-ghost">${escapeHtml(x.entry.name)}</span>` : ''}${funBadge(x.fun_impact, x.fun_note)}${contBadge(x.continuity)}</div>
+            <div class="bt-fixwhat">${escapeHtml(x.problem || '')}</div>
+            ${x.quote ? `<blockquote class="bt-quote">${escapeHtml(x.quote)}</blockquote>` : ''}
+            ${x.fix ? `<div class="bt-prose bt-muted">${prose(x.fix)}</div>` : ''}
+            ${x.paste ? `<pre class="bt-paste">${escapeHtml(x.paste)}</pre><div class="bt-actions bt-actions-end"><button type="button" class="bt-btn bt-btn-sm bt-btn-primary bt-lc-apply" data-i="${i}">${ico('file-import')}<span>${x.where === 'lore' ? '로어북 항목 바꾸기' : `${escapeHtml(FIELD_LABEL[x.where] || x.where || '')}에 넣기`}</span></button></div>` : ''}
+        </article>`).join('');
+    const unused = (r.unused || []).map(x => `<li><b>${escapeHtml(x.entry?.name || `#${x.idx}`)}</b> — ${escapeHtml(x.why || '')}${x.fix ? `<div class="bt-muted">${escapeHtml(x.fix)}</div>` : ''}</li>`).join('');
+    return `
+        <section class="bt-card bt-hero">
+            ${ringHtml(Math.max(0, Math.min(100, Number(r.score) || 0)))}
+            <div class="bt-hero-meta"><span class="bt-eyebrow">Lore × chat</span><h3>로어북 기준 채팅 검사</h3><div class="bt-hero-sub"><span>${escapeHtml(new Date(ai.time).toLocaleString())}</span></div></div>
+        </section>
+        <section class="bt-card"><div class="bt-meters">${meter('설정 일치', sc.facts)}${meter('지시 따름', sc.rules)}${meter('로어 활용', sc.use)}</div>
+            ${r.summary ? `<div class="bt-prose" style="margin-top:12px">${prose(r.summary)}</div>` : ''}
+            ${r.good?.length ? `<div class="bt-restyle-changes" style="margin-top:12px"><span>잘 살린 장면</span>${renderList(r.good)}</div>` : ''}</section>
+        ${v ? `<section class="bt-card">${cardHead('Violations', '로어북과 어긋난 답장', '로어북 항목을 고치거나 카드에 한 줄 더해서 원인부터 고쳐요.')}<div class="bt-stack">${v}</div></section>` : ''}
+        ${unused ? `<section class="bt-card">${cardHead('Unused', '켜졌는데 안 쓰인 항목')}<ul class="bt-list">${unused}</ul></section>` : ''}`;
+}
+
+function loreCardHtml(ai) {
+    if (!ai?.result) return '';
+    const r = ai.result;
+    const rules = (r.rules || []).map(x => `<li><b>${escapeHtml(x.entry?.name || `#${x.idx}`)}</b> — ${escapeHtml(x.rule || '')}</li>`).join('');
+    const conflicts = (r.conflicts || []).map((x, i) => `
+        <article class="bt-issue bt-sev-line-high">
+            <div class="bt-issue-head"><span class="bt-tag">${escapeHtml(FIELD_LABEL[x.field] || x.field || '')}</span>${x.entry ? `<span class="bt-tag bt-tag-ghost">${escapeHtml(x.entry.name)}</span>` : ''}${funBadge(x.fun_impact, x.fun_note)}${contBadge(x.continuity)}</div>
+            <div class="bt-fixwhat">${escapeHtml(x.problem || '')}</div>
+            ${x.rule ? `<div class="bt-prose bt-muted"><p>로어북: ${escapeHtml(x.rule)}</p></div>` : ''}
+            ${x.card_quote ? `<blockquote class="bt-quote">${escapeHtml(x.card_quote)}</blockquote>` : ''}
+            ${x.paste ? `<pre class="bt-paste">${escapeHtml(x.paste)}</pre><div class="bt-actions bt-actions-end"><button type="button" class="bt-btn bt-btn-sm bt-btn-primary bt-lk-fix" data-i="${i}">${ico('file-import')}<span>이 부분 바꾸기</span></button></div>` : ''}
+        </article>`).join('');
+    const missing = (r.missing || []).map((x, i) => `
+        <article class="bt-sugg">
+            <div class="bt-sugg-head"><span class="bt-tag">${escapeHtml(FIELD_LABEL[x.field] || x.field || '')}</span>${funBadge(x.fun_impact, x.fun_note)}${contBadge(x.continuity)}<span class="bt-sugg-btns">${copyBtn('bt-lk-mcopy', i)}${applyBtn('bt-lk-madd', i)}</span></div>
+            <div class="bt-fixwhat" style="margin-top:6px">${escapeHtml(x.rule || '')}</div>
+            ${x.why ? `<div class="bt-prose bt-muted">${prose(x.why)}</div>` : ''}
+            ${x.paste ? `<pre class="bt-paste">${escapeHtml(x.paste)}</pre>` : ''}
+        </article>`).join('');
+    const overrides = (r.overrides || []).map(x => `<li><b>${escapeHtml(FIELD_LABEL[x.field] || x.field || '')}</b> — ${escapeHtml(x.problem || '')}${x.card_quote ? `<div class="bt-quote">${escapeHtml(x.card_quote)}</div>` : ''}</li>`).join('');
+    return `
+        <section class="bt-card bt-hero">
+            ${ringHtml(Math.max(0, Math.min(100, Number(r.score) || 0)))}
+            <div class="bt-hero-meta"><span class="bt-eyebrow">Lore × card</span><h3>로어북 지시 기준 카드 검사</h3><div class="bt-hero-sub"><span>${escapeHtml(new Date(ai.time).toLocaleString())}</span></div></div>
+        </section>
+        ${r.summary ? `<section class="bt-card bt-summary">${ico('book')}<div class="bt-prose">${prose(r.summary)}</div></section>` : ''}
+        ${rules ? `<section class="bt-card"><details class="bt-disclosure bt-disclosure-sm"><summary><span>로어북에서 찾은 지시사항 ${r.rules.length}개</span>${ico('chevron-down')}</summary><ul class="bt-list">${rules}</ul></details></section>` : ''}
+        ${conflicts ? `<section class="bt-card">${cardHead('Conflicts', '로어북과 부딪히는 카드 내용', '바꾸기를 누르면 인용된 부분만 고친 카드 전체를 보여주고, 확인하면 적용해요.')}<div class="bt-stack">${conflicts}</div></section>` : ''}
+        ${missing ? `<section class="bt-card">${cardHead('Missing', '카드가 받쳐주지 못하는 지시')}<div class="bt-stack">${missing}</div></section>` : ''}
+        ${overrides ? `<section class="bt-card bt-card-warn">${cardHead('Overrides', '로어북을 무시하게 만드는 부분')}<ul class="bt-list">${overrides}</ul></section>` : ''}
+        ${!conflicts && !missing && !overrides ? `<div class="bt-callout">${ico('circle-check')}<div class="bt-prose"><p>카드가 로어북 지시와 잘 맞아요.</p></div></div>` : ''}`;
+}
+
+function bindLoreAiViews(d) {
+    const el = $id('doc_lore');
+    if (!el) return;
+    const chat = d.chatAi?.result;
+    el.querySelectorAll('.bt-lc-apply').forEach(b => b.addEventListener('click', async () => {
+        const x = chat?.violations?.[Number(b.dataset.i)];
+        if (!x) return;
+        let ok;
+        if (x.where === 'lore' && x.entry) ok = await applyReplace({ kind: 'lore', world: x.entry.book, uid: x.entry.uid, label: `로어북: ${x.entry.name}` }, x.paste, { tag: '수정', note: x.problem });
+        else ok = await openApplyDialog({ field: x.where, text: x.paste, reason: x.problem });
+        if (ok !== false && x.where === 'lore') { b.classList.add('disabled'); b.querySelector('span').textContent = '적용됨'; }
+    }));
+    const card = d.cardAi?.result;
+    el.querySelectorAll('.bt-lk-fix').forEach(b => b.addEventListener('click', async () => {
+        const x = card?.conflicts?.[Number(b.dataset.i)];
+        if (!x) return;
+        const ok = await applyQuoteReplace(x.field, x.card_quote, x.paste, x.problem);
+        if (ok) { b.classList.add('disabled'); b.querySelector('span').textContent = '적용됨'; runDoctorLocal(true); }
+    }));
+    el.querySelectorAll('.bt-lk-mcopy').forEach(b => b.addEventListener('click', () => copyText(card?.missing?.[Number(b.dataset.idx)]?.paste || '')));
+    el.querySelectorAll('.bt-lk-madd').forEach(b => b.addEventListener('click', () => {
+        const x = card?.missing?.[Number(b.dataset.idx)];
+        if (x) openApplyDialog({ field: x.field, text: x.paste || '', reason: x.rule || '' });
+    }));
 }
 
 
