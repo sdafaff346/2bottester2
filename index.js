@@ -35,6 +35,8 @@ const defaultSettings = Object.freeze({
     notifyOn: false,        // 브라우저 알림 (다른 탭에 있을 때)
     funReference: '',       // creator's proven fun style (from 재미 분석)
     loreAsReference: true,  // use linked lorebooks as reference material in evaluation
+    pasteLang: 'en',        // language of ready-to-paste fixes: en | card | ko
+    pasteKeepLines: true,   // spoken lines inside quotes keep the character's chat language
     funReferenceSamples: '', // short quotes from the reference bot (format examples for restyle)
     accent: 'champagne',
     panelPos: null,
@@ -87,7 +89,7 @@ function charKey(char) {
     return STORE_PREFIX + (char?.avatar || char?.name || 'unknown');
 }
 
-const emptyCharData = () => ({ urls: [], refText: '', authorNote: '', history: [], names: null, voiceProfile: null, voiceResults: {}, doctor: null, runs: [], abBaselineId: null, abLast: null, applyLog: [], funProfile: null, caehBase: '', caehCaution: '', anchorText: '', anchorTime: 0, anchorBind: false, contLast: null });
+const emptyCharData = () => ({ urls: [], refText: '', authorNote: '', history: [], names: null, voiceProfile: null, voiceResults: {}, doctor: null, runs: [], abBaselineId: null, abLast: null, applyLog: [], funProfile: null, caehBase: '', caehCaution: '', anchorText: '', anchorTime: 0, anchorBind: false, contLast: null, sourceLang: 'auto' });
 
 async function loadCharData(char) {
     if (!char) return emptyCharData();
@@ -463,6 +465,58 @@ function caehGuide(cd) {
     if (String(cd?.caehCaution || '').trim()) parts.push(`CREATOR'S CAUTIONS — hard rules. No score, suggestion, rewrite, compression or test message may go against these:\n${truncate(cd.caehCaution, 1500)}`);
     if (cd?.anchorBind && String(cd?.anchorText || '').trim()) parts.push(`ESTABLISHED IN THE CREATOR'S ONGOING CHAT — they keep playing this chat after editing the card, so the character must stay recognizably the same there: same voice, same attitude and distance toward {{user}}, same running bits. Edits may sharpen or add, never re-characterize:\n${truncate(cd.anchorText, 1800)}`);
     return parts.join('\n\n');
+}
+
+const SOURCE_LANG = {
+    auto: '자동',
+    ja: '일본 작품 (한국어 + 日本語)',
+    en: '영어권 작품 (한국어 + English)',
+    ko: '한국 작품 (한국어만)',
+    other: '기타 (한국어만)',
+};
+
+/** Where the original work comes from, for writing proper nouns (Korean + original script). */
+function sourceOrigin(cd) {
+    const sel = cd?.sourceLang || 'auto';
+    if (sel !== 'auto') return sel;
+    const n = cd?.names || {};
+    const kana = /[\u3040-\u30ff]/;
+    if (kana.test(`${n.ja || ''}${n.seriesJa || ''}`)) return 'ja';
+    const ref = String(cd?.refText || '').slice(0, 6000);
+    if ((ref.match(/[\u3040-\u30ff]/g) || []).length > 40) return 'ja';
+    if (/fandom\.com/.test((cd?.urls || []).join(' ')) && !/dic\.pixiv|namu\.wiki/.test((cd?.urls || []).join(' '))) return 'en';
+    return 'unknown';
+}
+
+/**
+ * Language rule for ready-to-paste text (card / lorebook fixes). Explanations stay Korean;
+ * paste text is compact English by default to save tokens, proper nouns stay Korean (+ original).
+ */
+function pasteLangRule(cd, { keys = false } = {}) {
+    const s = getSettings();
+    const origin = sourceOrigin(cd);
+    const orig = {
+        ja: 'This is a Japanese work: the first time each proper noun appears in a paste, write Korean followed by the Japanese original in parentheses, e.g. 무라사키바라 아츠시(紫原敦), 요센(陽泉); afterwards Korean only.',
+        en: 'This is an English-language work: the first time each proper noun appears in a paste, write Korean followed by the English original in parentheses, e.g. 해리 포터(Harry Potter), 호그와트(Hogwarts); afterwards Korean only.',
+        ko: 'This is a Korean work: proper nouns in Korean only.',
+        other: 'Proper nouns in Korean only.',
+        unknown: 'Work out from the reference/card whether the work is Japanese, English-language or Korean: for a Japanese work add the Japanese original in parentheses at the first mention (e.g. 무라사키바라 아츠시(紫原敦)), for an English-language work add the English original (e.g. 해리 포터(Harry Potter)), for a Korean work Korean only.',
+    }[origin];
+    const lines = s.pasteKeepLines !== false
+        ? 'Spoken lines inside quotes (sample dialogue, example messages, catchphrases, first-message dialogue) stay in the language the character speaks in the chat, so the voice and dialect are preserved.'
+        : 'Spoken lines are written in English too.';
+    const keyLine = keys ? 'Lorebook trigger KEYWORDS are an exception: they stay in the languages people actually type in chat (Korean names, nicknames, plus original-script names).' : '';
+    if (s.pasteLang === 'card') return ['PASTE TEXT LANGUAGE: ready-to-paste card/lorebook text ("paste", "text", "content", "rewrite") uses the same language as the card. Explanations stay in Korean.', keyLine].filter(Boolean).join('\n');
+    if (s.pasteLang === 'ko') return ['PASTE TEXT LANGUAGE: ready-to-paste card/lorebook text ("paste", "text", "content", "rewrite") is written in Korean. Explanations stay in Korean.', orig, keyLine].filter(Boolean).join('\n');
+    return [
+        'PASTE TEXT LANGUAGE — overrides any other instruction about the language of ready-to-paste text ("paste", "text", "content", "rewrite", new lore entries):',
+        '- Write it in concise English to save tokens: compact descriptive or imperative sentences, no filler, no Korean grammar. Explanations, problems and reasons stay in Korean.',
+        '- Proper nouns (people, nicknames, places, schools, teams, organizations, techniques, items, titles) are NOT translated or romanized into English: write them in Korean.',
+        `- ${orig}`,
+        `- ${lines}`,
+        '- Keep macros exactly: {{char}}, {{user}}, <START>.',
+        keyLine ? `- ${keyLine}` : '',
+    ].filter(Boolean).join('\n');
 }
 
 /** Extra guidance: the creator's direction + change discipline + proven style + protected parts. */
@@ -994,6 +1048,7 @@ async function runEvaluation({ useChat = true, messages = 0 } = {}) {
         'Scoring guide: 90+ = feels like the original character; 70-89 = mostly right with noticeable slips; 50-69 = recognizable but often off; <50 = largely a different character.',
         'Canon fixes must be written as PLAYABLE cues (how the trait shows up in a scene: a gesture, a line, a trigger) — not as wiki facts to memorize. Never propose a suggestion with fun_impact "-" unless the canon error is severe; say so in fun_note.',
         funGuard(charData),
+        pasteLangRule(charData),
         useChat
             ? 'Weigh the BOT messages in the test chat most heavily (actual behavior), and use the card to explain WHY problems happen.'
             : 'There is no chat log: evaluate the character card itself (how well it would reproduce the original).',
@@ -1203,6 +1258,7 @@ function buildPanel() {
         ${cardHead('Direction', '캐해 방향', '여기 적은 내용이 원작·2차 캐해보다 우선이에요. 평가, 수정 제안, 토큰 다이어트, 스타일 고치기, 테스트 메시지가 모두 이걸 따라요. 캐릭터마다 따로 자동 저장돼요.')}
         ${field('원하는 캐해 (바탕)', '<textarea id="bt_caehbase" class="bt-input" rows="4" placeholder="예) 귀찮아하면서도 결국 챙겨주는 쪽&#10;{{user}}한테는 반말 + 장난, 진지해질 땐 말이 짧고 낮아짐&#10;원작보다 능글맞은 쪽으로 가져가고 싶음"></textarea>', '점수·제안의 기준')}
         ${field('주의사항', '<textarea id="bt_caehcaution" class="bt-input" rows="3" placeholder="예) 너무 다정하게 만들지 말 것&#10;원작 최종장 이후 설정은 쓰지 말 것&#10;말끝마다 ~ 붙이지 말 것"></textarea>', '절대 어기지 않을 것')}
+        ${field('원작 언어', `<select id="bt_sourcelang" class="bt-input">${Object.entries(SOURCE_LANG).map(([k, v]) => `<option value="${k}">${v}</option>`).join('')}</select>`, '고유명사 표기')}
         ${field('이어가는 채팅 기준', '<textarea id="bt_anchor" class="bt-input" rows="5" placeholder="하던 채팅을 연 상태에서 아래 버튼을 누르면, 그 채팅에서 캐릭터가 실제로 어떤 말투·태도·거리감으로 굴러가는지 정리해 넣어요. 직접 적어도 돼요."></textarea>', '<span id="bt_anchor_meta"></span>')}
         <div class="bt-actions bt-actions-split">
           <button type="button" id="bt_anchor_grab" class="bt-btn">${ico('link')}<span>지금 채팅에서 가져오기</span></button>
@@ -1280,6 +1336,11 @@ ${doctorPageHtml()}
           ${field('프로필 최대 토큰', '<input id="bt_proftokens" class="bt-input bt-num" type="number" min="4000" max="64000" step="500">')}
           ${field('테스트 메시지 최대 토큰', '<input id="bt_testertokens" class="bt-input bt-num" type="number" min="1024" max="16000" step="256">')}
         </div>
+        ${field('고칠 문장 언어', `<select id="bt_pastelang" class="bt-input">
+            <option value="en">영어 (토큰 절약 · 고유명사는 한국어+원어)</option>
+            <option value="card">카드와 같은 언어</option>
+            <option value="ko">한국어</option>
+          </select>`, '복사·적용하는 문장')}
         ${field('웹 검색 방식', `<select id="bt_searchengine" class="bt-input">
             <option value="auto">자동 (키 불필요)</option>
             <option value="serper">Serper (Google, API 키 필요)</option>
@@ -1288,6 +1349,7 @@ ${doctorPageHtml()}
           </select>`)}
         <div class="bt-switches">
           ${toggle('lorebook', '내장 로어북도 평가에 포함')}
+          ${toggle('pastelines', '고칠 문장 속 대사는 원래 언어 유지', '설명은 영어로 줄여도, 따옴표 안의 대사는 캐릭터가 채팅에서 쓰는 언어로 남겨서 말투·사투리를 지켜요')}
           ${toggle('loreref', '연결된 로어북을 기준 자료로 쓰기', '평가할 때 로어북 설정과 어긋나는 답장도 찾아요. 원작 자료가 없어도 로어북만으로 평가할 수 있어요.')}
         </div>
       </section>
@@ -1432,6 +1494,10 @@ function bindPanel() {
     bindCheck('autoeval', 'autoEvalAfterTest');
     bindCheck('lorebook', 'includeLorebook');
     bindCheck('loreref', 'loreAsReference');
+    bindCheck('pastelines', 'pasteKeepLines');
+    const pl = $id('pastelang');
+    pl.value = ['en', 'card', 'ko'].includes(s.pasteLang) ? s.pasteLang : 'en';
+    pl.addEventListener('change', () => { s.pasteLang = pl.value; saveSettings(); });
 
     const scen = $id('scenario');
     scen.value = s.scenario;
@@ -1808,6 +1874,7 @@ async function refreshPanelForChar() {
     $id('caehcaution').value = data.caehCaution || '';
     $id('anchor').value = data.anchorText || '';
     $id('anchorbind').checked = !!data.anchorBind;
+    $id('sourcelang').value = SOURCE_LANG[data.sourceLang] ? data.sourceLang : 'auto';
     renderAnchorMeta(data);
     renderAnchorNote();
     renderContPick(data);
@@ -1839,6 +1906,7 @@ async function saveSourceFromUI(notify) {
     data.caehBase = $id('caehbase').value;
     data.caehCaution = $id('caehcaution').value;
     data.anchorBind = $id('anchorbind').checked;
+    data.sourceLang = $id('sourcelang').value;
     if (data.anchorText !== $id('anchor').value) { data.anchorText = $id('anchor').value; data.anchorTime = data.anchorText ? Date.now() : 0; }
     await saveCharData(char, data);
     if (notify) toastr.success(`${char.name}의 원작 자료를 저장했어요`);
@@ -2651,6 +2719,7 @@ async function runVoiceCheck(setKey = 'ja_ko') {
             'Differences the creator marked as intentional (AU / 설정 변경) must not reduce scores.',
             NO_SHIP_RULE,
             funGuard(charData),
+            pasteLangRule(charData),
             'JSON rules: straight double quotes, escape any " inside strings as \\", no trailing commas, no comments. Output ONE JSON object only, no markdown fences.',
         ].join('\n');
 
@@ -2675,7 +2744,7 @@ async function runVoiceCheck(setKey = 'ja_ko') {
                 ' "checks": {"first_person": "ok|bad|n/a", "address": "ok|bad|n/a", "register": "ok|bad|n/a", "dialect": "ok|bad|n/a", "tics": "ok|bad|n/a"},',
                 ' "comment": "",',
                 ' "flagged": [{"line": "", "problem": "", "rewrite": "", "rewrite_ko": "<고친 문장의 한국어 뜻, 한국어판이면 빈 문자열>"}],',
-                ` "bot_fixes": [{"priority": "high"|"medium"|"low", "what": "", "where": "description|personality|mes_example|first_mes|system_prompt|post_history|lorebook|author_note", "how": "", "paste": "<붙여넣을 문장, 대사는 해당 언어로 — 규칙 나열보다 샘플 대사·연출 지시 형태로>", ${FUN_IMPACT_DOC}}]}`,
+                ` "bot_fixes": [{"priority": "high"|"medium"|"low", "what": "", "where": "description|personality|mes_example|first_mes|system_prompt|post_history|lorebook|author_note", "how": "", "paste": "<붙여넣을 문장 (PASTE TEXT LANGUAGE 규칙대로) — 규칙 나열보다 샘플 대사·연출 지시 형태로>", ${FUN_IMPACT_DOC}}]}`,
             ].join('\n');
             const prompt = [
                 `[레퍼런스 — ${VOICE_VERSIONS[v].label} 말투]\n${JSON.stringify(prof.speech?.[v] ?? {}, null, 1)}`,
@@ -3395,8 +3464,9 @@ async function runCardDoctor() {
             MODEL_HEURISTICS,
             funGuard(charData),
             'Do NOT flag the fun engines above as problems. Specific prohibitions that come with a replacement behavior, per-language speech mechanics, escalation tiers, running gags and directorial cues are strengths even if they cost tokens. Only flag token cost when the text is redundant, wiki-like trivia, or never affects a scene.',
-            'Rewrite examples: turn vague prohibitions or flat lines into vivid, concrete, playable instructions (keep the same language as the card). Never make a line blander or shorter at the cost of flavor.',
-            'Everything human-readable in natural 한국어 (quotes and rewrites stay in the card\'s language). Short, concrete sentences.',
+            'Rewrite examples: turn vague prohibitions or flat lines into vivid, concrete, playable instructions. Never make a line blander or shorter at the cost of flavor.',
+            pasteLangRule(charData),
+            'Everything human-readable in natural 한국어 (quotes of the card stay exactly as written; rewrites and paste follow PASTE TEXT LANGUAGE). Short, concrete sentences.',
             NO_SHIP_RULE,
             'Limits: issues ≤ 8, rewrite_examples ≤ 4. JSON rules: straight double quotes, escape " inside strings, no trailing commas. Output ONE JSON object only:',
             '{"overall": <0-100 how well the card supports good roleplay>, "fun": <0-100 how fun the roleplay will likely be>, "summary": "<2-3 문장>",',
@@ -3450,6 +3520,7 @@ async function runChatDoctor() {
             'Look for: repetitive sentence openings/structures, reused phrases, parroting the user, speaking or acting for {{user}}, purple prose/over-description, replies too long or too short, bland or passive acting, forgetting character traits, ignoring lorebook info, OOC tone, clichés, ending every reply with a question, summarizing/moralizing endings, stiffness caused by prohibitions.',
             'Also judge FUN: does the bot create small conflicts or hooks, use physical beats and signature cues, pay off running gags and nicknames, escalate when triggered, show subtext through the body, and leave {{user}} something to react to? Boring-but-accurate replies are a problem.',
             funGuard(cdFun),
+            pasteLangRule(cdFun),
             MODEL_HEURISTICS,
             'Everything in natural 한국어 (quotes stay in the chat\'s language).',
             NO_SHIP_RULE,
@@ -4189,7 +4260,7 @@ function funProtectRules(charData) {
     ].join('\n');
 }
 
-async function compressText({ text, label, kind, level, keepExamples, positive, isReference = false, protectFun = true, charData = null, context = '' }) {
+async function compressText({ text, label, kind, level, keepExamples, positive, isReference = false, protectFun = true, charData = null, context = '', toEnglish = false }) {
     const L = DIET_LEVELS[level] || DIET_LEVELS.normal;
     const inTok = await countTokens(text);
     const target = Math.max(40, Math.round(inTok * L.ratio));
@@ -4200,7 +4271,7 @@ async function compressText({ text, label, kind, level, keepExamples, positive, 
         `Target length: about ${target} tokens (original ≈ ${inTok}). ${L.rule}`,
         isReference ? '' : DIET_PRINCIPLES,
         'Rules:',
-        '- Keep the SAME language as the original. Do not translate.',
+        toEnglish ? `- Rewrite in compact English (big token saving).\n${pasteLangRule(charData)}` : '- Keep the SAME language as the original. Do not translate.',
         '- Keep every macro exactly as written ({{char}}, {{user}}, <START>, etc.).',
         '- Keep names, speech style, first-person pronoun, dialect, catchphrases, relationships, key backstory and anything that changes behaviour.',
         keepExamples ? '- Keep quoted lines / example dialogue VERBATIM (you may drop some examples, but never rewrite a kept line).' : '- You may shorten example lines, but keep the character\'s voice.',
@@ -4232,7 +4303,7 @@ async function compressText({ text, label, kind, level, keepExamples, positive, 
 }
 
 /** Keeps the always-sent core in the field and moves situational details into keyword lorebook entries. */
-async function splitToLore({ text, label, level, keepExamples, protectFun = true, charData = null, context = '' }) {
+async function splitToLore({ text, label, level, keepExamples, protectFun = true, charData = null, context = '', toEnglish = false }) {
     const L = DIET_LEVELS[level] || DIET_LEVELS.normal;
     const inTok = await countTokens(text);
     const target = Math.max(60, Math.round(inTok * L.ratio));
@@ -4244,7 +4315,7 @@ async function splitToLore({ text, label, level, keepExamples, protectFun = true
         `Target CORE length: about ${target} tokens (original ≈ ${inTok}). ${L.rule}`,
         DIET_PRINCIPLES,
         'Rules:',
-        '- Keep the SAME language as the original. Keep every macro exactly ({{char}}, {{user}}).',
+        toEnglish ? `- Rewrite CORE and lore content in compact English (big token saving).\n${pasteLangRule(charData, { keys: true })}` : '- Keep the SAME language as the original. Keep every macro exactly ({{char}}, {{user}}).',
         '- Nothing may be lost: every fact is either in CORE or in a lore entry (or listed in <removed> as a true duplicate).',
         '- Never move voice, personality core, relationship to {{user}}, or fun mechanics into lore — those must stay in CORE.',
         keepExamples ? '- Keep quoted lines verbatim.' : '',
@@ -4384,6 +4455,7 @@ function dietCardHtml() {
           ${toggle('diet_protect', '재미 요소 보호 (추천)', '연출 지시·모드 전환·트리거·개그·별명 규칙·샘플 대사는 줄이지 않아요')}
           ${toggle('diet_keepex', '대사는 그대로 두기', '예시 대사·인용 대사는 문장을 바꾸지 않고 개수만 줄여요')}
           ${toggle('diet_positive', '막연한 금지문만 긍정문으로', '대체 행동이 붙은 구체적인 금지문은 그대로 둬요')}
+          ${toggle('diet_en', '영어로 바꿔서 더 줄이기', '설명은 영어로, 고유명사는 한국어(+원어)로, 대사는 원래 언어로 남겨요')}
         </div>
         ${dietTipsHtml()}
         <div class="bt-actions">
@@ -4511,6 +4583,7 @@ async function runDiet() {
     const keepExamples = $id('diet_keepex').checked;
     const positive = $id('diet_positive').checked;
     const protectFun = $id('diet_protect').checked;
+    const toEnglish = $id('diet_en').checked;
     const dietCharData = await loadCharData(getCurrentCharacter());
     // other permanent parts as context so duplicates across fields can be merged
     const contextFor = (t) => dietCache.filter(x => x.id !== t.id && (x.cost === 'perm' || x.cost === 'lorec'))
@@ -4524,7 +4597,7 @@ async function runDiet() {
             if (stopRequested) break;
             const split = mode === 'split' && t.kind === 'field' && SPLITTABLE_FIELDS.includes(t.field);
             try {
-                const common = { text: t.text, label: t.label, level, keepExamples: keepExamples || t.field === 'mes_example', protectFun, charData: dietCharData, context: contextFor(t) };
+                const common = { text: t.text, label: t.label, level, keepExamples: keepExamples || t.field === 'mes_example', protectFun, charData: dietCharData, context: contextFor(t), toEnglish };
                 dietResults[t.id] = await withTimer(`${split ? '🗂️' : '✂️'} (${i + 1}/${targets.length}) ${t.label} ${split ? '나누는' : '줄이는'} 중…`,
                     split ? splitToLore(common) : compressText({ ...common, kind: t.kind, positive }));
                 dietResults[t.id].original = t.text;
@@ -4802,15 +4875,16 @@ async function runFunAnalysis() {
             caehGuide(cdDir),
             changeDiscipline(cdDir),
             FUN_PRINCIPLES,
+            pasteLangRule(cdDir),
             'Find the concrete fun engines in THIS card (quote them), rate each, list what must never be cut, and suggest a few additions that would make it even more fun without flattening anything.',
             'style_summary: write the creator\'s "fun formula" as 6-10 short, reusable rules (in 한국어) that could guide edits to OTHER bots by the same creator.',
-            'Everything human-readable in natural 한국어; quotes stay in the card\'s language.',
+            'Everything human-readable in natural 한국어; quotes of the card stay exactly as written; paste follows PASTE TEXT LANGUAGE.',
             NO_SHIP_RULE,
             'Limits: engines ≤ 10, protect ≤ 12, improve ≤ 5. JSON rules: straight double quotes, escape " inside strings, no trailing commas. Output ONE JSON object only:',
             '{"fun": <0-100>, "summary": "<3-4 문장: 이 봇이 왜 재밌는지>",',
             ' "engines": [{"name": "<연출 지시|모드 전환 비트|단계별 에스컬레이션|언어별 말투 설계|대체 행동이 붙은 금지문|관계·호칭 시스템|반복 개그|시그니처 대사|서브텍스트·갭|장면 훅(첫 메시지)|희소성|기타>", "strength": "strong"|"ok"|"weak"|"missing", "evidence": "<카드 인용>", "why": "<왜 재밌게 만드는지>"}],',
             ' "protect": [{"what": "<지키야 할 요소>", "where": "<필드/로어북 항목>", "quote": "<짧은 인용>"}],',
-            ` "improve": [{"idea": "", "why": "", "where": "description|first_mes|mes_example|lorebook|personality|scenario", "paste": "<붙여넣을 문장, 카드 언어로>", ${FUN_IMPACT_DOC}}],`,
+            ` "improve": [{"idea": "", "why": "", "where": "description|first_mes|mes_example|lorebook|personality|scenario", "paste": "<붙여넣을 문장 (PASTE TEXT LANGUAGE 규칙대로)>", ${FUN_IMPACT_DOC}}],`,
             ' "style_summary": "<재미 공식 6-10줄>"}',
         ].join('\n');
         const prompt = [
@@ -4923,6 +4997,7 @@ function bindCaehUI() {
     $id('anchor_grab').addEventListener('click', grabAnchor);
     $id('anchor_pin').addEventListener('click', pinAnchorToChatNote);
     $id('anchorbind').addEventListener('change', save);
+    $id('sourcelang').addEventListener('change', save);
     $id('cont_run').addEventListener('click', runContinuity);
 }
 
@@ -5040,7 +5115,20 @@ async function pinAnchorToChatNote() {
         text = $id('anchor').value.trim();
         if (!text) return;
     }
-    const block = `${NOTE_START}\n${anchorToNote(text)}\n${NOTE_END}`;
+    let body = anchorToNote(text);
+    if (getSettings().pasteLang === 'en') {
+        try {
+            const cd = await loadCharData(char);
+            const en = stripReasoning(await withTimer('📝 작가 노트를 영어로 줄이는 중…', callLLM({
+                system: ['Convert this roleplay continuity note into a compact English author\'s note for the model. Keep every fact; no preamble, no markdown headers. Start with: "In this chat, keep playing {{char}} like this (overrides the card where they differ):"', pasteLangRule(cd)].join('\n'),
+                prompt: body,
+                profileId: getSettings().evalProfile,
+                maxTokens: 3000,
+            }))).replace(/^```[a-z]*\s*|```$/g, '').trim();
+            if (en) body = en;
+        } catch (e) { console.warn(LOG, 'note translation failed, keeping Korean', e); }
+    }
+    const block = `${NOTE_START}\n${body}\n${NOTE_END}`;
     const md = c.chatMetadata;
     const old = String(md.note_prompt || '');
     const re = chatNoteBlockRe();
@@ -5525,7 +5613,8 @@ async function runLoreAi() {
             'Keyword advice: keys should be words people actually type in chat. For Korean/Japanese chats include the forms used there. Never suggest the character\'s or user\'s name alone as a key.',
             funGuard(cd),
             NO_SHIP_RULE,
-            'Everything human-readable in natural 한국어; paste/content stays in the language the lorebook uses.',
+            'Everything human-readable in natural 한국어.',
+            pasteLangRule(cd, { keys: true }),
             'Limits: issues ≤ 10, missing ≤ 4. "idx" is the #number of the entry. "paste" = full replacement content for that entry, or empty string if only keys change.',
             'JSON rules: straight double quotes, escape " inside strings, no trailing commas. Output ONE JSON object only:',
             `{"score": <0-100 how well the lorebooks support fun, accurate roleplay>, "summary": "<2-3문장>",`,
@@ -5758,7 +5847,8 @@ async function runLoreChatCheck() {
             'Info-dumping lore text verbatim into a reply is also a problem: the lore should be SHOWN in the scene.',
             funGuard(cd),
             NO_SHIP_RULE,
-            'Everything human-readable in natural 한국어; quotes and paste stay in the original language.',
+            'Everything human-readable in natural 한국어; quotes of bot lines stay exactly as written.',
+            pasteLangRule(cd),
             'Limits: violations ≤ 8, unused ≤ 5, good ≤ 4. "idx" = lorebook entry #number, "reply" = BOT number.',
             'JSON rules: straight double quotes, escape " inside strings, no trailing commas. Output ONE JSON object only:',
             '{"score": <0-100>, "scores": {"facts": 0, "rules": 0, "use": 0}, "summary": "<2-3문장>",',
@@ -5811,7 +5901,8 @@ async function runLoreCardCheck() {
             'Fix toward the lorebook, but keep the card fun and in the creator\'s direction. If a lore rule itself is the problem, say so in "problem" instead of bending the card.',
             funGuard(cd),
             NO_SHIP_RULE,
-            'Everything human-readable in natural 한국어; card quotes and paste stay in the card\'s language.',
+            'Everything human-readable in natural 한국어; card_quote must be copied EXACTLY from the card (same language, same wording).',
+            pasteLangRule(cd),
             'Limits: rules ≤ 12, conflicts ≤ 8, missing ≤ 6, overrides ≤ 4. "idx" = lorebook entry #number.',
             'JSON rules: straight double quotes, escape " inside strings, no trailing commas. Output ONE JSON object only:',
             '{"score": <0-100 how well the card follows the lorebook>, "summary": "<2-3문장>",',
