@@ -89,7 +89,7 @@ function charKey(char) {
     return STORE_PREFIX + (char?.avatar || char?.name || 'unknown');
 }
 
-const emptyCharData = () => ({ urls: [], refText: '', authorNote: '', history: [], names: null, voiceProfile: null, voiceResults: {}, doctor: null, runs: [], abBaselineId: null, abLast: null, applyLog: [], funProfile: null, caehBase: '', caehCaution: '', anchorText: '', anchorTime: 0, anchorBind: false, contLast: null, sourceLang: 'auto' });
+const emptyCharData = () => ({ urls: [], refText: '', authorNote: '', history: [], names: null, voiceProfile: null, voiceResults: {}, doctor: null, runs: [], abBaselineId: null, abLast: null, applyLog: [], funProfile: null, caehBase: '', caehCaution: '', anchorText: '', anchorTime: 0, anchorBind: false, contLast: null, sourceLang: 'auto', botKind: 'auto', botKindDetected: 'single', rosterText: '', voiceMember: '', memberVoice: {} });
 
 async function loadCharData(char) {
     if (!char) return emptyCharData();
@@ -522,7 +522,7 @@ function pasteLangRule(cd, { keys = false } = {}) {
 /** Extra guidance: the creator's direction + change discipline + proven style + protected parts. */
 function funGuard(charData) {
     const s = getSettings();
-    const parts = [caehGuide(charData), changeDiscipline(charData), FUN_PRINCIPLES].filter(Boolean);
+    const parts = [botTypeGuide(charData), caehGuide(charData), changeDiscipline(charData), FUN_PRINCIPLES].filter(Boolean);
     if (s.funReference) parts.push(`CREATOR'S PROVEN FUN STYLE (their own bot that plays well — match this approach):\n${truncate(s.funReference, 1800)}`);
     const protect = charData?.funProfile?.protect || [];
     if (protect.length) {
@@ -596,6 +596,9 @@ const FOCUS = {
     values: ['캐릭터의 가치관을 시험하는 딜레마 제시', '캐릭터가 싫어하는 것/좋아하는 것을 들이밀기', '원작 성격이라면 거절할 법한 부탁을 하기'],
     chaos: ['갑작스러운 돌발 상황(사고, 위험, 낯선 사람 등장)', '분위기를 확 바꾸는 엉뚱한 행동', '캐릭터의 설정 밖의 질문(현대 문물 등)으로 일관성 확인'],
     fun: ['카드에 적힌 트리거(화나게 하는 것·모드가 바뀌는 조건)를 건드려 봄', '별명·호칭 규칙이나 반복 개그가 나올 상황을 만듦', '캐릭터가 숨기는 속마음을 슬쩍 찔러 봄', '작은 갈등이나 부탁을 던져서 장면을 굴려 봄'],
+    multi: ['두 캐릭터 이상에게 한꺼번에 말을 걸어 누가 어떻게 답하는지 봄', '특정 캐릭터 이름을 불러 그 캐릭터만 반응하는지 확인', '캐릭터들끼리 의견이 갈릴 만한 질문을 던짐', '한 캐릭터만 편들어서 다른 캐릭터들 반응을 봄', '평소 말이 적은 캐릭터에게 직접 말을 걺'],
+    sim: ['시간을 건너뛰거나 장소를 옮겨서 세계와 상태가 이어지는지 봄', '처음 보는 NPC에게 말을 걸거나 소문을 물어봄', '무리하거나 엉뚱한 선택을 해서 결과·대가가 따라오는지 봄', '상태창·호감도·돈 같은 수치를 확인하거나 바꾸는 행동', '이전에 있었던 사건을 다시 언급해 기억하는지 봄'],
+    rpg: ['전투를 걸어서 판정과 피해 계산이 맞는지 봄', '아이템을 쓰거나 사고팔아서 인벤토리·골드가 맞게 바뀌는지 봄', '불가능하거나 아주 위험한 행동을 시도해 실패 판정이 나오는지 봄', '스탯·상태창을 보여달라고 하거나 레벨업 조건을 물어봄', '규칙을 어기려는 행동(갑자기 돈이 생겼다고 주장하는 등)을 해 봄', '퀘스트를 받거나 진행 상황을 물어봄'],
 };
 
 const SCENARIO_LABELS = {
@@ -607,13 +610,19 @@ const SCENARIO_LABELS = {
     values: '가치관 / 좋고 싫음',
     fun: '재미 포인트 자극 (트리거·개그·속마음)',
     chaos: '돌발 상황 / 일관성',
+    multi: '다인봇: 여러 캐릭터와 대화',
+    sim: '시뮬: 세계·NPC·선택의 결과',
+    rpg: 'RPG: 전투·아이템·판정',
     custom: '직접 지시만 사용',
 };
 
-function pickFocus(scenario, turn) {
+function pickFocus(scenario, turn, kind = 'single') {
     if (scenario === 'custom') return '제작자 지시사항을 따름';
+    const mixKeys = kind === 'single'
+        ? ['daily', 'fun', 'lore', 'relationship', 'emotion', 'values', 'chaos', 'fun']
+        : [kind, 'daily', kind, 'fun', kind, 'lore', kind, 'emotion', kind, 'chaos'];
     const pool = scenario === 'mix'
-        ? ['daily', 'fun', 'lore', 'relationship', 'emotion', 'values', 'chaos', 'fun'].map(k => FOCUS[k][turn % FOCUS[k].length])
+        ? mixKeys.map(k => FOCUS[k][turn % FOCUS[k].length])
         : FOCUS[scenario] ?? FOCUS.daily;
     return pool[turn % pool.length];
 }
@@ -659,7 +668,10 @@ function testerSystemPrompt(userName, charName, language) {
 }
 
 function testerContextBlocks(charData, s) {
+    const kind = botKind(charData);
+    const roster = rosterOf(charData);
     return [
+        kind !== 'single' ? `[봇 종류: ${BOT_KINDS[kind].label}] ${{ multi: '여러 캐릭터가 함께 나오는 봇이에요. 캐릭터 이름을 불러 말을 걸고, 캐릭터끼리 반응하게 만들어 보세요.', sim: '세계·상황을 진행하는 시뮬레이션 봇이에요. 장소·시간을 바꾸고, NPC를 만나고, 선택의 결과를 확인해 보세요.', rpg: '게임 마스터 역할의 RPG 봇이에요. 플레이어로서 행동을 선언하고, 전투·아이템·판정·상태창을 시험해 보세요.' }[kind]}${roster.length ? `\n등장인물: ${roster.map(r => r.name).join(', ')}` : ''}` : '',
         charData.refText ? `[원작 참고 자료 (발췌)]\n${truncate(charData.refText, 3000)}` : '[원작 참고 자료 없음 — 일반적인 캐릭터 일관성 위주로 테스트]',
         charData.authorNote ? `[제작자 메모 — 의도한 AU/설정 변경]\n${charData.authorNote}` : '',
         String(charData.caehBase || '').trim() ? `[제작자가 원하는 캐해 — 이 방향이 잘 드러나는지도 떠볼 것]\n${truncate(charData.caehBase, 1200)}` : '',
@@ -672,7 +684,7 @@ function testerContextBlocks(charData, s) {
 async function generateTestMessage(turn, total, charData) {
     const s = getSettings();
     const { userName, charName } = testerNames();
-    const focus = pickFocus(s.scenario, turn).replaceAll('{{user}}', userName);
+    const focus = pickFocus(s.scenario, turn, botKind(charData)).replaceAll('{{user}}', userName);
 
     const system = testerSystemPrompt(userName, charName, s.language)
         + `\n- Output ONLY ${userName}'s next chat message. Continue naturally from the conversation; do not repeat earlier questions.`;
@@ -697,7 +709,7 @@ async function generateTestMessage(turn, total, charData) {
 async function generateTestBatch(total, charData) {
     const s = getSettings();
     const { userName, charName } = testerNames();
-    const focuses = Array.from({ length: total }, (_, i) => `${i + 1}. ${pickFocus(s.scenario, i).replaceAll('{{user}}', userName)}`);
+    const focuses = Array.from({ length: total }, (_, i) => `${i + 1}. ${pickFocus(s.scenario, i, botKind(charData)).replaceAll('{{user}}', userName)}`);
 
     const system = testerSystemPrompt(userName, charName, s.language) + [
         '',
@@ -869,6 +881,14 @@ function stopTest() {
 // ---------------------------------------------------------------------------
 
 const EVAL_CATEGORIES = ['말투·어휘', '성격·가치관', '원작 설정·세계관', '인간관계', '행동·반응 패턴', '재미·몰입'];
+const KIND_EVAL_CATEGORIES = {
+    multi: ['캐릭터 구분'],
+    sim: ['세계·시스템 일관성', '상태 추적'],
+    rpg: ['규칙·판정', '수치 일관성'],
+};
+function evalCategories(kind) {
+    return [...EVAL_CATEGORIES, ...(KIND_EVAL_CATEGORIES[kind] || [])];
+}
 
 /** Depth of unclosed {}/[] outside of strings — > 0 means the output was cut off. */
 function jsonOpenDepth(t) {
@@ -1038,7 +1058,8 @@ async function runEvaluation({ useChat = true, messages = 0 } = {}) {
         '{',
         '  "overall": <integer 0-100, faithfulness to the original>,',
         '  "fun": <integer 0-100, how fun and immersive the bot is to roleplay with: scene hooks, vivid physical beats, humor/gags, tension and escalation, subtext, room for {{user}} to act>,',
-        `  "categories": [ {"name": one of ${JSON.stringify(EVAL_CATEGORIES)}, "score": <0-100>, "comment": "<1-2 sentences>"} ],`,
+        `  "categories": [ {"name": one of ${JSON.stringify(evalCategories(botKind(charData)))}, "score": <0-100>, "comment": "<1-2 sentences>"} ],`,
+        botKind(charData) === 'single' ? '' : '  "per_character": [ {"name": "<character or key NPC>", "score": <0-100 faithful to their own canon and distinct>, "comment": "<1 sentence>"} ],',
         '  "summary": "<2-3 sentence overall verdict>",',
         '  "strengths": ["<what matches canon well>", ...],',
         '  "issues": [ {"severity": "high"|"medium"|"low", "category": "<category name>", "problem": "<what is off vs canon>", "evidence": "<short quote from the chat or card>", "canon": "<what the reference says>", "fix": "<concrete fix>"} ],',
@@ -1229,6 +1250,7 @@ function buildPanel() {
   <div id="bt_body" class="bt-body">
 
     <div class="bt-page" data-page="source">
+${botKindCardHtml()}
       <section class="bt-card">
         ${cardHead('Step 1', '위키 링크', '픽시브 백과사전, 나무위키, 팬덤 위키 링크를 한 줄에 하나씩 넣어주세요.<br>캐릭터마다 따로 저장돼요.')}
         <textarea id="bt_urls" class="bt-input bt-mono" rows="3" placeholder="https://namu.wiki/w/…&#10;https://dic.pixiv.net/a/…&#10;https://xxx.fandom.com/wiki/…"></textarea>
@@ -1514,6 +1536,9 @@ function bindPanel() {
     $id('reftext').addEventListener('input', updateRefCount);
     $id('savesrc').addEventListener('click', () => saveSourceFromUI(true));
     bindCaehUI();
+    bindBotKindUI();
+    bindVoiceMember();
+    bindKindDoctor();
     $id('fetch').addEventListener('click', onFetchClick);
 
     // Test page
@@ -1866,7 +1891,9 @@ async function refreshPanelForChar() {
     if (!$id('panel')) return;
     const char = getCurrentCharacter();
     $id('charname').textContent = char ? char.name : '캐릭터 없음';
-    const data = await loadCharData(char);
+    let data = await loadCharData(char);
+    data = await refreshBotKind(char, data);
+    renderBotKindUI(data);
     $id('urls').value = (data.urls || []).join('\n');
     $id('reftext').value = data.refText || '';
     $id('authornote').value = data.authorNote || '';
@@ -1881,7 +1908,7 @@ async function refreshPanelForChar() {
     renderContResult(data.contLast);
     updateRefCount();
     renderHistory(data.history || []);
-    renderVoiceForChar(data);
+    renderVoiceForChar(await loadVoiceData(char));
     renderDoctorForChar(data);
     renderAbPanel(data);
     renderAbCompare(data);
@@ -1907,6 +1934,8 @@ async function saveSourceFromUI(notify) {
     data.caehCaution = $id('caehcaution').value;
     data.anchorBind = $id('anchorbind').checked;
     data.sourceLang = $id('sourcelang').value;
+    data.botKind = $id('botkind').value;
+    data.rosterText = $id('roster').value;
     if (data.anchorText !== $id('anchor').value) { data.anchorText = $id('anchor').value; data.anchorTime = data.anchorText ? Date.now() : 0; }
     await saveCharData(char, data);
     if (notify) toastr.success(`${char.name}의 원작 자료를 저장했어요`);
@@ -2028,6 +2057,7 @@ function renderResult(entry, prevEntry) {
         </section>`}
         ${r.summary ? `<section class="bt-card bt-summary">${ico('quote-left')}<div class="bt-prose">${prose(r.summary)}</div></section>` : ''}
         ${cats ? `<section class="bt-card">${cardHead('', '항목별 점수')}<div class="bt-meters">${cats}</div></section>` : ''}
+        ${r.per_character?.length ? `<section class="bt-card">${cardHead('', '캐릭터별')}<div class="bt-meters">${r.per_character.map(c => meterHtml(escapeHtml(c.name || ''), c.score ?? null, { sub: c.comment })).join('')}</div></section>` : ''}
         ${r.strengths?.length ? `<section class="bt-card">${cardHead('', '잘 된 점')}${renderList(r.strengths, 'bt-list-check')}</section>` : ''}
         ${issues ? `<section class="bt-card">${cardHead('', '수정이 필요한 점')}<div class="bt-stack">${issues}</div></section>` : ''}
         ${sugg ? `<section class="bt-card">${cardHead('', '카드 수정 제안', '복사해서 캐릭터 카드에 붙여넣으세요.')}<div class="bt-stack">${sugg}</div></section>` : ''}
@@ -2433,6 +2463,7 @@ async function autofillNames(char, charData) {
     const system = 'You identify fictional characters. Output ONE JSON object only.';
     const prompt = [
         `[캐릭터 카드 이름] ${char.name}`,
+        charData.__member ? `[찾을 캐릭터] 이 카드는 여러 캐릭터를 연기해요. 그중 “${charData.__member}”만 찾으세요.` : '',
         `[카드 설명 일부]\n${truncate(char.description || '', 1500)}`,
         charData.refText ? `[원작 자료 일부]\n${truncate(charData.refText, 2500)}` : '',
         'Identify the ORIGINAL character this fan-made bot is based on. Return:',
@@ -2466,7 +2497,7 @@ async function buildVoiceProfile() {
     const char = getCurrentCharacter();
     if (!char) { toastr.error('1:1 캐릭터 채팅을 열어주세요'); return; }
     const s = getSettings();
-    const charData = await loadCharData(char);
+    const charData = await loadVoiceData(char);
     readNamesFromUI(charData);
 
     running = true;
@@ -2507,7 +2538,8 @@ async function buildVoiceProfile() {
 
         const n = charData.names;
         const prompt = [
-            `[캐릭터] ${char.name} / 日: ${n.ja} / EN: ${n.en} / KO: ${n.ko}`,
+            `[캐릭터] ${voiceName(char, charData)} / 日: ${n.ja} / EN: ${n.en} / KO: ${n.ko}`,
+            charData.__member ? `[참고] 이 카드는 여러 캐릭터를 연기하는 카드예요. ${charData.__member} 한 명만 정리하세요.` : '',
             `[작품] 日: ${n.seriesJa} / EN: ${n.seriesEn} / KO: ${n.seriesKo}`,
             charData.refText ? `[원작 자료 (위키)]\n${truncate(charData.refText, 10000)}` : '[원작 자료 없음]',
             research.text ? `[웹 검색 결과 스니펫 (일·영·한, X/트위터·레딧 포함)]\n${research.text}` : '[웹 검색 결과 없음 — 자체 지식으로 작성하고 confidence를 낮게]',
@@ -2527,7 +2559,7 @@ async function buildVoiceProfile() {
             sources: research.sources.slice(0, 40),
             searchStat: research.total ? `${research.okCount}/${research.total}` : '검색 안 함',
         };
-        await saveCharData(char, charData);
+        await saveVoiceData(char, charData);
         renderVoiceProfile(charData.voiceProfile);
         setStatus('✅ 말투·성격 프로필 완성');
         toastr.success('말투·성격 프로필을 만들었어요');
@@ -2543,8 +2575,9 @@ async function buildVoiceProfile() {
 
 // ---------- Verification ----------
 
-async function generateVoiceSamples(versions) {
-    const { userName, charName } = testerNames();
+async function generateVoiceSamples(versions, nameOverride = '') {
+    const { userName } = testerNames();
+    const charName = nameOverride || testerNames().charName;
     const out = {};
     for (const v of versions) {
         if (stopRequested) break;
@@ -2691,10 +2724,10 @@ async function runVoiceCheck(setKey = 'ja_ko') {
     const char = getCurrentCharacter();
     if (!char) { toastr.error('1:1 캐릭터 채팅을 열어주세요'); return; }
     const s = getSettings();
-    let charData = await loadCharData(char);
+    let charData = await loadVoiceData(char);
     if (!charData.voiceProfile?.profile) {
         await buildVoiceProfile();
-        charData = await loadCharData(char);
+        charData = await loadVoiceData(char);
         if (!charData.voiceProfile?.profile) return;
     }
     const versions = set.versions;
@@ -2703,7 +2736,7 @@ async function runVoiceCheck(setKey = 'ja_ko') {
     stopRequested = false;
     updateRunState();
     try {
-        const samples = s.voiceSamples ? await generateVoiceSamples(versions) : {};
+        const samples = s.voiceSamples ? await generateVoiceSamples(versions, charData.__member) : {};
         const chatLog = s.voiceUseChat ? collectChatLog(Number(s.evalMessages) || 20) : '';
         if (!chatLog.trim() && !Object.keys(samples).length) {
             throw new Error('검증할 대사가 없어요. “샘플 대사 생성”을 켜거나 채팅을 먼저 진행해 주세요.');
@@ -2718,6 +2751,7 @@ async function runVoiceCheck(setKey = 'ja_ko') {
             'Every explanation must be in natural 한국어 that a Korean reader who is not fluent in the other language can understand. When you mention an English/Japanese word, add its Korean meaning in parentheses.',
             'Differences the creator marked as intentional (AU / 설정 변경) must not reduce scores.',
             NO_SHIP_RULE,
+            memberFocusLine(charData),
             funGuard(charData),
             pasteLangRule(charData),
             'JSON rules: straight double quotes, escape any " inside strings as \\", no trailing commas, no comments. Output ONE JSON object only, no markdown fences.',
@@ -2807,7 +2841,7 @@ async function runVoiceCheck(setKey = 'ja_ko') {
         const entry = { time: Date.now(), set: setKey, versions, samples, result };
         charData.voiceResults = charData.voiceResults || {};
         charData.voiceResults[setKey] = [entry, ...(charData.voiceResults[setKey] || [])].slice(0, 10);
-        await saveCharData(char, charData);
+        await saveVoiceData(char, charData);
         currentVoiceSet = setKey;
         renderVoiceResults(charData);
         const p = result.personality || {};
@@ -2851,9 +2885,9 @@ function writeNamesToUI(n) {
 async function saveNamesFromUI() {
     const char = getCurrentCharacter();
     if (!char) return;
-    const data = await loadCharData(char);
+    const data = await loadVoiceData(char);
     readNamesFromUI(data);
-    await saveCharData(char, data);
+    await saveVoiceData(char, data);
     writeNamesToUI(data.names);
 }
 
@@ -2871,11 +2905,11 @@ function bindVoicePage() {
         const char = getCurrentCharacter();
         if (!char) { toastr.error('캐릭터 채팅을 먼저 열어주세요'); return; }
         await saveSourceFromUI(false);
-        const data = await loadCharData(char);
+        const data = await loadVoiceData(char);
         running = true; updateRunState();
         try {
             data.names = await withTimer('✨ 이름 자동 확인 중…', autofillNames(char, data));
-            await saveCharData(char, data);
+            await saveVoiceData(char, data);
             writeNamesToUI(data.names);
             $id('names_box').open = true;
             setStatus('✅ 이름을 채웠어요. 맞는지 확인해 주세요.');
@@ -2904,6 +2938,9 @@ function voicePageHtml() {
     <div class="bt-page" data-page="voice" style="display:none">
       <section class="bt-card">
         ${cardHead('Voice & Personality', '말투·성격 검증', '언어별 원작 말투와 성격(원작 캐해, 팬덤 2차 캐해)을 정리한 뒤, 봇이 그대로 말하고 행동하는지 언어 짝별로 검사해요.<br>링크는 따로 안 넣어도 돼요.')}
+        <div id="bt_vmember_wrap" style="display:none">
+          ${field('검증할 캐릭터', '<select id="bt_vmember" class="bt-input"></select>', '다인봇은 한 명씩')}
+        </div>
         <details class="bt-disclosure" id="bt_names_box">
           <summary><span>캐릭터 이름 · 작품명</span><small id="bt_names_summary"></small>${ico('chevron-down')}</summary>
           <div class="bt-grid2">
@@ -3587,6 +3624,7 @@ function doctorPageHtml() {
         </div>
         <p class="bt-note">토큰 수는 지금 연결된 모델의 토크나이저 기준이에요. GPT·Claude·Gemini끼리는 ±10~20% 정도 차이 나요.</p>
       </section>
+${kindDoctorHtml()}
       <div id="bt_doc_fun" class="bt-result"></div>
 ${restyleCardHtml()}
       <div id="bt_doc_local_view" class="bt-result"></div>
@@ -3752,6 +3790,7 @@ function renderDoctorForChar(data) {
     if ($id('doc_local_view')) $id('doc_local_view').innerHTML = '';
     if (loreCheckCache && loreCheckCache.char !== getCurrentCharacter()?.avatar) loreCheckCache = null;
     renderLoreCheck();
+    renderKindResults();
     renderFunAnalysis(data);
     renderDoctorCard(data?.doctor?.card);
     renderDoctorChat(data?.doctor?.chat);
@@ -4280,6 +4319,7 @@ async function compressText({ text, label, kind, level, keepExamples, positive, 
         isReference ? '- Focus on personality, speech, values, relationships, likes/dislikes and major events. Drop trivia (voice actors, merchandise, release dates, popularity polls).' : '- Do not invent anything new.',
         (!isReference && protectFun) ? funProtectRules(charData) : '',
         (!isReference && !protectFun) ? caehGuide(charData) : '',
+        (!isReference && !protectFun) ? botTypeGuide(charData) : '',
         NO_SHIP_RULE,
         'Output format (no markdown fences):',
         '<compressed>',
@@ -4320,7 +4360,7 @@ async function splitToLore({ text, label, level, keepExamples, protectFun = true
         '- Never move voice, personality core, relationship to {{user}}, or fun mechanics into lore — those must stay in CORE.',
         keepExamples ? '- Keep quoted lines verbatim.' : '',
         '- 0-6 entries. If nothing is situational, output an empty <lore></lore> and only tighten CORE.',
-        protectFun ? funProtectRules(charData) : caehGuide(charData),
+        protectFun ? funProtectRules(charData) : `${botTypeGuide(charData)}\n${caehGuide(charData)}`,
         NO_SHIP_RULE,
         'Output format (no markdown fences):',
         '<core>',
@@ -5024,6 +5064,8 @@ async function grabAnchor() {
         const system = [
             `You read an ongoing roleplay chat and write down how ${charName} is ACTUALLY being played in it, so that later edits to the character card do not break continuity.`,
             'Describe what the chat shows, not what canon says. Quote short real lines from the chat as evidence.',
+            botKind(cd) === 'multi' ? 'This card plays several characters: in 말투 and 거리감, describe each main character on its own line.' : '',
+            botKind(cd) === 'sim' || botKind(cd) === 'rpg' ? 'This is a simulation/RPG bot: in 지금 상황 also note the current tracked values (stats, items, money, affection, day/time) exactly as the chat shows them.' : '',
             'Write in natural 한국어 (quotes stay in the chat\'s language). Plain text, no markdown headers, at most about 1200 characters.',
             'Use exactly these five labeled parts, each 1-3 lines:',
             '말투: first person, how they address {{user}}, sentence endings, dialect, tics — with 2-3 short quotes',
@@ -5289,6 +5331,7 @@ async function runContinuity() {
         const Y = swap ? replyBefore : replyAfter;
         const system = [
             'You judge two candidate next replies in an ongoing roleplay. The creator edited the character card and keeps playing THIS chat, so the character must still feel like the same person the chat has established.',
+            botTypeGuide(cd),
             caehGuide({ ...cd, anchorBind: true }),
             changeDiscipline({ ...cd, anchorBind: true }),
             'Score each candidate 0-100 on: continuity (same voice, attitude and distance toward the user as earlier in the chat), fun (scene energy, hooks, personality on the page, gives the user something to react to), direction (fits the creator\'s intended characterization and cautions; if none are given, fits the character as established).',
@@ -6022,6 +6065,454 @@ function bindLoreAiViews(d) {
         const x = card?.missing?.[Number(b.dataset.idx)];
         if (x) openApplyDialog({ field: x.field, text: x.paste || '', reason: x.rule || '' });
     }));
+}
+
+
+// ---------------------------------------------------------------------------
+// Bot types (봇 종류): single character, multi-character card, simulation, RPG
+// ---------------------------------------------------------------------------
+
+const BOT_KINDS = {
+    auto: { label: '자동 감지', short: '자동' },
+    single: { label: '1인 캐릭터봇', short: '1인봇' },
+    multi: { label: '다인봇 (한 카드에 여러 캐릭터)', short: '다인봇' },
+    sim: { label: '시뮬레이션봇 (세계·NPC·상황 진행)', short: '시뮬봇' },
+    rpg: { label: 'RPG봇 (스탯·전투·아이템·퀘스트)', short: 'RPG봇' },
+};
+
+/** Guesses the bot type from the card text. Returns { kind, reasons }. */
+function detectBotKind(char) {
+    const text = `${collectCard(char)}\n${char?.first_mes || ''}`;
+    const count = (re) => (text.match(re) || []).length;
+    const rpg = count(/\b(?:HP|MP|SP|EXP|XP|Lv\.?\s?\d|level|stats?|inventory|items?|quests?|dungeon|combat|battle|dice|d20|d6|gold|skill ?tree|equipment|loot)\b|레벨|스탯|능력치|인벤토리|아이템|퀘스트|던전|전투|주사위|골드|장비|경험치|체력\s*[:：]|마나|스킬/gi);
+    const sim = count(/\b(?:simulation|simulator|NPCs?|system|status (?:window|panel)|affection|turn|day \d|calendar|event|random(?:ly)?|generate)\b|시뮬|NPC|시스템|상태창|호감도|날짜|시간대|이벤트|랜덤|무작위|생성해|세계관|턴제|일과/gi);
+    const statusBlock = /```[\s\S]{0,40}(?:status|상태|STAT)|<(?:div|details|status)[^>]*>|\[\s*(?:상태|STATUS|Status)\s*\]/i.test(text);
+    const nameFields = count(/^\s*(?:[-*]\s*)?(?:name|이름|名前)\s*[:：]/gim);
+    const sectionHeads = count(/^\s*(?:#{1,4}\s*|\[|【|<)\s*[^\n\]】>]{1,24}\s*(?:\]|】|>)?\s*$/gm);
+    const multiWords = count(/\bnarrator\b|나레이터|내레이터|multiple characters|characters\s*[:：]|등장인물|캐릭터 목록|인물 소개|NPC 목록/gi);
+    const reasons = [];
+    if (rpg >= 5) reasons.push(`게임 용어 ${rpg}개`);
+    if (sim >= 4) reasons.push(`시뮬레이션 용어 ${sim}개`);
+    if (statusBlock) reasons.push('상태창 형식');
+    if (nameFields >= 2) reasons.push(`이름 칸 ${nameFields}개`);
+    if (multiWords) reasons.push('등장인물·나레이터 표현');
+    let kind = 'single';
+    if (rpg >= 5 && rpg >= sim * 0.8) kind = 'rpg';
+    else if (sim >= 4 || (statusBlock && sim >= 2)) kind = 'sim';
+    else if (nameFields >= 2 || multiWords >= 1 || (sectionHeads >= 8 && nameFields >= 1)) kind = 'multi';
+    return { kind, reasons };
+}
+
+function botKind(cd) {
+    const sel = cd?.botKind || 'auto';
+    return sel !== 'auto' && BOT_KINDS[sel] ? sel : (cd?.botKindDetected || 'single');
+}
+
+/** Roster lines: "이름 | 원어 이름 | 메모" */
+function parseRoster(text) {
+    return String(text || '').split('\n').map(l => l.trim()).filter(Boolean).map(l => {
+        const [name, orig = '', ...rest] = l.split('|').map(x => x.trim());
+        return { name, orig, note: rest.join(' | ') };
+    }).filter(x => x.name);
+}
+
+function rosterOf(cd) {
+    return parseRoster(cd?.rosterText);
+}
+
+function botTypeGuide(cd) {
+    const kind = botKind(cd);
+    if (kind === 'single') return '';
+    const roster = rosterOf(cd);
+    const list = roster.length ? `\nCharacters / key NPCs in this card:\n${roster.slice(0, 20).map(r => `- ${r.name}${r.orig ? ` (${r.orig})` : ''}${r.note ? ` — ${r.note}` : ''}`).join('\n')}` : '';
+    const body = {
+        multi: 'BOT TYPE: multi-character card. One bot plays several characters. Judge and edit EACH character separately: distinct voices (no blending into one tone), consistent who-is-who, fair screen time, each one\'s relationship to {{user}} and to each other, characters reacting to each other, and the bot never merging them or speaking for {{user}}. Every fix must say which character it is for, and must keep per-character sections separate. "Faithful to the original" means each character is faithful to their own canon.',
+        sim: 'BOT TYPE: simulation bot. The bot runs a world or situation as narrator/system: NPCs, time and place, events, often a status window or tracked values (affection, money, days). Judge: world-rule consistency, state tracking (time, place, relationships, values) without silent resets, the status-window format kept identical every reply, NPC variety and memorable NPC voices, meaningful consequences of {{user}}\'s choices, event pacing, and {{user}} agency (never decides for {{user}}). When editing, never break status templates, variable names, tags or formulas.',
+        rpg: 'BOT TYPE: RPG / game-master bot. Judge: rule clarity and adherence, number consistency (HP/MP/gold/EXP/items change only with a cause and the math is right), checks or dice with real failure states (not everything succeeds), fair challenge and difficulty, inventory/quest/level tracking, the status-window format kept identical every reply, combat clarity and pacing, NPC and enemy personality, {{user}} agency, and how fun it is to PLAY (meaningful choices, rewards, tension). When editing, never break status templates, stat names, tags or formulas; keep numbers exact.',
+    }[kind];
+    return body + list;
+}
+
+// --- UI ---
+
+function botKindCardHtml() {
+    return `
+      <section class="bt-card" id="bt_kind_card">
+        ${cardHead('Bot type', '봇 종류', '다인봇·시뮬레이션봇·RPG봇도 검사할 수 있어요. 고르면 테스트 메시지, 평가 기준, 말투 검증, 진단이 그 봇에 맞게 바뀌어요.')}
+        ${field('봇 종류', `<select id="bt_botkind" class="bt-input">${Object.entries(BOT_KINDS).map(([k, v]) => `<option value="${k}">${v.label}</option>`).join('')}</select>`, '<span id="bt_botkind_hint"></span>')}
+        <div id="bt_roster_box">
+          ${field('등장인물 · 주요 NPC', '<textarea id="bt_roster" class="bt-input" rows="4" placeholder="한 줄에 한 명: 이름 | 원어 이름 | 메모&#10;무라사키바라 아츠시 | 紫原敦 | 요센 센터&#10;히무로 타츠야 | 氷室辰也 | 요센 가드"></textarea>', '한 줄에 한 명')}
+          <div class="bt-actions">
+            <button type="button" id="bt_roster_grab" class="bt-btn">${ico('users')}<span>카드에서 등장인물 찾기</span></button>
+          </div>
+          <p class="bt-note">다인봇은 캐릭터마다 따로 평가하고, 말투 탭에서 캐릭터를 골라 한 명씩 검증할 수 있어요.</p>
+        </div>
+      </section>`;
+}
+
+function renderBotKindUI(cd) {
+    const sel = $id('botkind');
+    if (!sel) return;
+    sel.value = BOT_KINDS[cd?.botKind] ? cd.botKind : 'auto';
+    const kind = botKind(cd);
+    const hint = $id('botkind_hint');
+    if (hint) hint.textContent = (cd?.botKind || 'auto') === 'auto' ? `감지: ${BOT_KINDS[kind].short}` : '';
+    sel.title = (cd?.botKindReasons || []).join(', ');
+    const box = $id('roster_box');
+    if (box) box.style.display = kind === 'single' ? 'none' : '';
+    $id('roster').value = cd?.rosterText || '';
+    renderVoiceMemberSelect(cd);
+    const kc = $id('doc_kind_card');
+    if (kc) {
+        kc.style.display = kind === 'single' ? 'none' : '';
+        const t = $id('doc_kind_title');
+        if (t) t.textContent = `${BOT_KINDS[kind].short} 검사`;
+        const st = $id('docbtn_status');
+        if (st) st.style.display = kind === 'sim' || kind === 'rpg' ? '' : 'none';
+    }
+}
+
+/** Runs detection when the card changes; stores the result so prompts can use it without the card. */
+async function refreshBotKind(char, cd) {
+    if (!char) return cd;
+    const { kind, reasons } = detectBotKind(char);
+    if (cd.botKindDetected !== kind || JSON.stringify(cd.botKindReasons || []) !== JSON.stringify(reasons)) {
+        cd.botKindDetected = kind;
+        cd.botKindReasons = reasons;
+        await saveCharData(char, cd);
+    }
+    return cd;
+}
+
+async function grabRoster() {
+    if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
+    const char = getCurrentCharacter();
+    if (!char) { toastr.error('캐릭터 채팅을 먼저 열어주세요'); return; }
+    const s = getSettings();
+    const cd = await loadCharData(char);
+    running = true;
+    updateRunState();
+    try {
+        const system = [
+            'List the characters this roleplay card plays or relies on (main characters and recurring named NPCs). Do not list {{user}}.',
+            'name: the name in Korean (official Korean name if it exists). orig: the original-script name (Japanese for a Japanese work, English for an English-language work), or "". note: 3-8 Korean words about who they are (role, affiliation).',
+            'At most 15 entries, most important first. Output ONE JSON object only: {"characters": [{"name": "", "orig": "", "note": ""}]}',
+        ].join('\n');
+        const prompt = [
+            `[카드]\n${truncate(collectCard(char), 9000)}`,
+            cd.refText ? `[원작 자료 일부]\n${truncate(cd.refText, 2500)}` : '',
+            'Now output the JSON.',
+        ].filter(Boolean).join('\n\n');
+        const r = await requestJson({ system, prompt, profileId: s.evalProfile, maxTokens: 4000, label: '👥 등장인물 찾는 중…' });
+        const list = (r.characters || []).filter(x => x?.name).map(x => [x.name, x.orig || '', x.note || ''].join(' | ').replace(/\s\|\s*\|\s*$|\s\|\s*$/, ''));
+        if (!list.length) throw new Error('등장인물을 찾지 못했어요');
+        $id('roster').value = list.join('\n');
+        await saveSourceFromUI(false);
+        renderBotKindUI(await loadCharData(char));
+        setStatus(`✅ 등장인물 ${list.length}명을 찾았어요 — 맞는지 확인해 주세요`);
+    } catch (e) {
+        setStatus(`❌ 등장인물 찾기 실패: ${e.message}`);
+        toastr.error(`등장인물 찾기 실패: ${e.message}`);
+    } finally {
+        running = false;
+        updateRunState();
+    }
+}
+
+function bindBotKindUI() {
+    $id('botkind').addEventListener('change', async () => {
+        await saveSourceFromUI(false);
+        const ch = getCurrentCharacter();
+        if (ch) renderBotKindUI(await loadCharData(ch));
+    });
+    $id('roster').addEventListener('change', async () => {
+        await saveSourceFromUI(false);
+        const ch = getCurrentCharacter();
+        if (ch) renderVoiceMemberSelect(await loadCharData(ch));
+    });
+    $id('roster_grab').addEventListener('click', grabRoster);
+}
+
+// --- per-character voice slots (multi-character cards) ---
+
+function activeMember(cd) {
+    if (botKind(cd) === 'single') return '';
+    const names = rosterOf(cd).map(r => r.name);
+    return names.includes(cd?.voiceMember) ? cd.voiceMember : '';
+}
+
+async function loadVoiceData(char) {
+    const cd = await loadCharData(char);
+    const who = activeMember(cd);
+    if (!who) return cd;
+    const slot = cd.memberVoice?.[who] || {};
+    const r = rosterOf(cd).find(x => x.name === who);
+    const names = slot.names || Object.assign(emptyNames(), { ko: who, ...(r?.orig ? (/[぀-ヿ一-鿿]/.test(r.orig) ? { ja: r.orig } : { en: r.orig }) : {}) });
+    return { ...cd, names, voiceProfile: slot.voiceProfile || null, voiceResults: slot.voiceResults || {}, __member: who };
+}
+
+async function saveVoiceData(char, vd) {
+    if (!vd.__member) { await saveCharData(char, vd); return; }
+    const cd = await loadCharData(char);
+    cd.memberVoice = cd.memberVoice || {};
+    cd.memberVoice[vd.__member] = { names: vd.names, voiceProfile: vd.voiceProfile, voiceResults: vd.voiceResults };
+    await saveCharData(char, cd);
+}
+
+function voiceName(char, vd) {
+    return vd?.__member || char?.name || '';
+}
+
+function memberFocusLine(vd) {
+    return vd?.__member ? `This card plays several characters. Check ONLY ${vd.__member}'s lines and behaviour (lines spoken by ${vd.__member}); ignore the other characters except where they show how ${vd.__member} treats them.` : '';
+}
+
+function renderVoiceMemberSelect(cd) {
+    const wrap = $id('vmember_wrap');
+    const sel = $id('vmember');
+    if (!wrap || !sel) return;
+    const roster = rosterOf(cd);
+    const show = botKind(cd) !== 'single' && roster.length > 0;
+    wrap.style.display = show ? '' : 'none';
+    if (!show) return;
+    sel.innerHTML = `<option value="">카드 전체 (대표 캐릭터)</option>${roster.map(r => `<option value="${escapeHtml(r.name)}">${escapeHtml(r.name)}${r.orig ? ` · ${escapeHtml(r.orig)}` : ''}</option>`).join('')}`;
+    sel.value = activeMember(cd);
+}
+
+function bindVoiceMember() {
+    $id('vmember').addEventListener('change', async () => {
+        const ch = getCurrentCharacter();
+        if (!ch) return;
+        const cd = await loadCharData(ch);
+        cd.voiceMember = $id('vmember').value;
+        await saveCharData(ch, cd);
+        renderVoiceForChar(await loadVoiceData(ch));
+        setStatus(cd.voiceMember ? `🗣 ${cd.voiceMember}의 말투·성격을 검증해요` : '');
+    });
+}
+
+// --- status-window tracker (sim / RPG), no AI ---
+
+const STAT_RE = /([A-Za-z가-힣ぁ-ヿ一-鿿][A-Za-z가-힣ぁ-ヿ一-鿿 ._]{0,14}?)\s*[:：=]\s*(-?\d[\d,]*(?:\.\d+)?)\s*(?:\/\s*(\d[\d,]*))?/g;
+
+function extractStatus(mes) {
+    const t = String(mes || '');
+    const blocks = [];
+    for (const m of t.matchAll(/```[\s\S]*?```|<(div|details|table|section|status)[\s\S]*?<\/\1>|\[[^\]\n]{0,300}\]|【[^】\n]{0,300}】/gi)) blocks.push(m[0]);
+    // also lines with 3+ "key: number" pairs, e.g. "HP: 80/100 | MP: 20 | Gold: 50"
+    for (const line of t.split('\n')) if ((line.match(/[:：=]\s*-?\d/g) || []).length >= 2) blocks.push(line);
+    const stats = {};
+    for (const b of blocks) {
+        const plain = b.replace(/<[^>]+>/g, ' ');
+        for (const m of plain.matchAll(STAT_RE)) {
+            const key = m[1].trim().replace(/\s+/g, ' ');
+            if (key.length < 1 || /^\d/.test(key)) continue;
+            stats[key] = { v: Number(m[2].replace(/,/g, '')), max: m[3] ? Number(m[3].replace(/,/g, '')) : null };
+        }
+    }
+    return { hasBlock: blocks.length > 0, stats };
+}
+
+function trackStatus(msgs) {
+    const bots = msgs.filter(m => !m.is_user);
+    const rows = bots.map((m, i) => ({ i: i + 1, ...extractStatus(m.mes) }));
+    const withBlock = rows.filter(r => Object.keys(r.stats).length >= 2);
+    const keyCount = {};
+    for (const r of withBlock) for (const k of Object.keys(r.stats)) keyCount[k] = (keyCount[k] || 0) + 1;
+    const keys = Object.entries(keyCount).filter(([, n]) => n >= Math.max(2, withBlock.length * 0.4)).sort((a, b) => b[1] - a[1]).map(([k]) => k).slice(0, 8);
+    const findings = [];
+    const add = (severity, title, detail, examples = []) => findings.push({ severity, category: '상태창', title, detail, examples });
+    if (!withBlock.length) {
+        add('medium', '봇 답장에서 상태창·수치를 찾지 못했어요', '상태창을 매 답장 출력하는 봇이라면 형식이 지켜지지 않고 있어요. 카드에 상태창 템플릿을 한 번만 정확히 두고, 예시 대사에도 같은 형식을 넣으세요.');
+        return { rows, keys, findings, withBlock: 0, total: bots.length };
+    }
+    const missing = rows.filter(r => Object.keys(r.stats).length < 2);
+    if (missing.length && withBlock.length >= bots.length * 0.5) add('high', `상태창이 빠진 답장이 ${missing.length}개 있어요`, '상태창이 있다가 없다가 하면 수치를 추적할 수 없어요. 카드의 상태창 지시를 "every reply ends with" 처럼 분명하게 쓰고, 예시 대사에도 넣으세요.', missing.slice(0, 8).map(r => `${r.i}번째 답장`));
+    const dropped = keys.filter(k => withBlock.some(r => !(k in r.stats)));
+    if (dropped.length) add('medium', `가끔 사라지는 항목이 ${dropped.length}개 있어요`, '상태창 항목이 답장마다 달라지면 모델이 값을 잊어버려요. 항목 이름과 순서를 고정하세요.', dropped.map(k => `${k}: ${withBlock.filter(r => k in r.stats).length}/${withBlock.length}번 나옴`));
+    const over = [];
+    const jumps = [];
+    for (const k of keys) {
+        let prev = null;
+        for (const r of withBlock) {
+            const s = r.stats[k];
+            if (!s) continue;
+            if (s.max !== null && s.v > s.max) over.push(`${r.i}번째 답장 ${k}: ${s.v}/${s.max}`);
+            if (prev && prev.v !== 0) {
+                const base = s.max || Math.max(Math.abs(prev.v), 1);
+                if (Math.abs(s.v - prev.v) / base >= 0.5 && Math.abs(s.v - prev.v) >= 5) jumps.push(`${k}: ${prev.v} → ${s.v} (${r.i}번째 답장)`);
+            }
+            prev = s;
+        }
+    }
+    if (over.length) add('high', `최대치를 넘은 수치가 ${over.length}번 나왔어요`, '현재값이 최대값보다 크면 계산이 틀린 거예요. 카드에 상한(cap) 규칙을 적어두세요.', over.slice(0, 6));
+    if (jumps.length) add('low', `크게 튄 수치가 ${jumps.length}번 있어요`, '전투·보상처럼 이유가 있으면 괜찮아요. 아무 일 없이 바뀌었다면 수치가 리셋되거나 지어낸 거예요.', jumps.slice(0, 6));
+    return { rows, keys, findings, withBlock: withBlock.length, total: bots.length };
+}
+
+function statusTableHtml(tr) {
+    if (!tr.keys.length) return '';
+    const rows = tr.rows.filter(r => Object.keys(r.stats).length >= 2).slice(-12);
+    return `<div class="bt-stat-table-wrap"><table class="bt-stat-table">
+        <thead><tr><th>답장</th>${tr.keys.map(k => `<th>${escapeHtml(k)}</th>`).join('')}</tr></thead>
+        <tbody>${rows.map(r => `<tr><td>${r.i}</td>${tr.keys.map(k => { const s = r.stats[k]; return `<td class="${!s ? 'miss' : s.max !== null && s.v > s.max ? 'bad' : ''}">${s ? `${s.v}${s.max !== null ? `<small>/${s.max}</small>` : ''}` : '—'}</td>`; }).join('')}</tr>`).join('')}</tbody>
+    </table></div>`;
+}
+
+// --- type-specific AI checks ---
+
+const KIND_CHECKS = {
+    multi: ['캐릭터 구분', '말투 차별화', '분량 배분', '관계·상호작용', '유저 대신 행동 안 함'],
+    sim: ['세계 규칙 일관성', '상태 추적', '상태창 형식', 'NPC 다양성', '선택의 결과', '진행 속도', '유저 주도권'],
+    rpg: ['규칙 명확성', '수치 일관성', '판정·실패', '난이도', '인벤토리·퀘스트 추적', '상태창 형식', '전투 재미', '유저 주도권'],
+};
+
+let kindCache = null; // { char, status, card, chat }
+
+function kindDoctorHtml() {
+    return `
+      <section class="bt-card" id="bt_doc_kind_card" style="display:none">
+        ${cardHead('Bot type check', '<span id="bt_doc_kind_title">봇 종류 검사</span>', '봇 종류에 맞는 기준으로 카드와 채팅을 검사해요. 종류는 원작 탭의 봇 종류에서 바꿀 수 있어요.')}
+        <div class="bt-vset-btns">
+          <button type="button" class="bt-vset-btn" id="bt_docbtn_status"><span class="bt-doc-ico">${ico('table-list')}</span><span class="bt-vset-text"><b>상태창·수치 추적</b><small>AI 없이 바로. 봇 답장의 상태창에서 수치를 뽑아 빠진 답장, 사라진 항목, 최대치 초과, 이유 없이 튄 값을 찾아요.</small></span>${ico('chevron-right')}</button>
+          <button type="button" class="bt-vset-btn" id="bt_docbtn_kcard"><span class="bt-doc-ico">${ico('id-card')}</span><span class="bt-vset-text"><b>카드 검사</b><small>캐릭터 구분, 규칙·수치 정의, 상태창 템플릿, 진행 구조를 봐요.</small></span>${ico('chevron-right')}</button>
+          <button type="button" class="bt-vset-btn" id="bt_docbtn_kchat"><span class="bt-doc-ico">${ico('comments')}</span><span class="bt-vset-text"><b>채팅 검사</b><small>지금 채팅에서 캐릭터가 섞이는지, 규칙·수치·상태창을 지키는지, 플레이가 재밌는지 봐요.</small></span>${ico('chevron-right')}</button>
+        </div>
+      </section>
+      <div id="bt_doc_kind" class="bt-result"></div>`;
+}
+
+function runStatusTrack() {
+    const char = getCurrentCharacter();
+    if (!char) { toastr.error('1:1 캐릭터 채팅을 열어주세요'); return; }
+    const msgs = ctx().chat.filter(m => m && !m.is_system && typeof m.mes === 'string');
+    if (msgs.filter(m => !m.is_user).length < 2) { toastr.warning('봇 답장이 있는 채팅을 열어주세요'); return; }
+    if (kindCache?.char !== char.avatar) kindCache = { char: char.avatar };
+    kindCache.status = { time: Date.now(), ...trackStatus(msgs) };
+    renderKindResults();
+    setStatus(`✅ 상태창 추적 완료 — 답장 ${kindCache.status.total}개 중 ${kindCache.status.withBlock}개에서 수치를 찾았어요`);
+    scrollPanelTo($id('doc_kind'));
+}
+
+async function runKindCheck(mode) {
+    if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
+    const char = getCurrentCharacter();
+    if (!char) { toastr.error('1:1 캐릭터 채팅을 열어주세요'); return; }
+    const cd = await loadCharData(char);
+    const kind = botKind(cd);
+    if (kind === 'single') { toastr.info('1인 캐릭터봇은 다른 진단을 쓰면 돼요'); return; }
+    const s = getSettings();
+    const msgs = ctx().chat.filter(m => m && !m.is_system && typeof m.mes === 'string');
+    if (mode === 'chat' && msgs.filter(m => !m.is_user).length < 2) { toastr.warning('봇 답장이 있는 채팅을 열어주세요'); return; }
+    const status = (kind === 'sim' || kind === 'rpg') && mode === 'chat' ? trackStatus(msgs.slice(-40)) : null;
+    const checks = KIND_CHECKS[kind];
+    const roster = rosterOf(cd);
+    running = true;
+    updateRunState();
+    try {
+        const system = [
+            `You are an expert designer and tester of ${{ multi: 'multi-character roleplay bots', sim: 'simulation roleplay bots', rpg: 'RPG / game-master roleplay bots' }[kind]} for SillyTavern.`,
+            mode === 'card'
+                ? 'Review the CARD (and its lorebook summary): is everything the model needs to run this kind of bot well clearly defined and playable?'
+                : 'Review the CHAT: does the bot actually run this kind of bot well? Quote exact bot lines as evidence and trace each problem to the card when possible.',
+            funGuard(cd),
+            pasteLangRule(cd),
+            NO_SHIP_RULE,
+            `Score each of these checks 0-100: ${checks.join(', ')}.`,
+            kind === 'multi' && roster.length ? 'Also give per_character: how well each listed character comes through (distinct voice, presence, faithful to their own canon).' : 'per_character may be an empty list.',
+            'Everything human-readable in natural 한국어. "where" = card field (description|personality|scenario|first_mes|mes_example|system_prompt|post_history|char_note|lorebook). "quote" = exact text from the card (card review) or a bot line (chat review). "paste" = ready-to-paste fix.',
+            'Limits: issues ≤ 8, per_character ≤ 10. JSON rules: straight double quotes, escape " inside strings, no trailing commas. Output ONE JSON object only:',
+            `{"score": <0-100>, "summary": "<2-3문장>", "checks": [{"name": "", "score": 0, "comment": ""}], "per_character": [{"name": "", "score": 0, "comment": ""}],`,
+            ` "issues": [{"severity": "high"|"medium"|"low", "check": "<one of the checks>", "character": "<해당 캐릭터, 없으면 빈 문자열>", "problem": "", "quote": "", "where": "", "fix": "", "paste": "", ${FUN_IMPACT_DOC}}]}`,
+        ].join('\n');
+        const stats = await analyzeTokens(char);
+        const lore = stats.lore.filter(e => e.enabled).slice(0, 30).map(e => `- ${e.constant ? '[상시]' : `[${e.keys.slice(0, 3).join(', ')}]`} ${e.name}: ${truncate(e.content.replace(/\s+/g, ' '), 300)}`).join('\n');
+        const { userName, charName } = testerNames();
+        const prompt = [
+            `[캐릭터 카드]\n${truncate(collectCard(char), 12000)}`,
+            lore ? `[로어북 요약]\n${lore}` : '',
+            mode === 'chat' ? `[채팅 — 최근 ${Math.min(msgs.length, 30)}개]\n${msgs.slice(-30).map(m => `${m.is_user ? userName : charName}: ${truncate(m.mes, 1500)}`).join('\n\n')}` : '',
+            status ? `[상태창 자동 추적 결과]\n${status.findings.map(f => `- ${f.title}${f.examples?.length ? `: ${f.examples.slice(0, 3).join('; ')}` : ''}`).join('\n') || '- 문제 없음'}` : '',
+            'Now output the JSON.',
+        ].filter(Boolean).join('\n\n');
+        const r = await requestJsonComplete({ system, prompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: mode === 'card' ? `🧩 ${BOT_KINDS[kind].short} 카드 검사 중…` : `🧩 ${BOT_KINDS[kind].short} 채팅 검사 중…` });
+        r.issues = (r.issues || []).filter(x => x && !hasShip(`${x.problem} ${x.fix} ${x.paste}`));
+        if (kindCache?.char !== char.avatar) kindCache = { char: char.avatar };
+        kindCache[mode] = { time: Date.now(), kind, result: r };
+        if (status) kindCache.status = { time: Date.now(), ...status };
+        renderKindResults();
+        setStatus(`✅ ${BOT_KINDS[kind].short} ${mode === 'card' ? '카드' : '채팅'} 검사 완료 — ${r.score ?? '?'}점`);
+        setMinimized(false);
+        scrollPanelTo($id(`kind_${mode}_view`));
+    } catch (e) {
+        console.error(LOG, e);
+        if (e.raw) toastr.error('결과 형식이 깨졌어요. 한 번 더 눌러주세요.');
+        setStatus(`❌ 검사 실패: ${e.message}`);
+    } finally {
+        running = false;
+        updateRunState();
+    }
+}
+
+function kindResultHtml(mode, data) {
+    if (!data?.result) return '';
+    const r = data.result;
+    const checks = (r.checks || []).map(c => meterHtml(escapeHtml(c.name || ''), c.score ?? null, { sub: c.comment })).join('');
+    const per = (r.per_character || []).map(c => meterHtml(escapeHtml(c.name || ''), c.score ?? null, { sub: c.comment })).join('');
+    const issues = (r.issues || []).map((x, i) => `
+        <article class="bt-issue bt-sev-line-${SEV_ORDER[x.severity] !== undefined ? x.severity : 'low'}">
+            <div class="bt-issue-head">${sevTag(x.severity)}<span class="bt-issue-cat">${escapeHtml(x.check || '')}</span>${x.character ? `<span class="bt-tag">${escapeHtml(x.character)}</span>` : ''}${x.where ? `<span class="bt-tag bt-tag-ghost">${escapeHtml(FIELD_LABEL[x.where] || x.where)}</span>` : ''}${funBadge(x.fun_impact, x.fun_note)}${contBadge(x.continuity)}</div>
+            <div class="bt-fixwhat">${escapeHtml(x.problem || '')}</div>
+            ${x.quote ? `<blockquote class="bt-quote">${escapeHtml(x.quote)}</blockquote>` : ''}
+            ${x.fix ? `<div class="bt-prose bt-muted">${prose(x.fix)}</div>` : ''}
+            ${x.paste ? `<pre class="bt-paste">${escapeHtml(x.paste)}</pre><div class="bt-actions bt-actions-end"><button type="button" class="bt-btn bt-btn-sm bt-k-copy" data-mode="${mode}" data-i="${i}">${ico('copy')}<span>복사</span></button><button type="button" class="bt-btn bt-btn-sm bt-btn-primary bt-k-apply" data-mode="${mode}" data-i="${i}">${ico('file-import')}<span>${mode === 'card' && x.quote ? '이 부분 바꾸기' : '카드에 넣기'}</span></button></div>` : ''}
+        </article>`).join('');
+    return `
+        <section class="bt-card bt-hero">
+            ${ringHtml(Math.max(0, Math.min(100, Number(r.score) || 0)))}
+            <div class="bt-hero-meta"><span class="bt-eyebrow">${BOT_KINDS[data.kind]?.short || ''} · ${mode === 'card' ? 'Card' : 'Chat'}</span><h3>${mode === 'card' ? '카드 검사' : '채팅 검사'}</h3><div class="bt-hero-sub"><span>${escapeHtml(new Date(data.time).toLocaleString())}</span></div></div>
+        </section>
+        ${r.summary ? `<section class="bt-card bt-summary">${ico('puzzle-piece')}<div class="bt-prose">${prose(r.summary)}</div></section>` : ''}
+        ${checks ? `<section class="bt-card">${cardHead('', '항목별 점수')}<div class="bt-meters">${checks}</div></section>` : ''}
+        ${per ? `<section class="bt-card">${cardHead('', '캐릭터별')}<div class="bt-meters">${per}</div></section>` : ''}
+        ${issues ? `<section class="bt-card">${cardHead('', '고칠 곳')}<div class="bt-stack">${issues}</div></section>` : ''}`;
+}
+
+function renderKindResults() {
+    const el = $id('doc_kind');
+    if (!el) return;
+    const k = kindCache;
+    if (!k || k.char !== getCurrentCharacter()?.avatar) { el.innerHTML = ''; return; }
+    const st = k.status;
+    const stFind = (st?.findings || []).map(f => `
+        <article class="bt-issue bt-sev-line-${f.severity}">
+            <div class="bt-issue-head">${sevTag(f.severity)}<span class="bt-issue-cat">${escapeHtml(f.category)}</span></div>
+            <div class="bt-fixwhat">${escapeHtml(f.title)}</div>
+            <div class="bt-prose bt-muted">${prose(f.detail)}</div>
+            ${f.examples?.length ? `<ul class="bt-list bt-examples">${f.examples.map(x => `<li>${escapeHtml(x)}</li>`).join('')}</ul>` : ''}
+        </article>`).join('');
+    el.innerHTML = `
+        ${st ? `<section class="bt-card">${cardHead('Status', '상태창·수치 추적', `봇 답장 ${st.total}개 중 ${st.withBlock}개에서 수치를 찾았어요.`)}
+            ${statusTableHtml(st)}
+            ${stFind ? `<div class="bt-stack" style="margin-top:12px">${stFind}</div>` : `<div class="bt-callout">${ico('circle-check')}<div class="bt-prose"><p>상태창 형식과 수치가 잘 이어지고 있어요.</p></div></div>`}
+        </section>` : ''}
+        <div id="bt_kind_card_view" class="bt-result">${kindResultHtml('card', k.card)}</div>
+        <div id="bt_kind_chat_view" class="bt-result">${kindResultHtml('chat', k.chat)}</div>`;
+    el.querySelectorAll('.bt-k-copy').forEach(b => b.addEventListener('click', () => copyText(k[b.dataset.mode]?.result?.issues?.[Number(b.dataset.i)]?.paste || '')));
+    el.querySelectorAll('.bt-k-apply').forEach(b => b.addEventListener('click', async () => {
+        const x = k[b.dataset.mode]?.result?.issues?.[Number(b.dataset.i)];
+        if (!x) return;
+        const ok = b.dataset.mode === 'card' && x.quote
+            ? await applyQuoteReplace(x.where || 'description', x.quote, x.paste, x.problem)
+            : await openApplyDialog({ field: x.where || 'description', text: x.paste, reason: x.problem });
+        if (ok) { b.classList.add('disabled'); b.querySelector('span').textContent = '적용됨'; }
+    }));
+}
+
+function bindKindDoctor() {
+    $id('docbtn_status').addEventListener('click', () => { if (!running) runStatusTrack(); });
+    $id('docbtn_kcard').addEventListener('click', () => runKindCheck('card'));
+    $id('docbtn_kchat').addEventListener('click', () => runKindCheck('chat'));
 }
 
 

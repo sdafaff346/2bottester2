@@ -1325,3 +1325,18 @@
 }
 #bt_panel .bt-card > .bt-disclosure:first-child { border-top: 0; margin-top: 0; padding-top: 0; }
 #bt_panel .bt-card > .bt-disclosure:first-child > summary { padding-top: 0; }
+
+/* ---------- v2.7: bot types ---------- */
+#bt_panel #bt_vmember_wrap { margin-bottom: 12px; }
+#bt_panel #bt_vmember_wrap .bt-field { margin-top: 0; }
+#bt_panel #bt_roster_box .bt-field { margin-top: 14px; }
+#bt_panel #bt_botkind_hint { color: var(--bt-accent-ink); font-weight: 650; }
+#bt_panel .bt-stat-table-wrap { overflow-x: auto; margin: 4px 0 0; border-radius: 11px; border: 1px solid var(--bt-line); background: var(--bt-well, var(--bt-surface)); }
+#bt_panel .bt-stat-table { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+#bt_panel .bt-stat-table th, #bt_panel .bt-stat-table td { padding: 6px 9px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--bt-line); }
+#bt_panel .bt-stat-table th { font-size: 11px; font-weight: 700; color: var(--bt-muted); background: var(--bt-surface-2); position: sticky; top: 0; }
+#bt_panel .bt-stat-table th:first-child, #bt_panel .bt-stat-table td:first-child { text-align: left; color: var(--bt-faint); }
+#bt_panel .bt-stat-table tr:last-child td { border-bottom: 0; }
+#bt_panel .bt-stat-table td small { color: var(--bt-faint); font-size: 10.5px; }
+#bt_panel .bt-stat-table td.miss { color: var(--bt-warn); }
+#bt_panel .bt-stat-table td.bad { color: var(--bt-bad); font-weight: 700; }
