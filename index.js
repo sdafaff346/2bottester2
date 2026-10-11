@@ -36,6 +36,11 @@ const defaultSettings = Object.freeze({
     funReference: '',       // creator's proven fun style (from 재미 분석)
     loreAsReference: true,  // use linked lorebooks as reference material in evaluation
     pasteLang: 'en',        // language of ready-to-paste fixes: en | card | ko
+    testPreset: '',         // preset (프롬) used for bot replies during tests ('' = keep current)
+    testProfile: '',        // connection profile used for bot replies during tests ('' = keep current)
+    testPromptVoice: true,  // also use the test preset/profile for voice sample lines
+    autoRerollSec: 180,     // re-send a request automatically when it takes longer than this (0 = off)
+    autoRerollMax: 1,       // how many automatic re-sends per request
     pasteKeepLines: true,   // spoken lines inside quotes keep the character's chat language
     funReferenceSamples: '', // short quotes from the reference bot (format examples for restyle)
     accent: 'champagne',
@@ -131,7 +136,7 @@ function escapeHtml(s) {
 
 function truncate(s, n) {
     s = String(s ?? '');
-    return s.length > n ? s.slice(0, n) + '\n…(생략)…' : s;
+    return s.length > n ? s.slice(0, n) + '\n…(truncated)…' : s;
 }
 
 function isGenerating() {
@@ -339,19 +344,172 @@ function evalTokens() {
 let tokenCeiling = Infinity;
 const TOKEN_STEPS = [64000, 32000, 16000, 8192, 4096];
 
-async function callLLMOnce({ system, prompt, profileId = '', maxTokens = 600 }) {
+async function callLLMRaw({ system, prompt, profileId = '', maxTokens = 600 }, signal) {
     const c = ctx();
     if (profileId) {
         const res = await c.ConnectionManagerRequestService.sendRequest(
             profileId,
             [{ role: 'system', content: system }, { role: 'user', content: prompt }],
             maxTokens,
-            { stream: false, extractData: true, includePreset: true, includeInstruct: true },
+            { stream: false, extractData: true, includePreset: true, includeInstruct: true, signal },
         );
         return String(res?.content ?? '').trim();
     }
-    const out = await c.generateRaw({ systemPrompt: system, prompt, responseLength: maxTokens });
+    const out = await c.generateRaw({ systemPrompt: system, prompt, responseLength: maxTokens, signal });
     return String(out ?? '').trim();
+}
+
+async function callLLMOnce(opts) {
+    return rerollable((signal) => callLLMRaw(opts, signal));
+}
+
+// ---------------------------------------------------------------------------
+// Reroll (리롤): re-send a request that takes too long — automatically or with a button
+// ---------------------------------------------------------------------------
+
+let currentReroll = null;
+
+function showRerollUI(on) {
+    for (const id of ['reroll', 'reroll_h']) {
+        const el = $id(id);
+        if (el) el.style.display = on ? '' : 'none';
+    }
+}
+
+function requestReroll() {
+    if (currentReroll) currentReroll.trigger('manual');
+}
+
+/**
+ * Runs make(signal) and lets it be abandoned and re-sent: by the 다시 요청 button (any time)
+ * or automatically after settings.autoRerollSec. onAbandon cleans up the abandoned attempt.
+ */
+async function rerollable(make, { onAbandon = null } = {}) {
+    const s = getSettings();
+    const limit = Math.max(0, Number(s.autoRerollSec) || 0);
+    const maxAuto = Math.max(0, Number(s.autoRerollMax ?? 1));
+    let autoUsed = 0;
+    for (let attempt = 0; ; attempt++) {
+        const ac = new AbortController();
+        let fire;
+        const rerollP = new Promise(r => { fire = r; });
+        const me = { trigger: (why) => fire(why) };
+        currentReroll = me;
+        showRerollUI(true);
+        const timer = limit > 0 && autoUsed < maxAuto ? setTimeout(() => fire('auto'), limit * 1000) : null;
+        try {
+            const work = Promise.resolve().then(() => make(ac.signal)).then(v => ({ v }), e => ({ e }));
+            const res = await Promise.race([work, rerollP.then(why => ({ reroll: why }))]);
+            if (res.reroll) {
+                if (res.reroll === 'auto') autoUsed++;
+                try { ac.abort(); } catch { /* ignore */ }
+                if (onAbandon) { try { await onAbandon(); } catch { /* ignore */ } }
+                if (stopRequested) throw new Error('중단됨');
+                toastr.info(res.reroll === 'auto' ? `${limit}초가 넘어서 다시 요청했어요` : '다시 요청했어요', '', { timeOut: 2500 });
+                continue;
+            }
+            if (res.e) throw res.e;
+            return res.v;
+        } finally {
+            if (timer) clearTimeout(timer);
+            if (currentReroll === me) { currentReroll = null; showRerollUI(false); }
+        }
+    }
+}
+
+function clickStop() {
+    try { ctx().stopGeneration?.(); } catch { /* ignore */ }
+    document.getElementById('mes_stop')?.click();
+}
+
+// ---------------------------------------------------------------------------
+// Test prompt (테스트 전용 프롬): switch preset / connection profile while the bot answers tests
+// ---------------------------------------------------------------------------
+
+async function presetManager() {
+    try { const pm = ctx().getPresetManager?.(); if (pm) return pm; } catch { /* fall through */ }
+    try { const m = await import('../../../preset-manager.js'); return m.getPresetManager?.() || null; } catch { return null; }
+}
+
+async function listPresets() {
+    const pm = await presetManager();
+    try { return (pm?.getAllPresets?.() || []).map(String).filter(Boolean); } catch { return []; }
+}
+
+async function selectPresetByName(name) {
+    // /preset is the documented way to switch the current API's preset
+    try {
+        await ctx().executeSlashCommandsWithOptions(`/preset ${name}`);
+        return;
+    } catch (e) { console.warn(LOG, '/preset failed, trying the preset manager', e); }
+    const pm = await presetManager();
+    const v = pm?.findPreset?.(name);
+    if (v === undefined || v === null || v === -1) throw new Error(`프리셋 “${name}”을 찾지 못했어요`);
+    pm.selectPreset(v);
+}
+
+function currentProfile() {
+    const cm = ctx().extensionSettings?.connectionManager;
+    return (cm?.profiles || []).find(p => p.id === cm?.selectedProfile) || null;
+}
+
+/** Switches to the test preset/profile and returns a function that switches back (safe to call twice). */
+async function applyTestPrompt() {
+    const s = getSettings();
+    const undo = [];
+    if (s.testProfile) {
+        const target = getProfiles().find(p => p.id === s.testProfile);
+        const cur = currentProfile();
+        if (!target) toastr.warning('테스트용 연결 프로필을 찾지 못해서 지금 연결로 테스트해요');
+        else if (!cur) toastr.warning('지금 선택된 연결 프로필이 없어서, 끝나고 원래대로 되돌릴 수 없어요. 테스트용 연결 프로필 전환은 건너뛸게요.');
+        else if (cur.id !== target.id) {
+            await ctx().executeSlashCommandsWithOptions(`/profile ${target.name}`);
+            await sleep(600);
+            undo.push(async () => { await ctx().executeSlashCommandsWithOptions(`/profile ${cur.name}`); await sleep(400); });
+        }
+    }
+    if (s.testPreset) {
+        try {
+            const pm = await presetManager();
+            const cur = pm?.getSelectedPresetName?.();
+            if (cur !== s.testPreset) {
+                await selectPresetByName(s.testPreset);
+                await sleep(300);
+                if (cur) undo.push(async () => { await selectPresetByName(cur); await sleep(200); });
+            }
+        } catch (e) { toastr.warning(`테스트용 프리셋으로 바꾸지 못했어요: ${e.message}`); }
+    }
+    let done = false;
+    return async () => {
+        if (done) return;
+        done = true;
+        for (const f of undo.reverse()) { try { await f(); } catch (e) { console.warn(LOG, 'restore failed', e); } }
+    };
+}
+
+function testPromptLabel() {
+    const s = getSettings();
+    const parts = [];
+    if (s.testPreset) parts.push(`프리셋 “${s.testPreset}”`);
+    const prof = s.testProfile ? getProfiles().find(p => p.id === s.testProfile) : null;
+    if (prof) parts.push(`연결 “${prof.name}”`);
+    return parts.join(' · ');
+}
+
+function renderTestPromptNote() {
+    const el = $id('testprompt_note');
+    if (!el) return;
+    const label = testPromptLabel();
+    el.innerHTML = label ? `${ico('wand-magic-sparkles')} 테스트 전용 프롬: <b>${escapeHtml(label)}</b> — 테스트하는 동안만 바꾸고 끝나면 원래대로 돌려놔요.` : '';
+}
+
+async function fillPresetSelect(sel, value) {
+    if (!sel) return;
+    const names = await listPresets();
+    const opts = ['<option value="">바꾸지 않음 (지금 프리셋)</option>', ...names.map(n => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`)];
+    if (value && !names.includes(value)) opts.push(`<option value="${escapeHtml(value)}">${escapeHtml(value)} (지금 API에 없음)</option>`);
+    sel.innerHTML = opts.join('');
+    sel.value = value || '';
 }
 
 /**
@@ -531,7 +689,7 @@ function funGuard(charData) {
     return parts.join('\n\n');
 }
 
-const FUN_IMPACT_DOC = '"fun_impact": "+"|"0"|"-" (does this change make the roleplay MORE fun, neutral, or LESS fun?), "fun_note": "<한 줄: 재미에 어떤 영향인지>", "continuity": "safe"|"risk" (risk = the character would feel noticeably different in an ongoing chat: voice, attitude or distance toward {{user}} changes)';
+const FUN_IMPACT_DOC = '"fun_impact": "+"|"0"|"-" (does this change make the roleplay MORE fun, neutral, or LESS fun?), "fun_note": "<one line: how it affects fun>", "continuity": "safe"|"risk" (risk = the character would feel noticeably different in an ongoing chat: voice, attitude or distance toward {{user}} changes)';
 
 function contBadge(c) {
     return String(c ?? '').trim() === 'risk' ? `<span class="bt-tag bt-cont-risk" title="적용하면 하던 채팅에서 성격·말투가 달라진 게 티 날 수 있어요">${ico('link-slash')}이어하기 주의</span>` : '';
@@ -554,7 +712,7 @@ function collectCard(char) {
     }
     const parts = [];
     const add = (label, v) => { if (v && String(v).trim()) parts.push(`### ${label}\n${String(v).trim()}`); };
-    add('이름', char?.name);
+    add('Name', char?.name);
     add('Description', fields.description ?? char?.description);
     add('Personality', fields.personality ?? char?.personality);
     add('Scenario', fields.scenario ?? char?.scenario);
@@ -568,9 +726,9 @@ function collectCard(char) {
         const entries = char?.data?.character_book?.entries ?? [];
         const lore = entries
             .filter(e => e && e.enabled !== false && e.content)
-            .map(e => `- [${(e.keys || []).slice(0, 4).join(', ') || e.comment || '항목'}] ${String(e.content).trim()}`)
+            .map(e => `- [${(e.keys || []).slice(0, 4).join(', ') || e.comment || 'entry'}] ${String(e.content).trim()}`)
             .join('\n');
-        add('내장 로어북', truncate(lore, 8000));
+        add('Embedded lorebook', truncate(lore, 8000));
     }
     return parts.join('\n\n');
 }
@@ -589,16 +747,16 @@ function collectChatLog(limit) {
 // ---------------------------------------------------------------------------
 
 const FOCUS = {
-    daily: ['평범한 일상 대화로 기본 말투·호칭·어휘를 확인', '가벼운 잡담이나 취미 이야기', '밥/날씨/하루 일과 같은 사소한 화제'],
-    lore: ['원작의 과거사·출신·소속에 대해 질문', '원작 속 사건이나 명장면을 언급하며 반응을 봄', '캐릭터의 능력·직업·특기에 관해 물어봄'],
-    relationship: ['원작의 다른 등장인물 이름을 꺼내 관계성을 확인', '가족·동료·라이벌에 대한 생각을 물어봄', '{{user}}와의 거리감/호칭이 원작 성격에 맞는지 떠봄'],
-    emotion: ['캐릭터를 화나게 하거나 당황하게 만드는 말', '슬프거나 약한 모습을 이끌어내는 상황', '칭찬하거나 고백하는 등 감정을 흔드는 상황'],
-    values: ['캐릭터의 가치관을 시험하는 딜레마 제시', '캐릭터가 싫어하는 것/좋아하는 것을 들이밀기', '원작 성격이라면 거절할 법한 부탁을 하기'],
-    chaos: ['갑작스러운 돌발 상황(사고, 위험, 낯선 사람 등장)', '분위기를 확 바꾸는 엉뚱한 행동', '캐릭터의 설정 밖의 질문(현대 문물 등)으로 일관성 확인'],
-    fun: ['카드에 적힌 트리거(화나게 하는 것·모드가 바뀌는 조건)를 건드려 봄', '별명·호칭 규칙이나 반복 개그가 나올 상황을 만듦', '캐릭터가 숨기는 속마음을 슬쩍 찔러 봄', '작은 갈등이나 부탁을 던져서 장면을 굴려 봄'],
-    multi: ['두 캐릭터 이상에게 한꺼번에 말을 걸어 누가 어떻게 답하는지 봄', '특정 캐릭터 이름을 불러 그 캐릭터만 반응하는지 확인', '캐릭터들끼리 의견이 갈릴 만한 질문을 던짐', '한 캐릭터만 편들어서 다른 캐릭터들 반응을 봄', '평소 말이 적은 캐릭터에게 직접 말을 걺'],
-    sim: ['시간을 건너뛰거나 장소를 옮겨서 세계와 상태가 이어지는지 봄', '처음 보는 NPC에게 말을 걸거나 소문을 물어봄', '무리하거나 엉뚱한 선택을 해서 결과·대가가 따라오는지 봄', '상태창·호감도·돈 같은 수치를 확인하거나 바꾸는 행동', '이전에 있었던 사건을 다시 언급해 기억하는지 봄'],
-    rpg: ['전투를 걸어서 판정과 피해 계산이 맞는지 봄', '아이템을 쓰거나 사고팔아서 인벤토리·골드가 맞게 바뀌는지 봄', '불가능하거나 아주 위험한 행동을 시도해 실패 판정이 나오는지 봄', '스탯·상태창을 보여달라고 하거나 레벨업 조건을 물어봄', '규칙을 어기려는 행동(갑자기 돈이 생겼다고 주장하는 등)을 해 봄', '퀘스트를 받거나 진행 상황을 물어봄'],
+    daily: ['Ordinary small talk to check basic speech style, forms of address and vocabulary', 'Light chat about hobbies or the day', 'A trivial topic such as food, weather or daily routine'],
+    lore: ['Ask about canon backstory, origin or affiliation', 'Mention a canon event or famous scene and watch the reaction', 'Ask about their abilities, job or special skills'],
+    relationship: ['Bring up another canon character by name to check the relationship', 'Ask what they think of family, teammates or rivals', 'Probe whether the distance and form of address toward {{user}} fit the canon personality'],
+    emotion: ['Say something that angers or flusters the character', 'Create a situation that draws out sadness or vulnerability', 'Praise or confess something that shakes their feelings'],
+    values: ['Present a dilemma that tests their values', 'Push something they dislike or like at them', 'Make a request the canon character would refuse'],
+    chaos: ['A sudden incident (accident, danger, a stranger appears)', 'An odd action that abruptly changes the mood', 'A question outside their setting (modern tech, etc.) to check consistency'],
+    fun: ['Poke a trigger written in the card (what angers them, what flips their mode)', 'Set up a situation where a nickname rule or running gag should appear', 'Gently poke at the feelings they hide', 'Throw a small conflict or request to get the scene moving'],
+    multi: ['Talk to two or more characters at once and see who answers how', 'Call one character by name and check that only they react', 'Ask something the characters would disagree about', 'Side with one character and watch the others react', 'Speak directly to a character who usually talks little'],
+    sim: ['Skip time or change location and check that the world and state carry over', 'Talk to a new NPC or ask about rumors', 'Make a reckless or odd choice and see whether consequences follow', 'Check or change tracked values (status window, affection, money)', 'Bring up an earlier event to see whether it is remembered'],
+    rpg: ['Start a fight and check that rolls and damage math are right', 'Use, buy or sell items and check that inventory and gold change correctly', 'Attempt something impossible or very risky and see whether it can fail', 'Ask to see stats / the status window or ask about level-up conditions', 'Try to break the rules (e.g. claim you suddenly have money)', 'Take a quest or ask about quest progress'],
 };
 
 const SCENARIO_LABELS = {
@@ -617,7 +775,7 @@ const SCENARIO_LABELS = {
 };
 
 function pickFocus(scenario, turn, kind = 'single') {
-    if (scenario === 'custom') return '제작자 지시사항을 따름';
+    if (scenario === 'custom') return "Follow the creator's instructions";
     const mixKeys = kind === 'single'
         ? ['daily', 'fun', 'lore', 'relationship', 'emotion', 'values', 'chaos', 'fun']
         : [kind, 'daily', kind, 'fun', kind, 'lore', kind, 'emotion', kind, 'chaos'];
@@ -671,12 +829,12 @@ function testerContextBlocks(charData, s) {
     const kind = botKind(charData);
     const roster = rosterOf(charData);
     return [
-        kind !== 'single' ? `[봇 종류: ${BOT_KINDS[kind].label}] ${{ multi: '여러 캐릭터가 함께 나오는 봇이에요. 캐릭터 이름을 불러 말을 걸고, 캐릭터끼리 반응하게 만들어 보세요.', sim: '세계·상황을 진행하는 시뮬레이션 봇이에요. 장소·시간을 바꾸고, NPC를 만나고, 선택의 결과를 확인해 보세요.', rpg: '게임 마스터 역할의 RPG 봇이에요. 플레이어로서 행동을 선언하고, 전투·아이템·판정·상태창을 시험해 보세요.' }[kind]}${roster.length ? `\n등장인물: ${roster.map(r => r.name).join(', ')}` : ''}` : '',
-        charData.refText ? `[원작 참고 자료 (발췌)]\n${truncate(charData.refText, 3000)}` : '[원작 참고 자료 없음 — 일반적인 캐릭터 일관성 위주로 테스트]',
-        charData.authorNote ? `[제작자 메모 — 의도한 AU/설정 변경]\n${charData.authorNote}` : '',
-        String(charData.caehBase || '').trim() ? `[제작자가 원하는 캐해 — 이 방향이 잘 드러나는지도 떠볼 것]\n${truncate(charData.caehBase, 1200)}` : '',
-        String(charData.caehCaution || '').trim() ? `[제작자 주의사항 — 테스트 메시지도 이걸 어기게 유도하지 말 것]\n${truncate(charData.caehCaution, 800)}` : '',
-        s.customInstruction ? `[제작자 지시사항]\n${s.customInstruction}` : '',
+        kind !== 'single' ? `[Bot type: ${kind}] ${{ multi: 'Several characters appear in this bot. Address characters by name and get them to react to each other.', sim: 'A simulation bot that runs a world or situation. Change place and time, meet NPCs, and check the consequences of choices.', rpg: 'An RPG bot acting as game master. Declare actions as the player and test combat, items, checks and the status window.' }[kind]}${roster.length ? `\nCharacters: ${roster.map(r => r.name).join(', ')}` : ''}` : '',
+        charData.refText ? `[Reference material (excerpt)]\n${truncate(charData.refText, 3000)}` : '[No reference material — test general character consistency]',
+        charData.authorNote ? `[Creator's note — intentional AU / setting changes]\n${charData.authorNote}` : '',
+        String(charData.caehBase || '').trim() ? `[Creator's intended characterization — also probe whether it comes through]\n${truncate(charData.caehBase, 1200)}` : '',
+        String(charData.caehCaution || '').trim() ? `[Creator's cautions — test messages must not push the bot to break these]\n${truncate(charData.caehCaution, 800)}` : '',
+        s.customInstruction ? `[Creator's instructions]\n${s.customInstruction}` : '',
     ].filter(Boolean);
 }
 
@@ -690,8 +848,8 @@ async function generateTestMessage(turn, total, charData) {
         + `\n- Output ONLY ${userName}'s next chat message. Continue naturally from the conversation; do not repeat earlier questions.`;
     const prompt = [
         ...testerContextBlocks(charData, s),
-        `[지금까지의 대화]\n${collectChatLog(8) || '(아직 대화 없음)'}`,
-        `[이번 턴 테스트 포인트] ${focus}`,
+        `[Conversation so far]\n${collectChatLog(8) || '(no conversation yet)'}`,
+        `[Test focus for this turn] ${focus}`,
         `Turn ${turn + 1}/${total}. Write ${userName}'s next message now.`,
     ].join('\n\n');
 
@@ -719,8 +877,8 @@ async function generateTestBatch(total, charData) {
     ].join('\n');
     const prompt = [
         ...testerContextBlocks(charData, s),
-        `[현재 채팅의 마지막 부분]\n${collectChatLog(4) || '(아직 대화 없음 — 첫 메시지는 자연스러운 상황 도입으로)'}`,
-        `[각 메시지의 테스트 포인트]\n${focuses.join('\n')}`,
+        `[End of the current chat]\n${collectChatLog(4) || '(no conversation yet — open the first message with a natural scene setup)'}`,
+        `[Test focus for each message]\n${focuses.join('\n')}`,
         `Write the JSON array of ${total} messages now.`,
     ].join('\n\n');
 
@@ -753,9 +911,14 @@ async function sendAsUserAndWait(text) {
     if (!ta) throw new Error('입력창을 찾을 수 없어요');
     ta.value = text;
     ta.dispatchEvent(new Event('input', { bubbles: true }));
-    await ctx().generate('normal');
-    await sleep(150);
-    await waitIdle();
+    let first = true;
+    await rerollable(async () => {
+        const type = first ? 'normal' : 'regenerate';
+        first = false;
+        await ctx().generate(type);
+        await sleep(150);
+        await waitIdle();
+    }, { onAbandon: async () => { clickStop(); await sleep(400); await waitIdle(30000).catch(() => {}); } });
 }
 
 function lastBotReply() {
@@ -790,7 +953,9 @@ async function runTest(turnsOverride, opts = {}) {
 
     const run = { id: Date.now(), time: Date.now(), role: opts.role || '', script: [], replies: [], chatId: '', eval: null };
     let handedOff = false;
+    let restorePrompt = async () => {};
     try {
+        restorePrompt = await applyTestPrompt();
         if (s.newChat || fixedScript) {
             await ctx().executeSlashCommandsWithOptions('/newchat');
             await sleep(500);
@@ -816,6 +981,7 @@ async function runTest(turnsOverride, opts = {}) {
             if (Number(s.delayMs) > 0) await sleep(Number(s.delayMs));
         }
         run.chatId = ctx().getCurrentChatId?.() ?? '';
+        await restorePrompt(); // evaluation runs on the normal connection
 
         if (stopRequested) {
             setStatus('⏹ 테스트를 중단했어요');
@@ -862,6 +1028,7 @@ async function runTest(turnsOverride, opts = {}) {
         setStatus(`❌ 오류: ${e.message}`);
         toastr.error(`테스트 실패: ${e.message}`);
     } finally {
+        await restorePrompt();
         if (!handedOff) {
             setMinimized(false);
             running = false;
@@ -1076,11 +1243,11 @@ async function runEvaluation({ useChat = true, messages = 0 } = {}) {
     ].join('\n');
 
     const prompt = [
-        charData.refText?.trim() ? `[원작 자료: ${char.name}]\n${truncate(charData.refText, Number(s.refMaxChars) || 15000)}` : '[원작 자료 없음 — 아래 로어북을 기준 자료로 사용]',
-        loreRef ? `[연결된 로어북 — 이 봇 세계관의 기준 설정]\n${loreRef}` : '',
-        charData.authorNote ? `[제작자 메모 — 의도한 AU/설정 변경 (감점 금지)]\n${charData.authorNote}` : '',
-        `[캐릭터 카드]\n${collectCard(char)}`,
-        useChat ? `[테스트 대화 로그 (최근 ${s.evalMessages}개)]\n${chatLog}` : '',
+        charData.refText?.trim() ? `[Reference material: ${char.name}]\n${truncate(charData.refText, Number(s.refMaxChars) || 15000)}` : '[No reference material — use the lorebook below as the reference]',
+        loreRef ? `[Linked lorebooks — this bot\'s world settings]\n${loreRef}` : '',
+        charData.authorNote ? `[Creator's note — intentional AU / setting changes (do not deduct)]\n${charData.authorNote}` : '',
+        `[Character card]\n${collectCard(char)}`,
+        useChat ? `[Test chat log (last ${s.evalMessages} messages)]\n${chatLog}` : '',
         'Now output the JSON evaluation.',
     ].filter(Boolean).join('\n\n');
 
@@ -1232,6 +1399,7 @@ function buildPanel() {
     </div>
     <span id="bt_hstatus" class="bt-hstatus"></span>
     <div class="bt-header-btns">
+      <button type="button" id="bt_reroll_h" class="bt-iconbtn bt-icon bt-reroll-h" style="display:none" title="다시 요청 (리롤)">${ico('rotate-right')}</button>
       <button type="button" id="bt_resetpos" class="bt-iconbtn bt-icon" title="위치 초기화">${ico('arrows-to-dot')}</button>
       <button type="button" id="bt_minimize" class="bt-iconbtn bt-icon" title="접기 / 펴기">${ico('minus')}</button>
       <button type="button" id="bt_close" class="bt-iconbtn bt-icon" title="닫기">${ico('xmark')}</button>
@@ -1314,6 +1482,7 @@ ${botKindCardHtml()}
           <button type="button" id="bt_run" class="bt-btn bt-btn-primary bt-btn-wide">${ico('play')}<span>테스트 시작</span></button>
           <button type="button" id="bt_stop" class="bt-btn bt-btn-danger" style="display:none">${ico('stop')}<span>중단</span></button>
         </div>
+        <p class="bt-note bt-testprompt-note" id="bt_testprompt_note"></p>
       </section>
 
       <section class="bt-card">
@@ -1346,6 +1515,25 @@ ${doctorPageHtml()}
         ${field('테스터용 연결', '<select id="bt_testerprofile" class="bt-input"></select>', '생각(Reasoning)을 끈 빠른 모델 추천')}
         ${field('평가용 연결', '<select id="bt_evalprofile" class="bt-input"></select>', '똑똑한 모델 추천')}
         <p class="bt-note">Connection Profiles(연결 프로필) 중에서 골라요. 비워두면 지금 연결된 API를 써요.</p>
+      </section>
+
+      <section class="bt-card">
+        ${cardHead('Test prompt', '테스트 전용 프롬', '자동 테스트에서 봇이 답장하는 동안만 프리셋·연결 프로필을 바꾸고, 끝나면 원래대로 돌려놔요. 평가는 원래 연결로 해요.')}
+        ${field('프리셋', '<select id="bt_testpreset" class="bt-input"></select>', '지금 API의 프리셋 목록')}
+        ${field('연결 프로필', '<select id="bt_testprofile" class="bt-input"></select>', '선택')}
+        <div class="bt-switches">
+          ${toggle('testpromptvoice', '말투 검증 샘플 대사에도 적용')}
+        </div>
+        <p class="bt-note">연결 프로필은 지금 연결 프로필이 선택돼 있을 때만 바꿔요(그래야 끝나고 정확히 되돌릴 수 있어요). 이어하기 비교의 답장도 이 연결 프로필로 만들어요.</p>
+      </section>
+
+      <section class="bt-card">
+        ${cardHead('Reroll', '오래 걸리면 다시 요청', '응답을 기다리는 동안 패널 아래쪽(접으면 위쪽)에 다시 요청 버튼이 생겨요. 시간을 정해두면 자동으로도 다시 보내요.')}
+        <div class="bt-grid2">
+          ${field('자동 리롤 (초)', '<input id="bt_rerollsec" class="bt-input bt-num" type="number" min="0" max="1800" step="10">', '0이면 끔')}
+          ${field('자동 리롤 횟수', '<input id="bt_rerollmax" class="bt-input bt-num" type="number" min="0" max="5" step="1">', '요청 하나당')}
+        </div>
+        <p class="bt-note">생각(Reasoning)하는 모델은 긴 평가에 몇 분씩 걸리기도 해요. 너무 짧게 잡으면 멀쩡한 요청도 다시 보내니 2~3분 이상을 추천해요.</p>
       </section>
 
       <section class="bt-card">
@@ -1421,6 +1609,7 @@ ${doctorPageHtml()}
   <footer class="bt-footer" data-state="idle">
     <span class="bt-status-dot" aria-hidden="true"></span>
     <span id="bt_status" class="bt-status">대기 중</span>
+    <button type="button" id="bt_reroll" class="bt-btn bt-btn-sm bt-reroll" style="display:none" title="응답이 너무 오래 걸리면 눌러서 같은 요청을 다시 보내요">${ico('rotate-right')}<span>다시 요청</span></button>
   </footer>
 </div>`;
     document.body.insertAdjacentHTML('beforeend', html);
@@ -1525,11 +1714,21 @@ function bindPanel() {
     scen.value = s.scenario;
     scen.addEventListener('change', () => { s.scenario = scen.value; saveSettings(); });
 
-    for (const [id, key] of [['testerprofile', 'testerProfile'], ['evalprofile', 'evalProfile']]) {
+    bindNum('rerollsec', 'autoRerollSec');
+    bindNum('rerollmax', 'autoRerollMax');
+    bindCheck('testpromptvoice', 'testPromptVoice');
+    const tp = $id('testpreset');
+    fillPresetSelect(tp, s.testPreset);
+    tp.addEventListener('focus', () => fillPresetSelect(tp, s.testPreset));
+    tp.addEventListener('change', () => { s.testPreset = tp.value; saveSettings(); renderTestPromptNote(); });
+    $id('reroll').addEventListener('click', requestReroll);
+    $id('reroll_h').addEventListener('click', (e) => { e.stopPropagation(); requestReroll(); });
+    renderTestPromptNote();
+    for (const [id, key] of [['testerprofile', 'testerProfile'], ['evalprofile', 'evalProfile'], ['testprofile', 'testProfile']]) {
         const el = $id(id);
         fillProfileSelect(el, s[key]);
         el.addEventListener('focus', () => fillProfileSelect(el, s[key]));
-        el.addEventListener('change', () => { s[key] = el.value; saveSettings(); });
+        el.addEventListener('change', () => { s[key] = el.value; saveSettings(); renderTestPromptNote(); });
     }
 
     // Source page
@@ -1561,7 +1760,10 @@ function switchTab(name) {
         const s = getSettings();
         fillProfileSelect($id('testerprofile'), s.testerProfile);
         fillProfileSelect($id('evalprofile'), s.evalProfile);
+        fillProfileSelect($id('testprofile'), s.testProfile);
+        fillPresetSelect($id('testpreset'), s.testPreset);
     }
+    if (name === 'test') renderTestPromptNote();
 }
 
 // ---------------------------------------------------------------------------
@@ -1643,7 +1845,7 @@ let lastStatus = { kind: '', text: '' };
 
 /** Called from updateRunState: plays the sound when a long task finishes. */
 function trackRunForSound() {
-    if (running && !wasRunning) { runStartedAt = Date.now(); lastStatus = { kind: '', text: '' }; getAudio(); }
+    if (running && !wasRunning) { runStartedAt = Date.now(); lastStatus = { kind: '', text: '' }; stopRequested = false; getAudio(); }
     if (!running && wasRunning && Date.now() - runStartedAt > 1500 && lastStatus.kind !== 'stop') {
         notifyFinish(lastStatus.kind === 'error' || lastStatus.kind === 'warn' ? 'error' : 'ok', lastStatus.text);
     }
@@ -2462,10 +2664,10 @@ async function autofillNames(char, charData) {
     const s = getSettings();
     const system = 'You identify fictional characters. Output ONE JSON object only.';
     const prompt = [
-        `[캐릭터 카드 이름] ${char.name}`,
-        charData.__member ? `[찾을 캐릭터] 이 카드는 여러 캐릭터를 연기해요. 그중 “${charData.__member}”만 찾으세요.` : '',
-        `[카드 설명 일부]\n${truncate(char.description || '', 1500)}`,
-        charData.refText ? `[원작 자료 일부]\n${truncate(charData.refText, 2500)}` : '',
+        `[Card name] ${char.name}`,
+        charData.__member ? `[Target] This card plays several characters; identify only "${charData.__member}".` : '',
+        `[Card description excerpt]\n${truncate(char.description || '', 1500)}`,
+        charData.refText ? `[Reference excerpt]\n${truncate(charData.refText, 2500)}` : '',
         'Identify the ORIGINAL character this fan-made bot is based on. Return:',
         '{"ja":"<Japanese name in original script, e.g. 白布賢二郎>","en":"<official English name>","ko":"<official Korean name>","seriesJa":"<series title in Japanese>","seriesEn":"<series title in English>","seriesKo":"<series title in Korean>"}',
         'If the work is not Japanese, still fill each language with the official/common name. Use "" if unknown.',
@@ -2478,11 +2680,11 @@ async function autofillNames(char, charData) {
 
 const SPEECH_KEYS_DOC = `{
   "available": <true if this language version officially exists or is well documented>,
-  "style_ko": "<이 버전에서 어떤 말투인지 한국어로 쉽게 2-4문장 (예시 표현과 그 뜻 포함). 영어판은 특히 자세히>",
-  "personality_ko": "<이 버전에서 성격이 어떤 느낌으로 전달되는지 한국어로 1-3문장>",
-  "first_person": "<1인칭 (e.g. 俺 / I / 나)>",
+  "style_ko": "<2-4 easy Korean sentences on how they talk in this version, with example expressions and their meaning; extra detail for English versions>",
+  "personality_ko": "<1-3 Korean sentences on how the personality comes across in this version>",
+  "first_person": "<first-person pronoun (e.g. 俺 / I / 나)>",
   "second_person": "<how they address others / {{user}}, e.g. お前, 呼び捨て, you, 너>",
-  "register": "<반말/존댓말/敬語/formality level>",
+  "register": "<formality level (e.g. 반말 / 존댓말 / 敬語)>",
   "sentence_endings": "<typical endings or grammar habits>",
   "dialect": "<dialect/accent and how it is rendered in this version, or '없음'>",
   "verbal_tics": ["<habits, fillers, sounds>"],
@@ -2522,27 +2724,27 @@ async function buildVoiceProfile() {
             'For en_gb: if there is no separate UK localization, say so in "dialect"/"register" and describe how the character should sound in natural British English (vocabulary, spelling), keeping the same personality.',
             'Fanon = how fans on X/Twitter, Reddit, pixiv etc. commonly interpret the character\'s PERSONALITY (popular headcanons about temperament, habits, attitude, memes, exaggerations). Separate it clearly from canon and list where fanon diverges from canon.',
             NO_SHIP_RULE + ' Ignore any search snippet about couplings. For canon relationships describe only the in-story bond (teammate, senior, rival, family), never romance between fans\' pairings.',
-            'Write explanations in 한국어; keep sample lines / catchphrases in their own language.',
+            'Write explanations in Korean; keep sample lines / catchphrases in their own language.',
             'Output ONE JSON object only (no markdown fences):',
             '{',
             `  "speech": { ${versions.map(v => `"${v}": <${VOICE_VERSIONS[v].desc}>`).join(', ')} },`,
             `  each speech entry has the shape: ${SPEECH_KEYS_DOC},`,
-            '  "dialect_mapping": "<원작 사투리/특유 말투가 각 언어판에서 어떻게 옮겨졌는지 한눈에 정리>",',
+            '  "dialect_mapping": "<overview of how the original dialect and speech quirks were rendered in each version>",',
             '  "personality": {',
             '    "canon": {"core_traits": [], "values": "", "likes": [], "dislikes": [], "emotional_expression": "", "relationships": [{"name": "", "dynamic": ""}], "behaviors": [], "confidence": "high|medium|low"},',
             '    "fanon": {"ja": {"popular_interpretations": [], "tags_memes": []}, "en": {"popular_interpretations": [], "tags_memes": []}, "ko": {"popular_interpretations": [], "tags_memes": []}, "divergence_from_canon": [], "confidence": "high|medium|low"}',
             '  },',
-            '  "notes": "<caveats, e.g. 영국판 별도 번역 없음 / 검색 결과 부족>"',
+            '  "notes": "<caveats, e.g. no separate UK localization / few search results>"',
             '}',
         ].join('\n');
 
         const n = charData.names;
         const prompt = [
-            `[캐릭터] ${voiceName(char, charData)} / 日: ${n.ja} / EN: ${n.en} / KO: ${n.ko}`,
-            charData.__member ? `[참고] 이 카드는 여러 캐릭터를 연기하는 카드예요. ${charData.__member} 한 명만 정리하세요.` : '',
-            `[작품] 日: ${n.seriesJa} / EN: ${n.seriesEn} / KO: ${n.seriesKo}`,
-            charData.refText ? `[원작 자료 (위키)]\n${truncate(charData.refText, 10000)}` : '[원작 자료 없음]',
-            research.text ? `[웹 검색 결과 스니펫 (일·영·한, X/트위터·레딧 포함)]\n${research.text}` : '[웹 검색 결과 없음 — 자체 지식으로 작성하고 confidence를 낮게]',
+            `[Character] ${voiceName(char, charData)} / 日: ${n.ja} / EN: ${n.en} / KO: ${n.ko}`,
+            charData.__member ? `[Note] This card plays several characters; profile only ${charData.__member}.` : '',
+            `[Series] 日: ${n.seriesJa} / EN: ${n.seriesEn} / KO: ${n.seriesKo}`,
+            charData.refText ? `[Reference material (wiki)]\n${truncate(charData.refText, 10000)}` : '[No reference material]',
+            research.text ? `[Web search snippets (JA / EN / KO)]\n${research.text}` : '[No web results — use your own knowledge and lower the confidence]',
             'Now output the JSON reference sheet.',
         ].join('\n\n');
 
@@ -2579,26 +2781,31 @@ async function generateVoiceSamples(versions, nameOverride = '') {
     const { userName } = testerNames();
     const charName = nameOverride || testerNames().charName;
     const out = {};
+    const restore = getSettings().testPromptVoice ? await applyTestPrompt() : async () => {};
+    try {
     for (const v of versions) {
         if (stopRequested) break;
         const lang = VOICE_VERSIONS[v].lang;
         const quietPrompt = [
-            `[OOC: 롤플레이를 잠깐 멈추고, ${charName}(으)로서 아래 세 상황에 대한 대사를 각각 1~2문장씩 **${lang}**(으)로만 써줘.`,
-            '지문·설명·번역·괄호 없이 대사만, 아래 형식 그대로:',
+            `[OOC: Pause the roleplay. As ${charName}, write one line of dialogue (1-2 sentences) for each of the three situations below, ONLY in ${lang}.`,
+            'Dialogue only — no narration, explanation, translation or brackets. Use exactly this format:',
             '1) ...\n2) ...\n3) ...',
-            `상황 1) ${userName}이(가) 가볍게 인사하며 말을 걸었다.`,
-            `상황 2) ${userName}이(가) 실수로 ${charName}을(를) 짜증 나게 했다.`,
-            `상황 3) ${userName}이(가) ${charName}을(를) 진심으로 칭찬했다.]`,
+            `Situation 1) ${userName} casually greets ${charName}.`,
+            `Situation 2) ${userName} accidentally annoys ${charName}.`,
+            `Situation 3) ${userName} sincerely praises ${charName}.]`,
         ].join('\n');
         try {
             await waitIdle();
             const text = await withTimer(`🗣 ${VOICE_VERSIONS[v].label} 샘플 대사 받는 중…`,
-                ctx().generateQuietPrompt({ quietPrompt, responseLength: 600 }));
+                rerollable(() => ctx().generateQuietPrompt({ quietPrompt, responseLength: 600 }), { onAbandon: async () => { clickStop(); await sleep(400); } }));
             out[v] = stripReasoning(String(text || '')).trim();
         } catch (e) {
             console.warn(LOG, 'sample failed', v, e);
             out[v] = `(생성 실패: ${e.message})`;
         }
+    }
+    } finally {
+        await restore();
     }
     return out;
 }
@@ -2745,10 +2952,10 @@ async function runVoiceCheck(setKey = 'ja_ko') {
         const prof = sanitizeProfile(structuredClone(charData.voiceProfile.profile || {}));
         const fanon = prof.personality?.fanon || {};
         const card = truncate(collectCard(char), 6000);
-        const note = charData.authorNote ? `[제작자 메모 — 의도한 AU/설정 변경 (감점 금지)]\n${charData.authorNote}` : '';
-        const sampleOf = (v) => samples[v] ? `[${VOICE_VERSIONS[v].label} (${VOICE_VERSIONS[v].lang}) 샘플 — 봇이 실제 설정으로 생성]\n${samples[v]}` : '';
+        const note = charData.authorNote ? `[Creator's note — intentional AU / setting changes (do not deduct)]\n${charData.authorNote}` : '';
+        const sampleOf = (v) => samples[v] ? `[${v} sample lines (${VOICE_VERSIONS[v].lang}) — generated by the bot with its real settings]\n${samples[v]}` : '';
         const common = [
-            'Every explanation must be in natural 한국어 that a Korean reader who is not fluent in the other language can understand. When you mention an English/Japanese word, add its Korean meaning in parentheses.',
+            'Every explanation must be in natural Korean that a Korean reader who is not fluent in the other language can understand. When you mention an English/Japanese word, add its Korean meaning in parentheses.',
             'Differences the creator marked as intentional (AU / 설정 변경) must not reduce scores.',
             NO_SHIP_RULE,
             memberFocusLine(charData),
@@ -2772,20 +2979,20 @@ async function runVoiceCheck(setKey = 'ja_ko') {
                 common,
                 'Shape:',
                 `{"version": "${v}", "status": "checked"|"no_sample", "score": <0-100 or null>,`,
-                ' "style_ko": "<이 버전에서 캐릭터가 원래 어떤 말투인지 (예시 표현 + 뜻)>",',
-                ' "personality_ko": "<이 버전에서 성격이 어떤 느낌으로 전달되는지>",',
-                ' "bot_style_ko": "<봇이 실제로 이 버전에서 어떤 말투로 말했는지, 샘플 없으면 빈 문자열>",',
+                ' "style_ko": "<how the character originally talks in this version (example expressions + meaning)>",',
+                ' "personality_ko": "<how the personality comes across in this version>",',
+                ' "bot_style_ko": "<how the bot actually talked in this version; empty if no sample>",',
                 ' "checks": {"first_person": "ok|bad|n/a", "address": "ok|bad|n/a", "register": "ok|bad|n/a", "dialect": "ok|bad|n/a", "tics": "ok|bad|n/a"},',
                 ' "comment": "",',
-                ' "flagged": [{"line": "", "problem": "", "rewrite": "", "rewrite_ko": "<고친 문장의 한국어 뜻, 한국어판이면 빈 문자열>"}],',
-                ` "bot_fixes": [{"priority": "high"|"medium"|"low", "what": "", "where": "description|personality|mes_example|first_mes|system_prompt|post_history|lorebook|author_note", "how": "", "paste": "<붙여넣을 문장 (PASTE TEXT LANGUAGE 규칙대로) — 규칙 나열보다 샘플 대사·연출 지시 형태로>", ${FUN_IMPACT_DOC}}]}`,
+                ' "flagged": [{"line": "", "problem": "", "rewrite": "", "rewrite_ko": "<Korean meaning of the rewrite; empty for the Korean version>"}],',
+                ` "bot_fixes": [{"priority": "high"|"medium"|"low", "what": "", "where": "description|personality|mes_example|first_mes|system_prompt|post_history|lorebook|author_note", "how": "", "paste": "<ready-to-paste text (PASTE TEXT LANGUAGE rule) — sample lines and directorial cues rather than rule lists>", ${FUN_IMPACT_DOC}}]}`,
             ].join('\n');
             const prompt = [
-                `[레퍼런스 — ${VOICE_VERSIONS[v].label} 말투]\n${JSON.stringify(prof.speech?.[v] ?? {}, null, 1)}`,
-                prof.dialect_mapping ? `[사투리·말투 번역 정리]\n${prof.dialect_mapping}` : '',
+                `[Reference — ${v} speech]\n${JSON.stringify(prof.speech?.[v] ?? {}, null, 1)}`,
+                prof.dialect_mapping ? `[Dialect / speech mapping]\n${prof.dialect_mapping}` : '',
                 note,
-                `[캐릭터 카드]\n${card}`,
-                chatLog ? `[현재 채팅 로그]\n${chatLog}` : '',
+                `[Character card]\n${card}`,
+                chatLog ? `[Current chat log]\n${chatLog}` : '',
                 sampleOf(v),
                 'Now output the JSON.',
             ].filter(Boolean).join('\n\n');
@@ -2804,7 +3011,7 @@ async function runVoiceCheck(setKey = 'ja_ko') {
         }
 
         // --- 2) one call for personality, comparison and card suggestions
-        const digest = speechResults.map(r => `${r.version}: ${r.score ?? '샘플 없음'}점 — ${r.comment || ''}`).join('\n');
+        const digest = speechResults.map(r => `${r.version}: ${r.score ?? 'no sample'}/100 — ${r.comment || ''}`).join('\n');
         const overviewSystem = [
             'You are a fandom expert reviewing a fan-made roleplay bot.',
             `Language pair: ${versions.map(v => VOICE_VERSIONS[v].desc).join(' / ')}. ${set.focus}`,
@@ -2818,13 +3025,13 @@ async function runVoiceCheck(setKey = 'ja_ko') {
             ` "card_suggestions": [{"field": "description|personality|mes_example|first_mes|lorebook|system_prompt", "action": "add|edit|remove", "text": "", "reason": "", ${FUN_IMPACT_DOC}}]}`,
         ].join('\n');
         const overviewPrompt = [
-            `[원작 성격]\n${JSON.stringify(prof.personality?.canon ?? {}, null, 1)}`,
-            `[2차 캐해 — ${set.fanon.map(k => FANON_LANGS[k]).join(', ')}]\n${JSON.stringify({ ...Object.fromEntries(set.fanon.map(k => [k, fanon[k] ?? null])), divergence_from_canon: fanon.divergence_from_canon }, null, 1)}`,
-            `[언어별 말투 요약]\n${versions.map(v => `${v}: ${prof.speech?.[v]?.style_ko || ''}`).join('\n')}`,
-            `[말투 검증 결과 요약]\n${digest}`,
+            `[Canon personality]\n${JSON.stringify(prof.personality?.canon ?? {}, null, 1)}`,
+            `[Fanon — ${set.fanon.join(', ')} fandoms]\n${JSON.stringify({ ...Object.fromEntries(set.fanon.map(k => [k, fanon[k] ?? null])), divergence_from_canon: fanon.divergence_from_canon }, null, 1)}`,
+            `[Speech summary per version]\n${versions.map(v => `${v}: ${prof.speech?.[v]?.style_ko || ''}`).join('\n')}`,
+            `[Speech check summary]\n${digest}`,
             note,
-            `[캐릭터 카드]\n${card}`,
-            chatLog ? `[현재 채팅 로그]\n${chatLog}` : '',
+            `[Character card]\n${card}`,
+            chatLog ? `[Current chat log]\n${chatLog}` : '',
             ...versions.map(sampleOf),
             'Now output the JSON.',
         ].filter(Boolean).join('\n\n');
@@ -3494,7 +3701,7 @@ async function runCardDoctor() {
         renderDoctorLocal(stats, lint);
         const charData = await loadCharData(char);
         const loreList = stats.lore.filter(e => e.enabled).slice(0, 40)
-            .map(e => `- ${e.constant ? '[상시]' : `[키: ${e.keys.slice(0, 5).join(', ')}]`} ${e.name} (${e.tokens} tok): ${truncate(e.content.replace(/\s+/g, ' '), e.constant ? 600 : 220)}`).join('\n');
+            .map(e => `- ${e.constant ? '[constant]' : `[keys: ${e.keys.slice(0, 5).join(', ')}]`} ${e.name} (${e.tokens} tok): ${truncate(e.content.replace(/\s+/g, ' '), e.constant ? 600 : 220)}`).join('\n');
         const system = [
             'You are an expert prompt engineer for character roleplay bots (SillyTavern character cards and lorebooks).',
             'Diagnose how well this card will make GPT, Claude and Gemini models roleplay the character — and above all whether the roleplay will be FUN: token efficiency, clarity, structure, vague prohibitions, contradictions, vague traits, {{user}} control, things that cause repetition or bland/stiff acting, lorebook design.',
@@ -3503,21 +3710,21 @@ async function runCardDoctor() {
             'Do NOT flag the fun engines above as problems. Specific prohibitions that come with a replacement behavior, per-language speech mechanics, escalation tiers, running gags and directorial cues are strengths even if they cost tokens. Only flag token cost when the text is redundant, wiki-like trivia, or never affects a scene.',
             'Rewrite examples: turn vague prohibitions or flat lines into vivid, concrete, playable instructions. Never make a line blander or shorter at the cost of flavor.',
             pasteLangRule(charData),
-            'Everything human-readable in natural 한국어 (quotes of the card stay exactly as written; rewrites and paste follow PASTE TEXT LANGUAGE). Short, concrete sentences.',
+            'Everything human-readable in natural Korean (quotes of the card stay exactly as written; rewrites and paste follow PASTE TEXT LANGUAGE). Short, concrete sentences.',
             NO_SHIP_RULE,
             'Limits: issues ≤ 8, rewrite_examples ≤ 4. JSON rules: straight double quotes, escape " inside strings, no trailing commas. Output ONE JSON object only:',
-            '{"overall": <0-100 how well the card supports good roleplay>, "fun": <0-100 how fun the roleplay will likely be>, "summary": "<2-3 문장>",',
-            ' "model_fit": [{"model": "gpt"|"claude"|"gemini", "score": <0-100>, "good": "<잘 맞는 점>", "risk": "<이 모델에서 생길 문제>", "tip": "<이 모델용 한 줄 팁>"}],',
-            ` "issues": [{"severity": "high"|"medium"|"low", "category": "막연한 금지문|토큰 낭비|모순|모호함|{{user}} 조종|반복 유발|재미 부족|구조·형식|로어북|기타", "where": "<필드 이름 또는 로어북 항목>", "problem": "", "evidence": "<카드 인용>", "fix": "", "paste": "<바꿔 넣을 문장, 없으면 빈 문자열>", ${FUN_IMPACT_DOC}}],`,
+            '{"overall": <0-100 how well the card supports good roleplay>, "fun": <0-100 how fun the roleplay will likely be>, "summary": "<2-3 sentences>",',
+            ' "model_fit": [{"model": "gpt"|"claude"|"gemini", "score": <0-100>, "good": "<what fits well>", "risk": "<problems this model will have>", "tip": "<one-line tip for this model>"}],',
+            ` "issues": [{"severity": "high"|"medium"|"low", "category": "막연한 금지문|토큰 낭비|모순|모호함|{{user}} 조종|반복 유발|재미 부족|구조·형식|로어북|기타", "where": "<field name or lorebook entry>", "problem": "", "evidence": "<카드 인용>", "fix": "", "paste": "<바꿔 넣을 문장, 없으면 빈 문자열>", ${FUN_IMPACT_DOC}}],`,
             ' "rewrite_examples": [{"before": "", "after": "", "why": ""}]}',
         ].join('\n');
         const prompt = [
-            `[토큰] 항상 들어감 ${stats.permanent} (카드 ${stats.cardPermanent} + 상시 로어북 ${stats.loreConstant}), 첫 메시지 ${stats.firstMes}, 키워드 로어북 ${stats.loreTriggeredCount}개/${stats.loreTriggeredTokens} tok, 최대 컨텍스트 ${stats.maxContext || '알 수 없음'}`,
-            `[필드별 토큰]\n${stats.rows.map(r => `- ${r.label}: ${r.tokens}`).join('\n')}`,
-            lint.length ? `[자동 검사에서 찾은 문제]\n${lint.map(f => `- (${f.severity}) ${f.title}`).join('\n')}` : '',
-            charData.authorNote ? `[제작자 메모 — 의도한 설정]\n${charData.authorNote}` : '',
-            `[캐릭터 카드 전문]\n${truncate(stats.rows.map(r => `### ${r.label}\n${r.text}`).join('\n\n'), 14000)}`,
-            loreList ? `[로어북]\n${loreList}` : '[로어북 없음]',
+            `[Tokens] always sent ${stats.permanent} (card ${stats.cardPermanent} + constant lore ${stats.loreConstant}), first message ${stats.firstMes}, keyword lore ${stats.loreTriggeredCount} entries / ${stats.loreTriggeredTokens} tok, max context ${stats.maxContext || 'unknown'}`,
+            `[Tokens per field]\n${stats.rows.map(r => `- ${r.label}: ${r.tokens}`).join('\n')}`,
+            lint.length ? `[Problems found by the automatic lint]\n${lint.map(f => `- (${f.severity}) ${f.title}`).join('\n')}` : '',
+            charData.authorNote ? `[Creator's note — intentional settings]\n${charData.authorNote}` : '',
+            `[Full character card]\n${truncate(stats.rows.map(r => `### ${r.label}\n${r.text}`).join('\n\n'), 14000)}`,
+            loreList ? `[Lorebook]\n${loreList}` : '[No lorebook]',
             'Now output the JSON diagnosis.',
         ].filter(Boolean).join('\n\n');
         const result = await requestJsonComplete({ system, prompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: '🩺 GPT·Claude·Gemini 적합도 진단 중…' });
@@ -3559,19 +3766,19 @@ async function runChatDoctor() {
             funGuard(cdFun),
             pasteLangRule(cdFun),
             MODEL_HEURISTICS,
-            'Everything in natural 한국어 (quotes stay in the chat\'s language).',
+            'Everything in natural Korean (quotes stay in the chat\'s language).',
             NO_SHIP_RULE,
             'Limits: patterns ≤ 7, evidence ≤ 2 quotes each. JSON rules: straight double quotes, escape " inside strings, no trailing commas. Output ONE JSON object only:',
-            '{"overall": <0-100 roleplay quality>, "fun": <0-100 how fun this chat was>, "summary": "<2-3 문장>", "strengths": ["..."],',
-            ' "patterns": [{"severity": "high"|"medium"|"low", "name": "<아쉬운 점 이름>", "evidence": ["<봇 대사 인용>"], "cause": "<카드·로어북의 어느 부분 때문인지 (모르면 빈 문자열)>", "fix": "<고치는 방법>", "paste": "<카드에 넣을 문장, 없으면 빈 문자열>"}]}',
+            '{"overall": <0-100 roleplay quality>, "fun": <0-100 how fun this chat was>, "summary": "<2-3 sentences>", "strengths": ["..."],',
+            ' "patterns": [{"severity": "high"|"medium"|"low", "name": "<short name of the problem>", "evidence": ["<quoted bot line>"], "cause": "<which part of the card/lorebook causes it (empty if unknown)>", "fix": "<고치는 방법>", "paste": "<카드에 넣을 문장, 없으면 빈 문자열>"}]}',
         ].join('\n');
-        const statLine = `봇 답장 ${st.count}개, 평균 ${st.avg}자 (최소 ${st.min}, 최대 ${st.max}), 질문으로 끝나는 비율 ${st.endsQuestionPct}%` +
-            (st.repeatedOpeners.length ? `\n반복되는 시작: ${st.repeatedOpeners.map(([o, n]) => `"${o}…" ×${n}`).join(', ')}` : '') +
-            (st.repeatedPhrases.length ? `\n여러 답장에 반복된 표현: ${st.repeatedPhrases.map(([g, n]) => `"${g}" ×${n}`).join(', ')}` : '');
+        const statLine = `${st.count} bot replies, average ${st.avg} chars (min ${st.min}, max ${st.max}), ${st.endsQuestionPct}% end with a question` +
+            (st.repeatedOpeners.length ? `\nRepeated openings: ${st.repeatedOpeners.map(([o, n]) => `"${o}…" ×${n}`).join(', ')}` : '') +
+            (st.repeatedPhrases.length ? `\nPhrases repeated across replies: ${st.repeatedPhrases.map(([g, n]) => `"${g}" ×${n}`).join(', ')}` : '');
         const prompt = [
-            `[자동 통계]\n${statLine}`,
-            `[캐릭터 카드 요약]\n${truncate(stats.rows.map(r => `### ${r.label}\n${r.text}`).join('\n\n'), 7000)}`,
-            `[롤플레잉 채팅 로그]\n${collectChatLog(Math.min(40, Math.max(10, Number(s.evalMessages) || 20)))}`,
+            `[Automatic stats]\n${statLine}`,
+            `[Character card summary]\n${truncate(stats.rows.map(r => `### ${r.label}\n${r.text}`).join('\n\n'), 7000)}`,
+            `[Roleplay chat log]\n${collectChatLog(Math.min(40, Math.max(10, Number(s.evalMessages) || 20)))}`,
             'Now output the JSON review.',
         ].join('\n\n');
         const result = await requestJsonComplete({ system, prompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: '💬 롤플 채팅 아쉬운 점 찾는 중…' });
@@ -3631,6 +3838,7 @@ ${restyleCardHtml()}
       <div id="bt_doc_lore" class="bt-result"></div>
       <div id="bt_doc_card" class="bt-result"></div>
       <div id="bt_doc_chat" class="bt-result"></div>
+${dedupCardHtml()}
 ${dietCardHtml()}
       <section class="bt-card">
         ${cardHead('History', '적용 기록', '봇 테스터로 카드에 넣은 내용이에요. 되돌리면 적용 전 내용으로 돌아가요.')}
@@ -3791,6 +3999,7 @@ function renderDoctorForChar(data) {
     if (loreCheckCache && loreCheckCache.char !== getCurrentCharacter()?.avatar) loreCheckCache = null;
     renderLoreCheck();
     renderKindResults();
+    renderDedup();
     renderFunAnalysis(data);
     renderDoctorCard(data?.doctor?.card);
     renderDoctorChat(data?.doctor?.chat);
@@ -3804,6 +4013,7 @@ function bindDoctorPage() {
     $id('docbtn_chat').addEventListener('click', runChatDoctor);
     $id('docbtn_fun').addEventListener('click', runFunAnalysis);
     $id('docbtn_lore').addEventListener('click', runLoreCheck);
+    bindDedup();
 }
 
 // ---------------------------------------------------------------------------
@@ -4326,10 +4536,10 @@ async function compressText({ text, label, kind, level, keepExamples, positive, 
         'the compressed text',
         '</compressed>',
         '<removed>',
-        '- one line per piece of information you dropped or merged (in 한국어)',
+        '- one line per piece of information you dropped or merged (in Korean)',
         '</removed>',
         '<fun_risk>',
-        '- one line per flavor/fun element that became weaker, in 한국어 (leave empty if none)',
+        '- one line per flavor/fun element that became weaker, in Korean (leave empty if none)',
         '</fun_risk>',
     ].filter(Boolean).join('\n');
     const prompt = [
@@ -4370,10 +4580,10 @@ async function splitToLore({ text, label, level, keepExamples, protectFun = true
         '<entry><name>short title</name><keys>keyword1, keyword2</keys><content>entry text</content></entry>',
         '</lore>',
         '<removed>',
-        '- one line per duplicate you dropped (in 한국어)',
+        '- one line per duplicate you dropped (in Korean)',
         '</removed>',
         '<fun_risk>',
-        '- one line per fun element that might become weaker, in 한국어 (leave empty if none)',
+        '- one line per fun element that might become weaker, in Korean (leave empty if none)',
         '</fun_risk>',
     ].filter(Boolean).join('\n');
     const prompt = [
@@ -4803,7 +5013,7 @@ async function restyleText({ key, label, text, level, src, charData, context }) 
         'the full new text of this field',
         '</rewritten>',
         '<changes>',
-        '- one line per change and which style rule it follows (in 한국어)',
+        '- one line per change and which style rule it follows (in Korean)',
         '</changes>',
     ].filter(Boolean).join('\n');
     const prompt = [
@@ -4908,7 +5118,7 @@ async function runFunAnalysis() {
         const stats = await analyzeTokens(char);
         const greetings = [char.first_mes || char.data?.first_mes || '', ...(char.data?.alternate_greetings || [])].filter(Boolean);
         const lore = stats.lore.filter(e => e.enabled).slice(0, 30)
-            .map(e => `- ${e.constant ? '[상시]' : `[키: ${e.keys.slice(0, 4).join(', ')}]`} ${e.name}: ${truncate(e.content.replace(/\s+/g, ' '), e.constant ? 900 : 300)}`).join('\n');
+            .map(e => `- ${e.constant ? '[constant]' : `[keys: ${e.keys.slice(0, 4).join(', ')}]`} ${e.name}: ${truncate(e.content.replace(/\s+/g, ' '), e.constant ? 900 : 300)}`).join('\n');
         const cdDir = await loadCharData(char);
         const system = [
             'You are a veteran roleplay-bot designer. The creator says this bot is genuinely FUN to roleplay with. Analyze WHY, at the level of format and technique, so the fun can be protected and reused.',
@@ -4917,20 +5127,20 @@ async function runFunAnalysis() {
             FUN_PRINCIPLES,
             pasteLangRule(cdDir),
             'Find the concrete fun engines in THIS card (quote them), rate each, list what must never be cut, and suggest a few additions that would make it even more fun without flattening anything.',
-            'style_summary: write the creator\'s "fun formula" as 6-10 short, reusable rules (in 한국어) that could guide edits to OTHER bots by the same creator.',
-            'Everything human-readable in natural 한국어; quotes of the card stay exactly as written; paste follows PASTE TEXT LANGUAGE.',
+            'style_summary: write the creator\'s "fun formula" as 6-10 short, reusable rules (in Korean) that could guide edits to OTHER bots by the same creator.',
+            'Everything human-readable in natural Korean; quotes of the card stay exactly as written; paste follows PASTE TEXT LANGUAGE.',
             NO_SHIP_RULE,
             'Limits: engines ≤ 10, protect ≤ 12, improve ≤ 5. JSON rules: straight double quotes, escape " inside strings, no trailing commas. Output ONE JSON object only:',
-            '{"fun": <0-100>, "summary": "<3-4 문장: 이 봇이 왜 재밌는지>",',
+            '{"fun": <0-100>, "summary": "<3-4 sentences: why this bot is fun>",',
             ' "engines": [{"name": "<연출 지시|모드 전환 비트|단계별 에스컬레이션|언어별 말투 설계|대체 행동이 붙은 금지문|관계·호칭 시스템|반복 개그|시그니처 대사|서브텍스트·갭|장면 훅(첫 메시지)|희소성|기타>", "strength": "strong"|"ok"|"weak"|"missing", "evidence": "<카드 인용>", "why": "<왜 재밌게 만드는지>"}],',
-            ' "protect": [{"what": "<지키야 할 요소>", "where": "<필드/로어북 항목>", "quote": "<짧은 인용>"}],',
-            ` "improve": [{"idea": "", "why": "", "where": "description|first_mes|mes_example|lorebook|personality|scenario", "paste": "<붙여넣을 문장 (PASTE TEXT LANGUAGE 규칙대로)>", ${FUN_IMPACT_DOC}}],`,
-            ' "style_summary": "<재미 공식 6-10줄>"}',
+            ' "protect": [{"what": "<element to protect>", "where": "<field / lorebook entry>", "quote": "<short quote>"}],',
+            ` "improve": [{"idea": "", "why": "", "where": "description|first_mes|mes_example|lorebook|personality|scenario", "paste": "<ready-to-paste text (PASTE TEXT LANGUAGE rule)>", ${FUN_IMPACT_DOC}}],`,
+            ' "style_summary": "<fun formula, 6-10 lines>"}',
         ].join('\n');
         const prompt = [
-            `[캐릭터 카드]\n${truncate(stats.rows.filter(r => r.key !== 'firstMessage').map(r => `### ${r.label}\n${r.text}`).join('\n\n'), 12000)}`,
-            `[첫 메시지 ${greetings.length}개]\n${greetings.slice(0, 4).map((g, i) => `--- ${i + 1}\n${truncate(g, 1400)}`).join('\n')}`,
-            lore ? `[로어북]\n${lore}` : '',
+            `[Character card]\n${truncate(stats.rows.filter(r => r.key !== 'firstMessage').map(r => `### ${r.label}\n${r.text}`).join('\n\n'), 12000)}`,
+            `[Greetings: ${greetings.length}]\n${greetings.slice(0, 4).map((g, i) => `--- ${i + 1}\n${truncate(g, 1400)}`).join('\n')}`,
+            lore ? `[Lorebook]\n${lore}` : '',
             'Now output the JSON analysis.',
         ].filter(Boolean).join('\n\n');
         const result = await requestJsonComplete({ system, prompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: '🎭 이 봇이 왜 재밌는지 분석 중…' });
@@ -5066,7 +5276,7 @@ async function grabAnchor() {
             'Describe what the chat shows, not what canon says. Quote short real lines from the chat as evidence.',
             botKind(cd) === 'multi' ? 'This card plays several characters: in 말투 and 거리감, describe each main character on its own line.' : '',
             botKind(cd) === 'sim' || botKind(cd) === 'rpg' ? 'This is a simulation/RPG bot: in 지금 상황 also note the current tracked values (stats, items, money, affection, day/time) exactly as the chat shows them.' : '',
-            'Write in natural 한국어 (quotes stay in the chat\'s language). Plain text, no markdown headers, at most about 1200 characters.',
+            'Write in natural Korean (quotes stay in the chat\'s language). Plain text, no markdown headers, at most about 1200 characters.',
             'Use exactly these five labeled parts, each 1-3 lines:',
             '말투: first person, how they address {{user}}, sentence endings, dialect, tics — with 2-3 short quotes',
             `{{user}}와의 거리감: how close they are right now, how ${charName} treats {{user}} (teasing, guarded, protective, …)`,
@@ -5077,7 +5287,7 @@ async function grabAnchor() {
         ].join('\n');
         const prompt = [
             caehGuide({ caehBase: cd.caehBase, caehCaution: cd.caehCaution }),
-            `[채팅 — 최근 ${Math.min(msgs.length, 40)}개]\n${msgs.slice(-40).map(m => `${m.is_user ? userName : charName}: ${truncate(m.mes, 1200)}`).join('\n\n')}`,
+            `[Chat — last ${Math.min(msgs.length, 40)} messages]\n${msgs.slice(-40).map(m => `${m.is_user ? userName : charName}: ${truncate(m.mes, 1200)}`).join('\n\n')}`,
             'Now write the five parts.',
         ].filter(Boolean).join('\n\n');
         const out = stripReasoning(await withTimer('🔗 이 채팅의 캐릭터 정리 중…', callLLM({ system, prompt, profileId: s.evalProfile, maxTokens: 6000 })))
@@ -5099,12 +5309,14 @@ async function grabAnchor() {
 
 // --- per-chat Author's Note: keep an ongoing chat's character while the card changes ---
 
-const NOTE_START = '[봇 테스터 · 이 채팅의 {{char}}]';
-const NOTE_END = '[/봇 테스터]';
+const NOTE_START = '[Bot Tester: {{char}} in this chat]';
+const NOTE_START_OLD = '[봇 테스터 · 이 채팅의 {{char}}]';
+const NOTE_END = '[/Bot Tester]';
+const NOTE_END_OLD = '[/봇 테스터]';
 
 function chatNoteBlockRe() {
     const esc = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    return new RegExp(`\\n*${esc(NOTE_START)}[\\s\\S]*?${esc(NOTE_END)}\\n*`);
+    return new RegExp(`\\n*(?:${esc(NOTE_START)}|${esc(NOTE_START_OLD)})[\\s\\S]*?(?:${esc(NOTE_END)}|${esc(NOTE_END_OLD)})\\n*`);
 }
 
 function currentChatNote() {
@@ -5117,7 +5329,7 @@ function anchorToNote(text) {
     const lines = String(text || '').split('\n').map(x => x.trim()).filter(Boolean)
         .filter(x => !/^(지금 상황|현재 상황)\s*[:：]/.test(x));
     return [
-        '이 채팅에서는 {{char}}를 아래처럼 계속 연기할 것. 캐릭터 설명과 달라도 이 채팅에서는 이쪽이 우선이다.',
+        'In this chat, keep playing {{char}} like this (overrides the card where they differ):',
         ...lines,
     ].join('\n');
 }
@@ -5284,7 +5496,7 @@ async function generateNextReply({ fields, lore, history, userName, charName, no
         `Write ONLY ${charName}'s next reply to the last message. Match the length and format of ${charName}'s earlier replies in this chat. Never write ${userName}'s lines or actions.`,
     ].filter(Boolean).join('\n\n');
     const prompt = `${history}\n\n${charName}:`;
-    const out = await callLLM({ system, prompt, profileId: '', maxTokens: Math.max(Number(getSettings().testerMaxTokens) || 0, 3000) });
+    const out = await callLLM({ system, prompt, profileId: getSettings().testProfile || '', maxTokens: Math.max(Number(getSettings().testerMaxTokens) || 0, 3000) });
     return stripReasoning(out).replace(new RegExp(`^${charName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:\\s*`), '').trim();
 }
 
@@ -5339,12 +5551,12 @@ async function runContinuity() {
             'changed_ko: in Korean, what concretely differs between X and Y in personality, voice or distance (quote short bits). advice_ko: if one is weaker, what to change in the CARD so the edited version keeps continuity and fun (1-3 short points, Korean).',
             NO_SHIP_RULE,
             'JSON rules: straight double quotes, escape " inside strings, no trailing commas. Output ONE JSON object only:',
-            '{"x": {"continuity": 0, "fun": 0, "direction": 0}, "y": {"continuity": 0, "fun": 0, "direction": 0}, "better": "x"|"y"|"tie", "changed_ko": "", "verdict_ko": "<2-3문장>", "advice_ko": ["..."]}',
+            '{"x": {"continuity": 0, "fun": 0, "direction": 0}, "y": {"continuity": 0, "fun": 0, "direction": 0}, "better": "x"|"y"|"tie", "changed_ko": "", "verdict_ko": "<2-3 sentences>", "advice_ko": ["..."]}',
         ].filter(Boolean).join('\n\n');
         const prompt = [
-            `[채팅 흐름 — 여기까지가 지금까지의 롤플]\n${history}`,
-            `[후보 X]\n${X}`,
-            `[후보 Y]\n${Y}`,
+            `[Chat so far]\n${history}`,
+            `[Candidate X]\n${X}`,
+            `[Candidate Y]\n${Y}`,
             'Now output the JSON.',
         ].join('\n\n');
         const j = await requestJsonComplete({ system, prompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: '⚖️ 어느 쪽이 더 이어지는지 비교 중…' });
@@ -5646,7 +5858,7 @@ async function runLoreAi() {
     const s = getSettings();
     const cd = await loadCharData(char);
     const active = loreCheckCache.entries.filter(e => !e.disable).slice(0, 60);
-    const list = active.map((e, i) => `#${i} [${e.book}] ${e.constant ? '상시' : `키워드: ${e.key.join(', ') || '(없음)'}${e.keysecondary.length ? ` / 보조: ${e.keysecondary.join(', ')}` : ''}`} · ${e.tokens}tok\n이름: ${e.name}\n${truncate(e.content, 700)}`).join('\n\n');
+    const list = active.map((e, i) => `#${i} [${e.book}] ${e.constant ? 'constant' : `keys: ${e.key.join(', ') || '(none)'}${e.keysecondary.length ? ` / secondary: ${e.keysecondary.join(', ')}` : ''}`} · ${e.tokens}tok\nName: ${e.name}\n${truncate(e.content, 700)}`).join('\n\n');
     running = true;
     updateRunState();
     try {
@@ -5656,19 +5868,19 @@ async function runLoreAi() {
             'Keyword advice: keys should be words people actually type in chat. For Korean/Japanese chats include the forms used there. Never suggest the character\'s or user\'s name alone as a key.',
             funGuard(cd),
             NO_SHIP_RULE,
-            'Everything human-readable in natural 한국어.',
+            'Everything human-readable in natural Korean.',
             pasteLangRule(cd, { keys: true }),
             'Limits: issues ≤ 10, missing ≤ 4. "idx" is the #number of the entry. "paste" = full replacement content for that entry, or empty string if only keys change.',
             'JSON rules: straight double quotes, escape " inside strings, no trailing commas. Output ONE JSON object only:',
-            `{"score": <0-100 how well the lorebooks support fun, accurate roleplay>, "summary": "<2-3문장>",`,
+            `{"score": <0-100 how well the lorebooks support fun, accurate roleplay>, "summary": "<2-3 sentences>",`,
             ` "issues": [{"idx": 0, "severity": "high"|"medium"|"low", "category": "키워드|내용|모순|구조|토큰|재미", "problem": "", "fix": "", "add_keys": ["..."], "paste": "", ${FUN_IMPACT_DOC}}],`,
-            ' "missing": [{"name": "", "keys": ["..."], "content": "<새 항목 내용>", "why": ""}]}',
+            ' "missing": [{"name": "", "keys": ["..."], "content": "<new entry content>", "why": ""}]}',
         ].join('\n');
         const prompt = [
-            `[캐릭터 카드]\n${truncate(collectCard(char), 6000)}`,
+            `[Character card]\n${truncate(collectCard(char), 6000)}`,
             cd.refText ? `[원작 자료 발췌]\n${truncate(cd.refText, 3500)}` : '',
             cd.authorNote ? `[제작자 메모]\n${cd.authorNote}` : '',
-            `[로어북 항목 ${active.length}개]\n${list}`,
+            `[Lorebook entries: ${active.length}]\n${list}`,
             'Now output the JSON.',
         ].filter(Boolean).join('\n\n');
         const r = await requestJsonComplete({ system, prompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: '📚 로어북 내용 점검 중…' });
@@ -5815,7 +6027,7 @@ async function loreReferenceText(char, maxChars = 8000) {
             const data = await ctx().loadWorldInfo(b.name);
             for (const e of Object.values(data?.entries || {})) {
                 if (e.disable || !String(e.content || '').trim()) continue;
-                items.push({ constant: !!e.constant, text: `- [${e.comment || (e.key || []).slice(0, 3).join(', ') || `#${e.uid}`}${e.constant ? ' · 상시' : ` · 키워드: ${(e.key || []).slice(0, 4).join(', ')}`}] ${String(e.content).trim()}` });
+                items.push({ constant: !!e.constant, text: `- [${e.comment || (e.key || []).slice(0, 3).join(', ') || `#${e.uid}`}${e.constant ? ' · constant' : ` · keys: ${(e.key || []).slice(0, 4).join(', ')}`}] ${String(e.content).trim()}` });
             }
         } catch { /* skip broken book */ }
     }
@@ -5830,7 +6042,7 @@ async function ensureLoreCache(char) {
 }
 
 function loreIndexList(active, maxEach = 700) {
-    return active.map((e, i) => `#${i} [${e.book}] ${e.constant ? '상시' : `키워드: ${e.key.join(', ') || '(없음)'}`} — ${e.name}\n${truncate(e.content, maxEach)}`).join('\n\n');
+    return active.map((e, i) => `#${i} [${e.book}] ${e.constant ? 'constant' : `keys: ${e.key.join(', ') || '(none)'}`} — ${e.name}\n${truncate(e.content, maxEach)}`).join('\n\n');
 }
 
 /** Finds a quoted passage in text, tolerating line-break and spacing differences. Returns [start, end] or null. */
@@ -5874,7 +6086,7 @@ async function runLoreChatCheck() {
         if (m.is_user) return `${userName}: ${truncate(m.mes, 1200)}`;
         const fired = active.map((e, idx) => ({ e, idx })).filter(({ e }) => entryFires(e, msgs.slice(Math.max(0, i - (Number(e.scanDepth) || g.depth)), i).map(x => x.mes).join('\n'), g)).map(x => `#${x.idx}`);
         k++;
-        return `[BOT ${k}] (켜져 있던 로어북: ${fired.join(', ') || '없음'})\n${charName}: ${truncate(m.mes, 1500)}`;
+        return `[BOT ${k}] (active lorebook entries: ${fired.join(', ') || 'none'})\n${charName}: ${truncate(m.mes, 1500)}`;
     }).join('\n\n');
     const cd = await loadCharData(char);
     running = true;
@@ -5890,19 +6102,19 @@ async function runLoreChatCheck() {
             'Info-dumping lore text verbatim into a reply is also a problem: the lore should be SHOWN in the scene.',
             funGuard(cd),
             NO_SHIP_RULE,
-            'Everything human-readable in natural 한국어; quotes of bot lines stay exactly as written.',
+            'Everything human-readable in natural Korean; quotes of bot lines stay exactly as written.',
             pasteLangRule(cd),
             'Limits: violations ≤ 8, unused ≤ 5, good ≤ 4. "idx" = lorebook entry #number, "reply" = BOT number.',
             'JSON rules: straight double quotes, escape " inside strings, no trailing commas. Output ONE JSON object only:',
-            '{"score": <0-100>, "scores": {"facts": 0, "rules": 0, "use": 0}, "summary": "<2-3문장>",',
+            '{"score": <0-100>, "scores": {"facts": 0, "rules": 0, "use": 0}, "summary": "<2-3 sentences>",',
             ` "violations": [{"reply": 1, "quote": "", "idx": 0, "kind": "facts"|"rules"|"use"|"dump", "problem": "", "fix": "", "where": "lore"|"description"|"personality"|"mes_example"|"system_prompt"|"post_history", "paste": "", ${FUN_IMPACT_DOC}}],`,
             ' "unused": [{"idx": 0, "why": "", "fix": ""}],',
-            ' "good": ["<로어북을 잘 살린 장면>"]}',
+            ' "good": ["<a scene that used the lorebook well>"]}',
         ].join('\n');
         const prompt = [
-            `[로어북 항목 ${active.length}개]\n${loreIndexList(active)}`,
-            `[캐릭터 카드]\n${truncate(collectCard(char), 5000)}`,
-            `[채팅 — 최근 ${msgs.length}개]\n${log}`,
+            `[Lorebook entries: ${active.length}]\n${loreIndexList(active)}`,
+            `[Character card]\n${truncate(collectCard(char), 5000)}`,
+            `[Chat — last ${msgs.length} messages]\n${log}`,
             'Now output the JSON.',
         ].join('\n\n');
         const r = await requestJsonComplete({ system, prompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: '📚 로어북 기준으로 채팅 검사 중…' });
@@ -5944,11 +6156,11 @@ async function runLoreCardCheck() {
             'Fix toward the lorebook, but keep the card fun and in the creator\'s direction. If a lore rule itself is the problem, say so in "problem" instead of bending the card.',
             funGuard(cd),
             NO_SHIP_RULE,
-            'Everything human-readable in natural 한국어; card_quote must be copied EXACTLY from the card (same language, same wording).',
+            'Everything human-readable in natural Korean; card_quote must be copied EXACTLY from the card (same language, same wording).',
             pasteLangRule(cd),
             'Limits: rules ≤ 12, conflicts ≤ 8, missing ≤ 6, overrides ≤ 4. "idx" = lorebook entry #number.',
             'JSON rules: straight double quotes, escape " inside strings, no trailing commas. Output ONE JSON object only:',
-            '{"score": <0-100 how well the card follows the lorebook>, "summary": "<2-3문장>",',
+            '{"score": <0-100 how well the card follows the lorebook>, "summary": "<2-3 sentences>",',
             ' "rules": [{"idx": 0, "rule": ""}],',
             ` "conflicts": [{"idx": 0, "rule": "", "field": "description"|"personality"|"scenario"|"first_mes"|"mes_example"|"system_prompt"|"post_history"|"char_note", "card_quote": "", "problem": "", "fix": "", "paste": "", ${FUN_IMPACT_DOC}}],`,
             ` "missing": [{"idx": 0, "rule": "", "field": "", "paste": "", "why": "", ${FUN_IMPACT_DOC}}],`,
@@ -5958,8 +6170,8 @@ async function runLoreCardCheck() {
             .map(k => [k, rawCardValue(char, k)]).filter(([, v]) => String(v).trim())
             .map(([k, v]) => `### field: ${k}\n${truncate(v, 5000)}`).join('\n\n');
         const prompt = [
-            `[로어북 항목 ${active.length}개]\n${loreIndexList(active, 900)}`,
-            `[캐릭터 카드 — 필드별]\n${fields}`,
+            `[Lorebook entries: ${active.length}]\n${loreIndexList(active, 900)}`,
+            `[Character card — by field]\n${fields}`,
             'Now output the JSON.',
         ].join('\n\n');
         const r = await requestJsonComplete({ system, prompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: '📚 로어북 지시에 맞게 카드 검사 중…' });
@@ -6199,8 +6411,8 @@ async function grabRoster() {
             'At most 15 entries, most important first. Output ONE JSON object only: {"characters": [{"name": "", "orig": "", "note": ""}]}',
         ].join('\n');
         const prompt = [
-            `[카드]\n${truncate(collectCard(char), 9000)}`,
-            cd.refText ? `[원작 자료 일부]\n${truncate(cd.refText, 2500)}` : '',
+            `[Card]\n${truncate(collectCard(char), 9000)}`,
+            cd.refText ? `[Reference excerpt]\n${truncate(cd.refText, 2500)}` : '',
             'Now output the JSON.',
         ].filter(Boolean).join('\n\n');
         const r = await requestJson({ system, prompt, profileId: s.evalProfile, maxTokens: 4000, label: '👥 등장인물 찾는 중…' });
@@ -6420,19 +6632,19 @@ async function runKindCheck(mode) {
             NO_SHIP_RULE,
             `Score each of these checks 0-100: ${checks.join(', ')}.`,
             kind === 'multi' && roster.length ? 'Also give per_character: how well each listed character comes through (distinct voice, presence, faithful to their own canon).' : 'per_character may be an empty list.',
-            'Everything human-readable in natural 한국어. "where" = card field (description|personality|scenario|first_mes|mes_example|system_prompt|post_history|char_note|lorebook). "quote" = exact text from the card (card review) or a bot line (chat review). "paste" = ready-to-paste fix.',
+            'Everything human-readable in natural Korean. "where" = card field (description|personality|scenario|first_mes|mes_example|system_prompt|post_history|char_note|lorebook). "quote" = exact text from the card (card review) or a bot line (chat review). "paste" = ready-to-paste fix.',
             'Limits: issues ≤ 8, per_character ≤ 10. JSON rules: straight double quotes, escape " inside strings, no trailing commas. Output ONE JSON object only:',
-            `{"score": <0-100>, "summary": "<2-3문장>", "checks": [{"name": "", "score": 0, "comment": ""}], "per_character": [{"name": "", "score": 0, "comment": ""}],`,
-            ` "issues": [{"severity": "high"|"medium"|"low", "check": "<one of the checks>", "character": "<해당 캐릭터, 없으면 빈 문자열>", "problem": "", "quote": "", "where": "", "fix": "", "paste": "", ${FUN_IMPACT_DOC}}]}`,
+            `{"score": <0-100>, "summary": "<2-3 sentences>", "checks": [{"name": "", "score": 0, "comment": ""}], "per_character": [{"name": "", "score": 0, "comment": ""}],`,
+            ` "issues": [{"severity": "high"|"medium"|"low", "check": "<one of the checks>", "character": "<the character this is about, or empty>", "problem": "", "quote": "", "where": "", "fix": "", "paste": "", ${FUN_IMPACT_DOC}}]}`,
         ].join('\n');
         const stats = await analyzeTokens(char);
-        const lore = stats.lore.filter(e => e.enabled).slice(0, 30).map(e => `- ${e.constant ? '[상시]' : `[${e.keys.slice(0, 3).join(', ')}]`} ${e.name}: ${truncate(e.content.replace(/\s+/g, ' '), 300)}`).join('\n');
+        const lore = stats.lore.filter(e => e.enabled).slice(0, 30).map(e => `- ${e.constant ? '[constant]' : `[${e.keys.slice(0, 3).join(', ')}]`} ${e.name}: ${truncate(e.content.replace(/\s+/g, ' '), 300)}`).join('\n');
         const { userName, charName } = testerNames();
         const prompt = [
-            `[캐릭터 카드]\n${truncate(collectCard(char), 12000)}`,
-            lore ? `[로어북 요약]\n${lore}` : '',
-            mode === 'chat' ? `[채팅 — 최근 ${Math.min(msgs.length, 30)}개]\n${msgs.slice(-30).map(m => `${m.is_user ? userName : charName}: ${truncate(m.mes, 1500)}`).join('\n\n')}` : '',
-            status ? `[상태창 자동 추적 결과]\n${status.findings.map(f => `- ${f.title}${f.examples?.length ? `: ${f.examples.slice(0, 3).join('; ')}` : ''}`).join('\n') || '- 문제 없음'}` : '',
+            `[Character card]\n${truncate(collectCard(char), 12000)}`,
+            lore ? `[Lorebook summary]\n${lore}` : '',
+            mode === 'chat' ? `[Chat — last ${Math.min(msgs.length, 30)} messages]\n${msgs.slice(-30).map(m => `${m.is_user ? userName : charName}: ${truncate(m.mes, 1500)}`).join('\n\n')}` : '',
+            status ? `[Status-window auto tracking]\n${status.findings.map(f => `- ${f.title}${f.examples?.length ? `: ${f.examples.slice(0, 3).join('; ')}` : ''}`).join('\n') || '- no problems'}` : '',
             'Now output the JSON.',
         ].filter(Boolean).join('\n\n');
         const r = await requestJsonComplete({ system, prompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: mode === 'card' ? `🧩 ${BOT_KINDS[kind].short} 카드 검사 중…` : `🧩 ${BOT_KINDS[kind].short} 채팅 검사 중…` });
@@ -6513,6 +6725,265 @@ function bindKindDoctor() {
     $id('docbtn_status').addEventListener('click', () => { if (!running) runStatusTrack(); });
     $id('docbtn_kcard').addEventListener('click', () => runKindCheck('card'));
     $id('docbtn_kchat').addEventListener('click', () => runKindCheck('chat'));
+}
+
+
+// ---------------------------------------------------------------------------
+// Description ↔ Personality duplicates (중복 정리): both fields are sent every turn
+// ---------------------------------------------------------------------------
+
+const DEDUP_SIDES = {
+    personality: { label: 'Personality에서 지우기 (Description에 남김)', target: 'personality', other: 'description' },
+    description: { label: 'Description에서 지우기 (Personality에 남김)', target: 'description', other: 'personality' },
+};
+
+let dedupState = null; // { side, target, other, targetText, otherText, rows, ai }
+
+function dedupCardHtml() {
+    return `
+      <section class="bt-card" id="bt_dedup_card">
+        ${cardHead('Duplicates', 'Description ↔ Personality 중복 정리', '두 칸은 둘 다 매 턴 들어가서, 같은 내용이 양쪽에 있으면 토큰을 두 번 써요. 겹치는 내용을 찾아서 한쪽에서만 지워요. 지운 칸은 백업돼서 적용 기록에서 되돌릴 수 있어요.')}
+        ${field('지울 쪽', `<select id="bt_dedup_side" class="bt-input">${Object.entries(DEDUP_SIDES).map(([k, v]) => `<option value="${k}">${v.label}</option>`).join('')}</select>`)}
+        <div class="bt-actions bt-actions-split">
+          <button type="button" id="bt_dedup_find" class="bt-btn">${ico('clone')}<span>같은 문장 찾기</span></button>
+          <button type="button" id="bt_dedup_ai" class="bt-btn bt-btn-primary">${ico('wand-magic-sparkles')}<span>AI로 의미 중복까지</span></button>
+        </div>
+        <p class="bt-note"><b>같은 문장 찾기</b>는 AI 없이 바로 끝나요. 똑같거나 거의 같은 문장, 이미 다른 칸에 있는 특성 단어를 찾아요. <b>AI로 의미 중복까지</b>는 표현이 달라도 같은 뜻이면 찾아서, 지울 쪽에서만 빼고 나머지 문장은 그대로 둬요.</p>
+      </section>
+      <div id="bt_dedup_result" class="bt-result"></div>`;
+}
+
+function dedupNorm(t, charName = '') {
+    let x = String(t || '').toLowerCase().replace(/\{\{char\}\}|\{\{user\}\}/g, '');
+    if (charName) for (const part of String(charName).toLowerCase().split(/\s+/).filter(p => p.length >= 2)) x = x.split(part).join('');
+    return x.replace(/[\s"'“”‘’`*_~.,!?;:()[\]{}<>|/\\\-—–…·・。、！？「」『』【】#]+/g, '');
+}
+
+function bigrams(t) {
+    const out = new Map();
+    for (let i = 0; i < t.length - 1; i++) { const g = t.slice(i, i + 2); out.set(g, (out.get(g) || 0) + 1); }
+    return out;
+}
+
+function dice(a, b) {
+    if (!a || !b) return 0;
+    if (a === b) return 1;
+    const A = bigrams(a); const B = bigrams(b);
+    let inter = 0;
+    for (const [g, n] of A) inter += Math.min(n, B.get(g) || 0);
+    const total = Math.max(1, a.length - 1 + b.length - 1);
+    return (2 * inter) / total;
+}
+
+/** Splits a field into sentences, and comma lists into items, keeping their positions. */
+function dedupUnits(text) {
+    const units = [];
+    let pos = 0;
+    for (const line of String(text).split('\n')) {
+        const lineStart = pos;
+        pos += line.length + 1;
+        if (!line.trim()) continue;
+        const labelM = line.match(/^(\s*(?:[-*•]\s*)?[^:：\n]{1,24}[:：]\s*)(.*)$/);
+        const body = labelM ? labelM[2] : line;
+        const bodyStart = lineStart + (labelM ? labelM[1].length : 0);
+        const commas = (body.match(/[,，、]/g) || []).length;
+        const items = body.split(/[,，、]/);
+        const isList = commas >= 2 && items.every(it => it.trim().length <= 40) && !/[.!?。！？]\s*\S/.test(body);
+        if (isList) {
+            let off = 0;
+            for (const it of items) {
+                const lead = it.length - it.trimStart().length;
+                const val = it.trim();
+                if (val) units.push({ text: val, start: bodyStart + off + lead, end: bodyStart + off + lead + val.length, kind: 'item' });
+                off += it.length + 1;
+            }
+            continue;
+        }
+        const re = /[^.!?。！？\n]+[.!?。！？]*["”」』)]*\s*/g;
+        let m;
+        while ((m = re.exec(body))) {
+            const raw = m[0];
+            const val = raw.trim();
+            if (val.length < 2) continue;
+            const lead = raw.length - raw.trimStart().length;
+            units.push({ text: val, start: bodyStart + m.index + lead, end: bodyStart + m.index + lead + val.length, kind: 'sentence' });
+        }
+    }
+    return units;
+}
+
+function findDuplicates(targetText, otherText, charName) {
+    const other = dedupUnits(otherText).map(u => ({ ...u, n: dedupNorm(u.text, charName) })).filter(u => u.n);
+    const otherAll = dedupNorm(otherText, charName);
+    const rows = [];
+    for (const u of dedupUnits(targetText)) {
+        const n = dedupNorm(u.text, charName);
+        if (n.length < 2) continue;
+        let best = null; let score = 0;
+        for (const o of other) {
+            const d = n === o.n ? 1 : (n.length >= 8 && o.n.length >= 8 ? dice(n, o.n) : 0);
+            if (d > score) { score = d; best = o; }
+        }
+        if (score >= 0.999) rows.push({ ...u, match: best.text, how: 'same' });
+        else if (score >= 0.72) rows.push({ ...u, match: best.text, how: 'similar', score });
+        else if (u.kind === 'item' && n.length >= 2 && n.length <= 20 && otherAll.includes(n)) rows.push({ ...u, match: '', how: 'contained' });
+    }
+    return rows;
+}
+
+/** Removes the given spans and tidies leftover commas, bullets and blank lines. */
+function removeSpans(text, spans) {
+    let t = String(text);
+    for (const sp of [...spans].sort((a, b) => b.start - a.start)) {
+        let s = sp.start; let e = sp.end;
+        if (sp.kind === 'item') {
+            const after = t.slice(e).match(/^\s*[,，、]\s*/);
+            if (after) e += after[0].length;
+            else { const before = t.slice(0, s).match(/[,，、]\s*$/); if (before) s -= before[0].length; }
+        }
+        // a line that becomes empty is removed together with its line break
+        const ls = t.lastIndexOf('\n', s - 1) + 1;
+        const leRaw = t.indexOf('\n', e);
+        const le = leRaw === -1 ? t.length : leRaw;
+        if (!t.slice(ls, s).replace(/^[ \t]*(?:[-*•][ \t]*)?/, '').trim() && !t.slice(e, le).trim()) { s = ls; e = leRaw === -1 ? t.length : le + 1; }
+        t = t.slice(0, s) + t.slice(e);
+    }
+    return t
+        .replace(/[ \t]+([,，、.。])/g, '$1')
+        .replace(/([,，、])\s*(?=[,，、])/g, '')
+        .replace(/([:：])\s*[,，、]\s*/g, '$1 ')
+        .replace(/[,，、]\s*$/gm, '')
+        .replace(/^[ \t]*[-*•][ \t]*$/gm, '')
+        .replace(/[ \t]{2,}/g, ' ')
+        .replace(/[ \t]+$/gm, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
+function dedupSide() {
+    return DEDUP_SIDES[$id('dedup_side')?.value] || DEDUP_SIDES.personality;
+}
+
+function dedupTexts() {
+    const char = getCurrentCharacter();
+    const side = dedupSide();
+    return { char, side, targetText: rawCardValue(char, side.target), otherText: rawCardValue(char, side.other) };
+}
+
+async function runDedupFind() {
+    const { char, side, targetText, otherText } = dedupTexts();
+    if (!char) { toastr.error('1:1 캐릭터 채팅을 열어주세요'); return; }
+    if (!targetText.trim() || !otherText.trim()) { toastr.info(`${!targetText.trim() ? FIELD_LABEL[side.target] : FIELD_LABEL[side.other]} 칸이 비어 있어서 겹칠 내용이 없어요`); return; }
+    const rows = findDuplicates(targetText, otherText, char.name);
+    dedupState = { char: char.avatar, side, targetText, otherText, rows, ai: null, time: Date.now() };
+    renderDedup();
+    setStatus(rows.length ? `✅ 겹치는 내용 ${rows.length}개를 찾았어요` : '✅ 같은 문장은 없어요 — 뜻이 겹치는 건 AI로 찾아보세요');
+    scrollPanelTo($id('dedup_result'));
+}
+
+async function runDedupAi() {
+    if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
+    const { char, side, targetText, otherText } = dedupTexts();
+    if (!char) { toastr.error('1:1 캐릭터 채팅을 열어주세요'); return; }
+    if (!targetText.trim() || !otherText.trim()) { toastr.info(`${!targetText.trim() ? FIELD_LABEL[side.target] : FIELD_LABEL[side.other]} 칸이 비어 있어서 겹칠 내용이 없어요`); return; }
+    const cd = await loadCharData(char);
+    const T = FIELD_LABEL[side.target]; const O = FIELD_LABEL[side.other];
+    running = true;
+    updateRunState();
+    try {
+        const system = [
+            `You remove duplicated content between two fields of a SillyTavern character card. ${T} and ${O} are both sent to the model every turn, so anything stated in both wastes tokens.`,
+            `Find every fact, trait, behaviour, rule or description that appears in BOTH fields with the same meaning, even if worded differently. Delete it from ${T} (the TARGET) only — it stays in ${O}.`,
+            `Keep everything else in ${T} exactly as written: same language, same wording, same order and formatting, same macros. Do not rewrite, translate, summarize or add anything.`,
+            `If a ${T} sentence mixes duplicated and unique information, keep the unique part with the smallest possible edit.`,
+            `If ${T} repeats a trait but adds something ${O} does not have (a concrete behaviour, a directorial cue, a sample line, a trigger, a nuance), that addition is NOT a duplicate: keep it.`,
+            'Leave headings and labels in place unless everything under them was removed.',
+            botTypeGuide(cd),
+            caehGuide(cd),
+            'Output format (no markdown fences):',
+            '<cleaned>',
+            `the full new ${T} text`,
+            '</cleaned>',
+            '<removed>',
+            `- one line per removed item: the removed text in quotes, then where it already is in ${O} (explanation in Korean)`,
+            '</removed>',
+        ].filter(Boolean).join('\n');
+        const prompt = `[${O} — keep as is, reference only]\n${otherText}\n\n[${T} — TARGET to clean]\n${targetText}`;
+        const inTok = await countTokens(targetText);
+        const raw = await withTimer('🧹 겹치는 내용 찾는 중…', requestTagged({ system, prompt, maxTokens: Math.round(inTok * 2) + 2500, lastTag: 'cleaned', label: '🧹 중복 정리' }));
+        const cleaned = pickTag(raw, 'cleaned');
+        if (!cleaned) throw new Error('결과가 비어 있어요');
+        dedupState = {
+            char: char.avatar, side, targetText, otherText, rows: dedupState?.char === char.avatar && dedupState.side.target === side.target ? dedupState.rows : [],
+            ai: { cleaned, removed: tagLines(raw, 'removed'), before: inTok, after: await countTokens(cleaned) }, time: Date.now(),
+        };
+        renderDedup();
+        setStatus(`✅ 중복 정리 완료 — ${T} ${inTok.toLocaleString()} → ${dedupState.ai.after.toLocaleString()} 토큰`);
+        scrollPanelTo($id('dedup_ai_view'));
+    } catch (e) {
+        console.error(LOG, e);
+        setStatus(`❌ 중복 정리 실패: ${e.message}`);
+        toastr.error(`중복 정리 실패: ${e.message}`);
+    } finally {
+        running = false;
+        updateRunState();
+    }
+}
+
+const DEDUP_HOW = { same: '같음', similar: '거의 같음', contained: '이미 있음' };
+
+function renderDedup() {
+    const el = $id('dedup_result');
+    if (!el) return;
+    const d = dedupState;
+    if (!d || d.char !== getCurrentCharacter()?.avatar) { el.innerHTML = ''; return; }
+    const T = FIELD_LABEL[d.side.target]; const O = FIELD_LABEL[d.side.other];
+    const rows = d.rows.map((r, i) => `
+        <label class="bt-fixcheck bt-dedup-row">
+            <input type="checkbox" class="bt-dedup-check" value="${i}" ${r.how !== 'similar' || r.score >= 0.85 ? 'checked' : ''}>
+            <span class="bt-checkmark" aria-hidden="true">${ico('check')}</span>
+            <span class="bt-dedup-body">
+                <span class="bt-dedup-head"><span class="bt-tag bt-dedup-${r.how}">${DEDUP_HOW[r.how]}</span><b>${escapeHtml(r.text)}</b></span>
+                ${r.match ? `<small>${escapeHtml(O)}: ${escapeHtml(truncate(r.match, 160))}</small>` : `<small>${escapeHtml(O)} 문장 안에 이미 있는 단어예요</small>`}
+            </span>
+        </label>`).join('');
+    const ai = d.ai;
+    el.innerHTML = `
+        ${d.rows.length || !ai ? `<section class="bt-card">
+            ${cardHead('Same text', `${escapeHtml(T)}에서 지울 문장`, d.rows.length ? `체크한 것만 ${escapeHtml(T)}에서 지워요. ${escapeHtml(O)}에는 그대로 남아요.` : '똑같거나 거의 같은 문장은 없어요. 표현만 다르게 겹치는 내용은 AI로 찾아보세요.')}
+            ${rows ? `<div class="bt-stack bt-dedup-list">${rows}</div>
+            <div class="bt-actions bt-actions-end"><button type="button" id="bt_dedup_apply" class="bt-btn bt-btn-primary">${ico('broom')}<span>체크한 것 지우기</span></button></div>` : ''}
+        </section>` : ''}
+        <div id="bt_dedup_ai_view">${ai ? `<section class="bt-card">
+            <div class="bt-diet-head"><h4>${ico('wand-magic-sparkles')} AI 중복 정리 · ${escapeHtml(T)}</h4><span class="bt-diet-tok">${ai.before.toLocaleString()} → <b>${ai.after.toLocaleString()}</b> <span class="bt-delta ${ai.after < ai.before ? 'up' : ''}">−${Math.max(0, ai.before - ai.after)}</span></span></div>
+            ${ai.removed.length ? `<div class="bt-diet-removed"><span>지운 내용 (${escapeHtml(O)}에 이미 있음)</span>${renderList(ai.removed)}</div>` : '<p class="bt-note">겹치는 내용이 없었어요.</p>'}
+            <details class="bt-disclosure bt-disclosure-sm"><summary><span>원래 ${escapeHtml(T)} 보기</span>${ico('chevron-down')}</summary><pre class="bt-paste">${escapeHtml(d.targetText)}</pre></details>
+            <pre class="bt-paste bt-diet-out">${escapeHtml(ai.cleaned)}</pre>
+            <div class="bt-actions bt-actions-end">
+                <button type="button" id="bt_dedup_ai_copy" class="bt-btn bt-btn-sm">${ico('copy')}<span>복사</span></button>
+                <button type="button" id="bt_dedup_ai_apply" class="bt-btn bt-btn-sm bt-btn-primary">${ico('file-import')}<span>적용</span></button>
+            </div>
+        </section>` : ''}</div>`;
+    $id('dedup_apply')?.addEventListener('click', async () => {
+        const picked = [...el.querySelectorAll('.bt-dedup-check:checked')].map(c => d.rows[Number(c.value)]).filter(Boolean);
+        if (!picked.length) { toastr.warning('지울 문장을 골라주세요'); return; }
+        const cur = rawCardValue(getCurrentCharacter(), d.side.target);
+        if (cur !== d.targetText) { toastr.warning(`${T} 칸이 그사이 바뀌었어요. 다시 찾아주세요.`); return; }
+        const next = removeSpans(cur, picked);
+        const ok = await applyReplace({ kind: 'field', field: d.side.target, label: T }, next, { tag: '중복 정리', note: `${picked.length}개를 지웠어요. ${O}에는 그대로 남아요.` });
+        if (ok) { runDoctorLocal(true); refreshDietList(); runDedupFind(); }
+    });
+    $id('dedup_ai_copy')?.addEventListener('click', () => copyText(ai?.cleaned || ''));
+    $id('dedup_ai_apply')?.addEventListener('click', async () => {
+        const ok = await applyReplace({ kind: 'field', field: d.side.target, label: T }, ai.cleaned, { tag: '중복 정리', note: `${O}와 겹치는 내용을 뺐어요.` });
+        if (ok) { runDoctorLocal(true); refreshDietList(); dedupState = null; renderDedup(); }
+    });
+}
+
+function bindDedup() {
+    $id('dedup_find').addEventListener('click', () => { if (!running) runDedupFind(); });
+    $id('dedup_ai').addEventListener('click', runDedupAi);
+    $id('dedup_side').addEventListener('change', () => { dedupState = null; renderDedup(); });
 }
 
 
