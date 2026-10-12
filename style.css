@@ -1364,3 +1364,12 @@
 #bt_panel .bt-dedup-same { background: color-mix(in srgb, var(--bt-bad) 14%, transparent); color: var(--bt-bad); }
 #bt_panel .bt-dedup-similar { background: color-mix(in srgb, var(--bt-warn) 14%, transparent); color: var(--bt-warn); }
 #bt_panel .bt-dedup-contained { background: var(--bt-surface-3); color: var(--bt-muted); }
+
+/* ---------- v3.0: old chats keep the old card ---------- */
+#bt_panel .bt-legacy-status { margin-bottom: 12px; }
+#bt_panel .bt-legacy-pill { display: flex; align-items: flex-start; gap: 8px; padding: 9px 12px; border-radius: 11px; font-size: 12.5px; line-height: 1.55; background: var(--bt-surface-2); border: 1px solid var(--bt-line); color: var(--bt-muted); }
+#bt_panel .bt-legacy-pill .fa-solid { margin-top: 3px; }
+#bt_panel .bt-legacy-pill.on { color: var(--bt-fg); background: color-mix(in srgb, var(--bt-accent) 10%, transparent); border-color: color-mix(in srgb, var(--bt-accent) 35%, transparent); }
+#bt_panel .bt-legacy-pill.on .fa-solid { color: var(--bt-accent); }
+#bt_panel #bt_legacy_card .bt-switches { margin-top: 12px; }
+#bt_panel #bt_legacy_preview { max-height: 260px; overflow-y: auto; }

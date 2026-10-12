@@ -41,6 +41,8 @@ const defaultSettings = Object.freeze({
     testPromptVoice: true,  // also use the test preset/profile for voice sample lines
     autoRerollSec: 180,     // re-send a request automatically when it takes longer than this (0 = off)
     autoRerollMax: 1,       // how many automatic re-sends per request
+    legacyAuto: true,       // chats started before a card edit keep the earlier characterization
+    legacyMode: 'changed',  // changed = earlier text of changed fields | diff = AI summary of differences
     pasteKeepLines: true,   // spoken lines inside quotes keep the character's chat language
     funReferenceSamples: '', // short quotes from the reference bot (format examples for restyle)
     accent: 'champagne',
@@ -94,7 +96,7 @@ function charKey(char) {
     return STORE_PREFIX + (char?.avatar || char?.name || 'unknown');
 }
 
-const emptyCharData = () => ({ urls: [], refText: '', authorNote: '', history: [], names: null, voiceProfile: null, voiceResults: {}, doctor: null, runs: [], abBaselineId: null, abLast: null, applyLog: [], funProfile: null, caehBase: '', caehCaution: '', anchorText: '', anchorTime: 0, anchorBind: false, contLast: null, sourceLang: 'auto', botKind: 'auto', botKindDetected: 'single', rosterText: '', voiceMember: '', memberVoice: {} });
+const emptyCharData = () => ({ urls: [], refText: '', authorNote: '', history: [], names: null, voiceProfile: null, voiceResults: {}, doctor: null, runs: [], abBaselineId: null, abLast: null, applyLog: [], funProfile: null, caehBase: '', caehCaution: '', anchorText: '', anchorTime: 0, anchorBind: false, contLast: null, sourceLang: 'auto', botKind: 'single', rosterText: '', voiceMember: '', memberVoice: {} });
 
 async function loadCharData(char) {
     if (!char) return emptyCharData();
@@ -1460,6 +1462,7 @@ ${botKindCardHtml()}
         </div>
         <p class="bt-note"><b>작가 노트에 넣기</b>: 지금 열린 채팅의 Author's Note(채팅마다 따로 저장)에만 들어가요. 카드를 새 성격으로 고쳐도 이 채팅은 예전 말투·거리감으로 이어지고, 새 채팅은 고친 카드대로 시작해요.</p>
       </section>
+${legacyCardHtml()}
     </div>
 
     <div class="bt-page" data-page="test" style="display:none">
@@ -1735,6 +1738,7 @@ function bindPanel() {
     $id('reftext').addEventListener('input', updateRefCount);
     $id('savesrc').addEventListener('click', () => saveSourceFromUI(true));
     bindCaehUI();
+    bindLegacyUI();
     bindBotKindUI();
     bindVoiceMember();
     bindKindDoctor();
@@ -2093,8 +2097,7 @@ async function refreshPanelForChar() {
     if (!$id('panel')) return;
     const char = getCurrentCharacter();
     $id('charname').textContent = char ? char.name : '캐릭터 없음';
-    let data = await loadCharData(char);
-    data = await refreshBotKind(char, data);
+    const data = await loadCharData(char);
     renderBotKindUI(data);
     $id('urls').value = (data.urls || []).join('\n');
     $id('reftext').value = data.refText || '';
@@ -4103,6 +4106,15 @@ async function logApply(char, item) {
     await saveCharData(char, cd);
     renderApplyLog(cd);
     renderContPick(cd);
+    if (item.kind === 'field' && LEGACY_FIELDS.some(([k]) => k === item.field)) {
+        // remember the card before and after this edit so old chats can keep the earlier version
+        try {
+            const now = cardFieldsNow(char);
+            let c2 = await recordCardVersion(char, await loadCharData(char), { fields: { ...now, [item.field]: String(item.before ?? '') }, time: Date.now() - 1, label: '수정 전' });
+            c2 = await recordCardVersion(char, c2, { fields: now, time: Date.now(), label: '수정 후' });
+            await legacyOnChatChanged();
+        } catch (e) { console.warn(LOG, 'version record failed', e); }
+    }
 }
 
 /** Opens an editable preview; the user confirms before anything is written. */
@@ -5517,7 +5529,7 @@ async function runContinuity() {
     const context = msgs.slice(Math.max(0, last - 15), last + 1);
     const history = context.map(m => `${m.is_user ? userName : charName}: ${truncate(m.mes, 1500)}`).join('\n\n');
     const actual = msgs.slice(last + 1).find(m => !m.is_user)?.mes || '';
-    const chatNote = currentChatNote() || ''; // the per-chat Author's Note is part of real play
+    const chatNote = [currentChatNote() || '', legacyMeta()?.on ? legacyMeta().text : ''].filter(Boolean).join('\n\n'); // per-chat note + old-card injection are part of real play
 
     // current card vs card with the picked edits reverted (newest-first log → oldest "before" wins)
     const after = Object.fromEntries(CONT_FIELDS.map(k => [k, rawCardValue(char, k)]));
@@ -6285,39 +6297,15 @@ function bindLoreAiViews(d) {
 // ---------------------------------------------------------------------------
 
 const BOT_KINDS = {
-    auto: { label: '자동 감지', short: '자동' },
     single: { label: '1인 캐릭터봇', short: '1인봇' },
     multi: { label: '다인봇 (한 카드에 여러 캐릭터)', short: '다인봇' },
     sim: { label: '시뮬레이션봇 (세계·NPC·상황 진행)', short: '시뮬봇' },
     rpg: { label: 'RPG봇 (스탯·전투·아이템·퀘스트)', short: 'RPG봇' },
 };
 
-/** Guesses the bot type from the card text. Returns { kind, reasons }. */
-function detectBotKind(char) {
-    const text = `${collectCard(char)}\n${char?.first_mes || ''}`;
-    const count = (re) => (text.match(re) || []).length;
-    const rpg = count(/\b(?:HP|MP|SP|EXP|XP|Lv\.?\s?\d|level|stats?|inventory|items?|quests?|dungeon|combat|battle|dice|d20|d6|gold|skill ?tree|equipment|loot)\b|레벨|스탯|능력치|인벤토리|아이템|퀘스트|던전|전투|주사위|골드|장비|경험치|체력\s*[:：]|마나|스킬/gi);
-    const sim = count(/\b(?:simulation|simulator|NPCs?|system|status (?:window|panel)|affection|turn|day \d|calendar|event|random(?:ly)?|generate)\b|시뮬|NPC|시스템|상태창|호감도|날짜|시간대|이벤트|랜덤|무작위|생성해|세계관|턴제|일과/gi);
-    const statusBlock = /```[\s\S]{0,40}(?:status|상태|STAT)|<(?:div|details|status)[^>]*>|\[\s*(?:상태|STATUS|Status)\s*\]/i.test(text);
-    const nameFields = count(/^\s*(?:[-*]\s*)?(?:name|이름|名前)\s*[:：]/gim);
-    const sectionHeads = count(/^\s*(?:#{1,4}\s*|\[|【|<)\s*[^\n\]】>]{1,24}\s*(?:\]|】|>)?\s*$/gm);
-    const multiWords = count(/\bnarrator\b|나레이터|내레이터|multiple characters|characters\s*[:：]|등장인물|캐릭터 목록|인물 소개|NPC 목록/gi);
-    const reasons = [];
-    if (rpg >= 5) reasons.push(`게임 용어 ${rpg}개`);
-    if (sim >= 4) reasons.push(`시뮬레이션 용어 ${sim}개`);
-    if (statusBlock) reasons.push('상태창 형식');
-    if (nameFields >= 2) reasons.push(`이름 칸 ${nameFields}개`);
-    if (multiWords) reasons.push('등장인물·나레이터 표현');
-    let kind = 'single';
-    if (rpg >= 5 && rpg >= sim * 0.8) kind = 'rpg';
-    else if (sim >= 4 || (statusBlock && sim >= 2)) kind = 'sim';
-    else if (nameFields >= 2 || multiWords >= 1 || (sectionHeads >= 8 && nameFields >= 1)) kind = 'multi';
-    return { kind, reasons };
-}
-
+/** The bot type is always chosen by the creator (no automatic guessing). */
 function botKind(cd) {
-    const sel = cd?.botKind || 'auto';
-    return sel !== 'auto' && BOT_KINDS[sel] ? sel : (cd?.botKindDetected || 'single');
+    return BOT_KINDS[cd?.botKind] ? cd.botKind : 'single';
 }
 
 /** Roster lines: "이름 | 원어 이름 | 메모" */
@@ -6350,8 +6338,8 @@ function botTypeGuide(cd) {
 function botKindCardHtml() {
     return `
       <section class="bt-card" id="bt_kind_card">
-        ${cardHead('Bot type', '봇 종류', '다인봇·시뮬레이션봇·RPG봇도 검사할 수 있어요. 고르면 테스트 메시지, 평가 기준, 말투 검증, 진단이 그 봇에 맞게 바뀌어요.')}
-        ${field('봇 종류', `<select id="bt_botkind" class="bt-input">${Object.entries(BOT_KINDS).map(([k, v]) => `<option value="${k}">${v.label}</option>`).join('')}</select>`, '<span id="bt_botkind_hint"></span>')}
+        ${cardHead('Bot type', '봇 종류', '기본은 1인 캐릭터봇이에요. 다인봇·시뮬레이션봇·RPG봇이면 직접 골라 주세요. 고르면 테스트 메시지, 평가 기준, 말투 검증, 진단이 그 봇에 맞게 바뀌어요.')}
+        ${field('봇 종류', `<select id="bt_botkind" class="bt-input">${Object.entries(BOT_KINDS).map(([k, v]) => `<option value="${k}">${v.label}</option>`).join('')}</select>`, '직접 골라요')}
         <div id="bt_roster_box">
           ${field('등장인물 · 주요 NPC', '<textarea id="bt_roster" class="bt-input" rows="4" placeholder="한 줄에 한 명: 이름 | 원어 이름 | 메모&#10;무라사키바라 아츠시 | 紫原敦 | 요센 센터&#10;히무로 타츠야 | 氷室辰也 | 요센 가드"></textarea>', '한 줄에 한 명')}
           <div class="bt-actions">
@@ -6365,11 +6353,8 @@ function botKindCardHtml() {
 function renderBotKindUI(cd) {
     const sel = $id('botkind');
     if (!sel) return;
-    sel.value = BOT_KINDS[cd?.botKind] ? cd.botKind : 'auto';
     const kind = botKind(cd);
-    const hint = $id('botkind_hint');
-    if (hint) hint.textContent = (cd?.botKind || 'auto') === 'auto' ? `감지: ${BOT_KINDS[kind].short}` : '';
-    sel.title = (cd?.botKindReasons || []).join(', ');
+    sel.value = kind;
     const box = $id('roster_box');
     if (box) box.style.display = kind === 'single' ? 'none' : '';
     $id('roster').value = cd?.rosterText || '';
@@ -6382,18 +6367,6 @@ function renderBotKindUI(cd) {
         const st = $id('docbtn_status');
         if (st) st.style.display = kind === 'sim' || kind === 'rpg' ? '' : 'none';
     }
-}
-
-/** Runs detection when the card changes; stores the result so prompts can use it without the card. */
-async function refreshBotKind(char, cd) {
-    if (!char) return cd;
-    const { kind, reasons } = detectBotKind(char);
-    if (cd.botKindDetected !== kind || JSON.stringify(cd.botKindReasons || []) !== JSON.stringify(reasons)) {
-        cd.botKindDetected = kind;
-        cd.botKindReasons = reasons;
-        await saveCharData(char, cd);
-    }
-    return cd;
 }
 
 async function grabRoster() {
@@ -6988,6 +6961,291 @@ function bindDedup() {
 
 
 // ---------------------------------------------------------------------------
+// Keep old chats on the old characterization (기존 채팅 이어가기)
+//
+// The card is shared by every chat, so editing it changes old chats too. Bot Tester remembers
+// each version of the card it has seen. A chat that started before the card changed gets a
+// per-chat injection (/inject — stored inside that chat file only) describing the earlier
+// version, so it keeps its old feel while new chats use the revised card.
+// ---------------------------------------------------------------------------
+
+const LEGACY_FIELDS = [
+    ['description', 'Description'],
+    ['personality', 'Personality'],
+    ['scenario', 'Scenario'],
+    ['mes_example', 'Example dialogue'],
+    ['char_note', "Character's note"],
+    ['system_prompt', 'System prompt'],
+    ['post_history', 'Post-history instructions'],
+];
+const LEGACY_INJECT_ID = 'bt_legacy';
+const LEGACY_MODES = {
+    changed: { label: '바뀐 칸만 예전 내용으로 (AI 없이)' },
+    diff: { label: '달라진 점만 AI로 요약 (토큰 가장 적음)' },
+};
+
+function cardFieldsNow(char) {
+    return Object.fromEntries(LEGACY_FIELDS.map(([k]) => [k, String(rawCardValue(char, k) || '')]));
+}
+
+function hashText(t) {
+    let h = 2166136261;
+    const s = String(t);
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return (h >>> 0).toString(36);
+}
+
+function fieldsHash(f) {
+    return hashText(LEGACY_FIELDS.map(([k]) => (f[k] || '').trim()).join('\u0001'));
+}
+
+/** Records the current card as a version if it is new. Returns the (possibly updated) char data. */
+async function recordCardVersion(char, cd, { fields = null, time = Date.now(), label = '' } = {}) {
+    const f = fields || cardFieldsNow(char);
+    if (!LEGACY_FIELDS.some(([k]) => f[k].trim())) return cd;
+    const h = fieldsHash(f);
+    cd.cardVersions = cd.cardVersions || [];
+    if (cd.cardVersions.some(v => v.hash === h)) return cd;
+    const last = cd.cardVersions[cd.cardVersions.length - 1];
+    if (label === '수정 후' && last?.label === '수정 후' && time - last.time < 30 * 60e3) {
+        Object.assign(last, { hash: h, fields: f, time });
+        await saveCharData(char, cd);
+        return cd;
+    }
+    cd.cardVersions.push({ id: `v${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`, hash: h, time, fields: f, label });
+    cd.cardVersions.sort((a, b) => a.time - b.time);
+    if (cd.cardVersions.length > 8) cd.cardVersions = [cd.cardVersions[0], ...cd.cardVersions.slice(-7)];
+    await saveCharData(char, cd);
+    return cd;
+}
+
+function parseChatTime(v) {
+    if (v === undefined || v === null || v === '') return 0;
+    if (typeof v === 'number') return v > 1e12 ? v : v * 1000;
+    const s = String(v);
+    const m = s.match(/(\d{4})-(\d{1,2})-(\d{1,2})\s*@\s*(\d{1,2})h\s*(\d{1,2})m\s*(\d{1,2})s/);
+    if (m) return new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]).getTime();
+    const t = Date.parse(s.replace(/(\d)(am|pm)\b/i, '$1 $2'));
+    return Number.isFinite(t) ? t : 0;
+}
+
+/** When the open chat started (from its file name, else its first message). */
+function chatStartTime() {
+    const c = ctx();
+    const fromId = parseChatTime(String(c.getCurrentChatId?.() || ''));
+    if (fromId) return fromId;
+    const first = (c.chat || []).find(m => m && m.send_date);
+    return first ? parseChatTime(first.send_date) : 0;
+}
+
+/** The card version that was current when a chat started (latest version first seen before it). */
+function versionForStart(cd, start) {
+    const vs = cd.cardVersions || [];
+    if (!vs.length || !start) return null;
+    const before = vs.filter(v => v.time <= start);
+    return before.length ? before[before.length - 1] : vs[0];
+}
+
+function changedFields(oldF, newF) {
+    return LEGACY_FIELDS.filter(([k]) => (oldF[k] || '').trim() !== (newF[k] || '').trim());
+}
+
+function legacyHeader() {
+    return "This chat began before {{char}}'s character card was revised. In THIS chat, keep playing {{char}} the way the earlier version did — same voice, personality and relationship to {{user}}. Where the current card conflicts with the notes below, the notes win. New chats use the current card.";
+}
+
+function legacyChangedText(oldF, newF) {
+    const changed = changedFields(oldF, newF);
+    if (!changed.length) return '';
+    return [
+        `[Earlier version of {{char}} — this chat follows it]`,
+        legacyHeader(),
+        ...changed.filter(([k]) => (oldF[k] || '').trim()).map(([k, label]) => `### ${label} (earlier version)\n${oldF[k].trim()}`),
+        ...changed.filter(([k]) => !(oldF[k] || '').trim()).map(([, label]) => `### ${label}: did not exist in the earlier version; ignore the current one in this chat.`),
+    ].join('\n\n');
+}
+
+async function legacyDiffText(char, cd, oldF, newF) {
+    const changed = changedFields(oldF, newF);
+    if (!changed.length) return '';
+    const s = getSettings();
+    const system = [
+        "You write a compact continuity note for one ongoing roleplay chat. The character card was revised after this chat began; the chat must keep the EARLIER characterization.",
+        'Compare the earlier and current versions of the changed card fields. List only the differences that would change how {{char}} talks or behaves (voice, first person, how they address {{user}}, attitude, distance, traits, relationships, rules, setting facts). Ignore wording-only changes.',
+        'Write each point as a direct instruction describing the EARLIER version, e.g. "Speaks in casual drawl, not polite speech." Proper nouns stay as written; quoted dialogue stays in its original language.',
+        'Plain text, one point per line starting with "- ", at most 15 lines, English. No preamble.',
+    ].join('\n');
+    const prompt = changed.map(([k, label]) => `### ${label}\n[EARLIER]\n${truncate(oldF[k] || '(empty)', 5000)}\n[CURRENT]\n${truncate(newF[k] || '(empty)', 5000)}`).join('\n\n');
+    const out = stripReasoning(await callLLM({ system, prompt, profileId: s.evalProfile, maxTokens: 4000 })).replace(/^```[a-z]*\s*|```$/g, '').trim();
+    if (!out) throw new Error('결과가 비어 있어요');
+    return [`[Earlier version of {{char}} — this chat follows it]`, legacyHeader(), out].join('\n\n');
+}
+
+function escapeSlashArg(t) {
+    return String(t).replace(/\|/g, '\\|').replace(/\{:/g, '{\\:').replace(/:\}/g, ':\\}');
+}
+
+async function setLegacyInject(text) {
+    const c = ctx();
+    if (text) await c.executeSlashCommandsWithOptions(`/inject id=${LEGACY_INJECT_ID} position=chat depth=4 role=system ${escapeSlashArg(text)}`);
+    else await c.executeSlashCommandsWithOptions(`/flushinject ${LEGACY_INJECT_ID}`);
+}
+
+function legacyMeta() {
+    return ctx().chatMetadata?.bt_legacy || null;
+}
+
+async function saveLegacyMeta(v) {
+    const c = ctx();
+    if (!c.chatMetadata) return;
+    if (v) c.chatMetadata.bt_legacy = v; else delete c.chatMetadata.bt_legacy;
+    try { await c.saveMetadata?.(); } catch (e) { console.warn(LOG, 'saveMetadata failed', e); }
+}
+
+/** Locks the open chat to a card version (builds the injection text). */
+async function legacyLock(char, cd, version, { mode = getSettings().legacyMode || 'changed', auto = false } = {}) {
+    const now = cardFieldsNow(char);
+    let text = mode === 'diff' ? await legacyDiffText(char, cd, version.fields, now) : legacyChangedText(version.fields, now);
+    if (!text) { await legacyUnlock({ keepDecision: true, silent: true }); return null; }
+    await setLegacyInject(text);
+    const meta = { on: true, versionId: version.id, versionTime: version.time, mode, text, curHash: fieldsHash(now), auto, at: Date.now() };
+    await saveLegacyMeta(meta);
+    return meta;
+}
+
+async function legacyUnlock({ keepDecision = true, silent = false } = {}) {
+    await setLegacyInject('');
+    await saveLegacyMeta(keepDecision ? { on: false, at: Date.now() } : null);
+    if (!silent) toastr.info('이 채팅은 이제 지금 카드로 진행해요');
+}
+
+/** Runs on every chat change: remembers card versions and keeps old chats on their old version. */
+async function legacyOnChatChanged() {
+    const char = getCurrentCharacter();
+    if (!char) return;
+    try {
+        let cd = await loadCharData(char);
+        cd = await recordCardVersion(char, cd);
+        const s = getSettings();
+        const meta = legacyMeta();
+        const msgs = (ctx().chat || []).filter(m => m && !m.is_system);
+        if (meta?.on) {
+            // card changed again since the note was built → rebuild the AI-free text silently
+            const nowHash = fieldsHash(cardFieldsNow(char));
+            const v = (cd.cardVersions || []).find(x => x.id === meta.versionId);
+            if (v && meta.curHash !== nowHash && meta.mode !== 'diff') await legacyLock(char, cd, v, { mode: 'changed', auto: meta.auto });
+        } else if (!meta && s.legacyAuto !== false && msgs.length >= 3) {
+            const start = chatStartTime();
+            const v = versionForStart(cd, start);
+            const latest = (cd.cardVersions || []).slice(-1)[0];
+            if (v && latest && v.id !== latest.id) {
+                const m = await legacyLock(char, cd, v, { mode: 'changed', auto: true });
+                if (m) toastr.info('카드를 고치기 전에 시작한 채팅이라, 예전 캐해로 이어가요. 봇 테스터 원작 탭에서 끌 수 있어요.', '봇 테스터', { timeOut: 6000 });
+            }
+        }
+    } catch (e) {
+        console.warn(LOG, 'legacy check failed', e);
+    }
+    renderLegacyCard();
+}
+
+// --- UI ---
+
+function legacyCardHtml() {
+    return `
+      <section class="bt-card" id="bt_legacy_card">
+        ${cardHead('Old chats', '기존 채팅 이어가기', '카드를 고쳐도, 고치기 전에 시작한 채팅은 예전 캐해로 이어가게 해요. 그 채팅 파일 안에만 예전 버전 정보를 넣어서(/inject), 새 채팅은 고친 카드대로 시작해요.')}
+        <div id="bt_legacy_status" class="bt-legacy-status"></div>
+        ${field('이 채팅에 쓸 예전 카드', '<select id="bt_legacy_ver" class="bt-input"></select>', '봇 테스터가 본 카드 버전')}
+        ${field('넣는 방식', `<select id="bt_legacy_mode" class="bt-input">${Object.entries(LEGACY_MODES).map(([k, v]) => `<option value="${k}">${v.label}</option>`).join('')}</select>`)}
+        <div class="bt-actions bt-actions-split">
+          <button type="button" id="bt_legacy_lock" class="bt-btn bt-btn-primary">${ico('clock-rotate-left')}<span>이 채팅은 예전 캐해로</span></button>
+          <button type="button" id="bt_legacy_unlock" class="bt-btn">${ico('arrow-right')}<span>이 채팅도 지금 카드로</span></button>
+        </div>
+        <div class="bt-switches">
+          ${toggle('legacyauto', '카드 고치기 전에 시작한 채팅은 자동으로 예전 캐해 유지', '채팅을 열 때 확인해서, 바뀐 칸의 예전 내용을 그 채팅에만 넣어요')}
+        </div>
+        <div class="bt-actions">
+          <button type="button" id="bt_legacy_snap" class="bt-btn bt-btn-sm">${ico('camera')}<span>지금 카드를 버전으로 저장</span></button>
+        </div>
+        <p class="bt-note">봇 테스터가 카드를 처음 본 순간부터 버전을 기억해요. SillyTavern 편집 화면에서 직접 고칠 거면 고치기 전에 <b>지금 카드를 버전으로 저장</b>을 눌러 두면 확실해요. 봇 테스터로 적용한 수정은 자동으로 저장돼요.</p>
+        <details class="bt-disclosure bt-disclosure-sm" id="bt_legacy_preview_box"><summary><span>이 채팅에 들어간 내용 보기</span>${ico('chevron-down')}</summary><pre class="bt-paste" id="bt_legacy_preview"></pre></details>
+      </section>`;
+}
+
+async function renderLegacyCard() {
+    const el = $id('legacy_status');
+    if (!el) return;
+    const char = getCurrentCharacter();
+    if (!char) { el.innerHTML = '<p class="bt-note">캐릭터 채팅을 열어주세요.</p>'; return; }
+    const cd = await loadCharData(char);
+    const vs = cd.cardVersions || [];
+    const meta = legacyMeta();
+    const start = chatStartTime();
+    const sel = $id('legacy_ver');
+    if (sel) {
+        const latestId = vs.slice(-1)[0]?.id;
+        sel.innerHTML = vs.length ? vs.slice().reverse().map(v => `<option value="${v.id}">${escapeHtml(new Date(v.time).toLocaleString())}${v.id === latestId ? ' · 지금 카드' : ''}${v.label ? ` · ${escapeHtml(v.label)}` : ''}</option>`).join('') : '<option value="">저장된 버전 없음</option>';
+        const auto = versionForStart(cd, start);
+        sel.value = meta?.versionId || auto?.id || vs[0]?.id || '';
+    }
+    const mode = $id('legacy_mode');
+    if (mode) mode.value = meta?.mode || getSettings().legacyMode || 'changed';
+    const startTxt = start ? new Date(start).toLocaleString() : '알 수 없음';
+    let html;
+    if (meta?.on) {
+        const tok = await countTokens(meta.text || '').catch(() => 0);
+        html = `<div class="bt-legacy-pill on">${ico('clock-rotate-left')}<span>이 채팅은 <b>${escapeHtml(new Date(meta.versionTime).toLocaleString())}</b> 버전 캐해로 이어가는 중${tok ? ` · 매 턴 ${tok.toLocaleString()} 토큰` : ''}${meta.auto ? ' · 자동' : ''}</span></div>`;
+        if (tok > 900) html += '<p class="bt-note">예전 내용이 길어요. 넣는 방식을 <b>달라진 점만 AI로 요약</b>으로 바꾸면 토큰이 크게 줄어요.</p>';
+    } else {
+        const v = versionForStart(cd, start);
+        const latest = vs.slice(-1)[0];
+        const older = v && latest && v.id !== latest.id;
+        html = `<div class="bt-legacy-pill">${ico('arrow-right')}<span>이 채팅은 지금 카드로 진행 중 · 시작 ${escapeHtml(startTxt)}${older ? ' · <b>카드 수정 전에 시작한 채팅</b>' : ''}</span></div>`;
+    }
+    el.innerHTML = html;
+    const pv = $id('legacy_preview');
+    const box = $id('legacy_preview_box');
+    if (pv) pv.textContent = meta?.on ? meta.text : '';
+    if (box) box.style.display = meta?.on ? '' : 'none';
+}
+
+function bindLegacyUI() {
+    const s = getSettings();
+    const auto = $id('legacyauto');
+    auto.checked = s.legacyAuto !== false;
+    auto.addEventListener('change', () => { s.legacyAuto = auto.checked; saveSettings(); });
+    $id('legacy_mode').addEventListener('change', () => { s.legacyMode = $id('legacy_mode').value; saveSettings(); });
+    $id('legacy_lock').addEventListener('click', async () => {
+        if (running) return;
+        const char = getCurrentCharacter();
+        if (!char) { toastr.error('캐릭터 채팅을 먼저 열어주세요'); return; }
+        const cd = await loadCharData(char);
+        const v = (cd.cardVersions || []).find(x => x.id === $id('legacy_ver').value);
+        if (!v) { toastr.warning('저장된 예전 버전이 없어요'); return; }
+        const mode = $id('legacy_mode').value;
+        running = true; updateRunState();
+        try {
+            const m = await withTimer(mode === 'diff' ? '🕰 예전 카드와 달라진 점 정리 중…' : '🕰 이 채팅에 예전 캐해 넣는 중…', legacyLock(char, cd, v, { mode }));
+            if (m) { setStatus('✅ 이 채팅은 예전 캐해로 이어가요 — 새 채팅은 지금 카드대로'); toastr.success('이 채팅에만 예전 캐해를 넣었어요'); }
+            else toastr.info('고른 버전이 지금 카드와 같아서 넣을 게 없어요');
+        } catch (e) {
+            setStatus(`❌ 실패: ${e.message}`); toastr.error(`실패: ${e.message}`);
+        } finally { running = false; updateRunState(); renderLegacyCard(); }
+    });
+    $id('legacy_unlock').addEventListener('click', async () => { await legacyUnlock(); renderLegacyCard(); });
+    $id('legacy_snap').addEventListener('click', async () => {
+        const char = getCurrentCharacter();
+        if (!char) return;
+        const before = (await loadCharData(char)).cardVersions?.length || 0;
+        const cd = await recordCardVersion(char, await loadCharData(char), { label: '직접 저장' });
+        toastr[(cd.cardVersions?.length || 0) > before ? 'success' : 'info']((cd.cardVersions?.length || 0) > before ? '지금 카드를 버전으로 저장했어요' : '지금 카드는 이미 저장돼 있어요');
+        renderLegacyCard();
+    });
+}
+
+
+// ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
 
@@ -7002,9 +7260,11 @@ function bindDedup() {
     };
 
     if (document.getElementById('extensionsMenu')) setup();
+    eventSource.on(event_types.APP_READY, () => setTimeout(legacyOnChatChanged, 1500));
     eventSource.on(event_types.APP_READY, setup);
     eventSource.on(event_types.CHAT_CHANGED, () => {
         renderAnchorNote();
+        legacyOnChatChanged();
         if ($id('panel') && $id('panel').style.display !== 'none') refreshPanelForChar();
     });
 
