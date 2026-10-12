@@ -2098,6 +2098,7 @@ async function refreshPanelForChar() {
     const char = getCurrentCharacter();
     $id('charname').textContent = char ? char.name : '캐릭터 없음';
     const data = await loadCharData(char);
+    resolveCharWorld(char).catch(() => {});
     renderBotKindUI(data);
     $id('urls').value = (data.urls || []).join('\n');
     $id('reftext').value = data.refText || '';
@@ -3479,12 +3480,75 @@ async function countTokens(text) {
 }
 
 /** Lorebook entries attached to the character: linked world file first, else the embedded book. */
+// ---------- lorebook access with fallbacks (works on older / newer SillyTavern) ----------
+
+const worldNameCache = {};
+
+/** The character's primary lorebook name, from every place SillyTavern may keep it. */
+function charWorldName(char) {
+    if (!char) return '';
+    return char?.data?.extensions?.world
+        || char?.extensions?.world
+        || (getCurrentCharacter()?.avatar === char.avatar ? (document.querySelector('#character_world')?.value || '') : '')
+        || worldNameCache[char.avatar]
+        || '';
+}
+
+/** Like charWorldName, but asks the server for the full character when the local copy is incomplete. */
+async function resolveCharWorld(char) {
+    const quick = charWorldName(char);
+    if (quick || !char?.avatar) return quick;
+    try {
+        const res = await fetch('/api/characters/get', { method: 'POST', headers: ctx().getRequestHeaders(), body: JSON.stringify({ avatar_url: char.avatar }) });
+        if (res.ok) {
+            const full = await res.json();
+            const name = full?.data?.extensions?.world || '';
+            worldNameCache[char.avatar] = name;
+            return name;
+        }
+    } catch (e) { console.warn(LOG, 'character fetch failed', e); }
+    return '';
+}
+
+async function loadWorld(name) {
+    const c = ctx();
+    if (typeof c.loadWorldInfo === 'function') {
+        const d = await c.loadWorldInfo(name);
+        if (d) return d;
+    }
+    const wi = await worldInfoModule();
+    if (typeof wi?.loadWorldInfo === 'function') {
+        const d = await wi.loadWorldInfo(name);
+        if (d) return d;
+    }
+    const res = await fetch('/api/worldinfo/get', { method: 'POST', headers: c.getRequestHeaders(), body: JSON.stringify({ name }) });
+    if (!res.ok) throw new Error(`로어북 “${name}”을 불러오지 못했어요 (${res.status})`);
+    return await res.json();
+}
+
+async function saveWorld(name, data) {
+    const c = ctx();
+    if (typeof c.saveWorldInfo === 'function') return c.saveWorldInfo(name, data, true);
+    const wi = await worldInfoModule();
+    if (typeof wi?.saveWorldInfo === 'function') return wi.saveWorldInfo(name, data, true);
+    const res = await fetch('/api/worldinfo/edit', { method: 'POST', headers: c.getRequestHeaders(), body: JSON.stringify({ name, data }) });
+    if (!res.ok) throw new Error(`로어북 저장 실패 (${res.status})`);
+}
+
+/** Every lorebook name SillyTavern knows (for the manual picker). */
+async function allWorldNames() {
+    const wi = await worldInfoModule();
+    const fromModule = Array.isArray(wi?.world_names) ? wi.world_names : [];
+    const fromDom = [...document.querySelectorAll('#world_editor_select option, #world_info option')].map(o => (o.textContent || '').trim()).filter(Boolean);
+    return [...new Set([...fromModule, ...fromDom])].filter(n => n && !/^-+|^\s*$/.test(n)).sort((a, b) => a.localeCompare(b));
+}
+
 async function getLoreEntries(char) {
     const out = [];
-    const worldName = char?.data?.extensions?.world;
-    if (worldName && typeof ctx().loadWorldInfo === 'function') {
+    const worldName = await resolveCharWorld(char);
+    if (worldName) {
         try {
-            const data = await ctx().loadWorldInfo(worldName);
+            const data = await loadWorld(worldName);
             for (const e of Object.values(data?.entries || {})) {
                 out.push({
                     name: e.comment || (e.key || []).slice(0, 3).join(', ') || `#${e.uid}`,
@@ -4067,7 +4131,7 @@ function writeField(key, value) {
 
 async function addLoreEntry(worldName, { comment, keys, content }) {
     const c = ctx();
-    const data = await c.loadWorldInfo(worldName);
+    const data = await loadWorld(worldName);
     if (!data || typeof data.entries !== 'object') throw new Error('로어북을 불러오지 못했어요');
     let entry = null;
     try {
@@ -4085,17 +4149,17 @@ async function addLoreEntry(worldName, { comment, keys, content }) {
     entry.content = content;
     entry.constant = false;
     entry.disable = false;
-    await c.saveWorldInfo(worldName, data, true);
+    await saveWorld(worldName, data);
     try { c.reloadWorldInfoEditor?.(worldName, true); } catch { /* optional */ }
     return entry.uid;
 }
 
 async function removeLoreEntry(worldName, uid) {
     const c = ctx();
-    const data = await c.loadWorldInfo(worldName);
+    const data = await loadWorld(worldName);
     if (!data?.entries?.[uid]) return false;
     delete data.entries[uid];
-    await c.saveWorldInfo(worldName, data, true);
+    await saveWorld(worldName, data);
     try { c.reloadWorldInfoEditor?.(worldName, true); } catch { /* optional */ }
     return true;
 }
@@ -4126,7 +4190,7 @@ async function openApplyDialog({ field, text, reason = '' }) {
     if (!c.callGenericPopup) { copyText(text); return; }
 
     let key = normalizeField(field);
-    const worldName = char?.data?.extensions?.world || '';
+    const worldName = charWorldName(char);
     const wrap = document.createElement('div');
     wrap.className = 'bt-apply-dialog';
     wrap.innerHTML = `
@@ -4203,15 +4267,15 @@ async function undoApply(id) {
     const c = ctx();
     try {
         if (item.kind === 'lore-edit') {
-            const data = await c.loadWorldInfo(item.world);
+            const data = await loadWorld(item.world);
             const e = data?.entries?.[item.uid];
             if (!e) { toastr.info('그 로어북 항목은 이미 없어요'); }
-            else { e.content = item.before ?? ''; await c.saveWorldInfo(item.world, data, true); try { c.reloadWorldInfoEditor?.(item.world, true); } catch { /* optional */ } toastr.success('로어북 항목을 요약 전으로 되돌렸어요'); }
+            else { e.content = item.before ?? ''; await saveWorld(item.world, data); try { c.reloadWorldInfoEditor?.(item.world, true); } catch { /* optional */ } toastr.success('로어북 항목을 요약 전으로 되돌렸어요'); }
         } else if (item.kind === 'lore-keys') {
-            const data = await c.loadWorldInfo(item.world);
+            const data = await loadWorld(item.world);
             const e = data?.entries?.[item.uid];
             if (!e) { toastr.info('그 로어북 항목은 이미 없어요'); }
-            else { e.key = [...(item.before || [])]; await c.saveWorldInfo(item.world, data, true); try { c.reloadWorldInfoEditor?.(item.world, true); } catch { /* optional */ } toastr.success('로어북 키워드를 되돌렸어요'); }
+            else { e.key = [...(item.before || [])]; await saveWorld(item.world, data); try { c.reloadWorldInfoEditor?.(item.world, true); } catch { /* optional */ } toastr.success('로어북 키워드를 되돌렸어요'); }
         } else if (item.kind === 'lore') {
             const ok = await removeLoreEntry(item.world, item.uid);
             toastr[ok ? 'success' : 'info'](ok ? '추가했던 로어북 항목을 지웠어요' : '그 로어북 항목은 이미 없어요');
@@ -4440,10 +4504,10 @@ async function dietTargets(char) {
         if (!text.trim()) continue;
         out.push({ id: `f:${key}`, kind: 'field', field: key, label, text, tokens: await countTokens(text), cost: fieldCost(key) });
     }
-    const worldName = char?.data?.extensions?.world;
-    if (worldName && typeof ctx().loadWorldInfo === 'function') {
+    const worldName = await resolveCharWorld(char);
+    if (worldName) {
         try {
-            const data = await ctx().loadWorldInfo(worldName);
+            const data = await loadWorld(worldName);
             for (const e of Object.values(data?.entries || {})) {
                 if (e.disable || !String(e.content || '').trim()) continue;
                 out.push({
@@ -4636,12 +4700,12 @@ async function applyReplace(item, newText, { tag = '요약', note = '' } = {}) {
     }
     try {
         if (item.kind === 'lore') {
-            const data = await c.loadWorldInfo(item.world);
+            const data = await loadWorld(item.world);
             const e = data?.entries?.[item.uid];
             if (!e) throw new Error('로어북 항목을 찾지 못했어요');
             const before = String(e.content || '');
             e.content = text;
-            await c.saveWorldInfo(item.world, data, true);
+            await saveWorld(item.world, data);
             try { c.reloadWorldInfoEditor?.(item.world, true); } catch { /* optional */ }
             await logApply(char, { kind: 'lore-edit', label: `${item.label} (${tag})`, world: item.world, uid: item.uid, before, after: text });
         } else {
@@ -4662,7 +4726,7 @@ async function applyReplace(item, newText, { tag = '요약', note = '' } = {}) {
 async function applySplit(item, r) {
     const char = getCurrentCharacter();
     if (!char) return false;
-    const worldName = char?.data?.extensions?.world || '';
+    const worldName = charWorldName(char);
     if (r.lore.length && !worldName) {
         toastr.warning('이 캐릭터에 연결된 로어북이 없어요. 캐릭터 편집 화면의 🌐 버튼으로 로어북을 연결한 뒤 다시 적용하세요.');
         return false;
@@ -4738,7 +4802,7 @@ function updateDietModeNote() {
     const mode = $id('diet_mode')?.value || 'compress';
     const el = $id('diet_modenote');
     if (!el) return;
-    const world = getCurrentCharacter()?.data?.extensions?.world;
+    const world = charWorldName(getCurrentCharacter());
     el.textContent = mode === 'split'
         ? `${DIET_MODES.split.desc}. Description·Personality·Scenario·Character Note에만 쓰여요 (다른 칸은 압축). ${world ? `적용하면 “${world}” 로어북에 항목이 생겨요.` : '⚠️ 연결된 로어북이 없어서 적용하려면 먼저 로어북을 연결해야 해요.'}`
         : `${DIET_MODES.compress.desc}.`;
@@ -5471,11 +5535,11 @@ function fillNames(text, userName, charName) {
 }
 
 async function loreForVersions(char, picked, recentText) {
-    const worldName = char?.data?.extensions?.world;
+    const worldName = await resolveCharWorld(char);
     const out = { before: [], after: [] };
-    if (!worldName || typeof ctx().loadWorldInfo !== 'function') return out;
+    if (!worldName) return out;
     let data = null;
-    try { data = await ctx().loadWorldInfo(worldName); } catch { return out; }
+    try { data = await loadWorld(worldName); } catch { return out; }
     const added = new Set(picked.filter(x => x.kind === 'lore' && x.world === worldName).map(x => String(x.uid)));
     const edited = {};
     // applyLog is newest-first; the oldest "before" of an entry is its pre-edit state
@@ -5660,7 +5724,10 @@ const BOOK_KIND = {
     char: { label: '캐릭터 기본', order: 0 },
     extra: { label: '캐릭터 추가', order: 1 },
     chat: { label: '이 채팅 전용', order: 2 },
-    global: { label: '전역', order: 3 },
+    persona: { label: '페르소나', order: 3 },
+    manual: { label: '직접 추가', order: 4 },
+    global: { label: '전역', order: 5 },
+    embedded: { label: '카드 내장', order: 6 },
 };
 
 let loreCheckCache = null; // { books, entries, findings, sim, ai }
@@ -5672,14 +5739,38 @@ async function worldInfoModule() {
 /** Every lorebook that can fire in this chat, with where it is linked from. */
 async function getLinkedBooks(char) {
     const wi = await worldInfoModule();
+    const c = ctx();
     const out = [];
-    const push = (name, kind) => { if (name && !out.some(b => b.name === name)) out.push({ name, kind }); };
-    push(char?.data?.extensions?.world, 'char');
+    const diag = [];
+    const push = (name, kind) => { if (name && typeof name === 'string' && !out.some(b => b.name === name)) out.push({ name, kind }); };
+    const primary = await resolveCharWorld(char);
+    diag.push(`캐릭터 기본: ${primary || '없음'}`);
+    push(primary, 'char');
     const file = String(char?.avatar || '').replace(/\.[^.]+$/, '');
-    const charLore = wi?.world_info?.charLore || ctx().worldInfo?.charLore || [];
-    for (const name of charLore.find(x => x?.name === file)?.extraBooks || []) push(name, 'extra');
-    push(ctx().chatMetadata?.[wi?.METADATA_KEY || 'world_info'], 'chat');
-    for (const name of wi?.selected_world_info || []) push(name, 'global');
+    const charLore = wi?.world_info?.charLore || c.worldInfo?.charLore || [];
+    const extra = charLore.find(x => x?.name === file)?.extraBooks || [];
+    diag.push(`캐릭터 추가: ${extra.length ? extra.join(', ') : '없음'}${wi ? '' : ' (확인 못 함)'}`);
+    for (const name of extra) push(name, 'extra');
+    const chatBook = c.chatMetadata?.[wi?.METADATA_KEY || 'world_info'];
+    diag.push(`채팅 전용: ${chatBook || '없음'}`);
+    push(chatBook, 'chat');
+    const persona = c.powerUserSettings?.persona_description_lorebook;
+    if (persona) { diag.push(`페르소나: ${persona}`); push(persona, 'persona'); }
+    let globals = Array.isArray(wi?.selected_world_info) ? wi.selected_world_info : null;
+    if (!globals) globals = [...document.querySelectorAll('#world_info option:checked')].map(o => (o.textContent || '').trim()).filter(Boolean);
+    diag.push(`전역: ${globals.length ? globals.join(', ') : '없음'}`);
+    for (const name of globals) push(name, 'global');
+    try {
+        const cd = await loadCharData(char);
+        for (const name of cd.manualBooks || []) push(name, 'manual');
+        if ((cd.manualBooks || []).length) diag.push(`직접 추가: ${cd.manualBooks.join(', ')}`);
+    } catch { /* ignore */ }
+    const embedded = char?.data?.character_book?.entries || [];
+    if (embedded.length && !primary) {
+        out.push({ name: char?.data?.character_book?.name || '카드 내장 로어북', kind: 'embedded', readonly: true });
+        diag.push(`카드 내장: ${embedded.length}개 항목 (연결 안 됨)`);
+    }
+    out.diag = diag;
     return out;
 }
 
@@ -5732,11 +5823,17 @@ function entryFires(e, text, g) {
 
 async function collectLoreForCheck(char) {
     const books = await getLinkedBooks(char);
+    const diag = books.diag || [];
     const entries = [];
     for (const b of books) {
         try {
-            const data = await ctx().loadWorldInfo(b.name);
-            const list = Object.values(data?.entries || {});
+            const list = b.kind === 'embedded'
+                ? (char?.data?.character_book?.entries || []).map((e, i) => ({
+                    uid: e.id ?? i, key: e.keys || [], keysecondary: e.secondary_keys || [], content: e.content || '',
+                    comment: e.comment || e.name || '', constant: !!e.constant, disable: e.enabled === false,
+                    selective: !!e.selective, position: e.position, order: e.insertion_order,
+                }))
+                : Object.values((await loadWorld(b.name))?.entries || {});
             b.count = list.length;
             for (const e of list) {
                 entries.push({
@@ -5754,7 +5851,7 @@ async function collectLoreForCheck(char) {
         }
     }
     books.sort((a, b) => BOOK_KIND[a.kind].order - BOOK_KIND[b.kind].order);
-    return { books, entries };
+    return { books, entries, diag };
 }
 
 function lintLore({ books, entries }, char, g, chatText, chatIsKorean) {
@@ -5764,11 +5861,10 @@ function lintLore({ books, entries }, char, g, chatText, chatIsKorean) {
     const active = entries.filter(e => !e.disable);
 
     if (!books.length) {
-        const embedded = char?.data?.character_book?.entries?.length || 0;
-        add(embedded ? 'high' : 'low', '연결', embedded ? `카드에 내장 로어북(${embedded}개 항목)이 있지만 연결돼 있지 않아요` : '연결된 로어북이 없어요',
-            embedded ? '내장 로어북은 가져오기 전에는 롤플에 들어가지 않아요. 캐릭터 편집 화면의 🌐 버튼으로 로어북을 가져와 연결하세요.' : '캐릭터 편집 화면의 🌐 버튼에서 기본 로어북이나 추가 로어북을 연결할 수 있어요.');
+        add('low', '연결', '연결된 로어북을 찾지 못했어요', '아래 “찾아본 곳”에서 어디가 비어 있는지 확인해 보세요. 연결했는데도 안 보이면 “검사할 로어북 직접 추가”에서 골라 주세요.');
         return findings;
     }
+    if (books.some(b => b.kind === 'embedded')) add('medium', '연결', '카드 내장 로어북은 아직 롤플에 들어가지 않아요', '내장 로어북은 가져오기 전에는 쓰이지 않아요. 캐릭터 편집 화면의 🌐 버튼으로 가져와 연결하세요. 검사는 그대로 해 드려요(고치기 버튼은 가져온 뒤에 써요).');
     for (const b of books.filter(x => x.error)) add('high', '연결', `“${b.name}” 로어북을 불러오지 못했어요`, `파일이 지워졌거나 이름이 바뀌었을 수 있어요. (${b.error})`);
 
     const never = active.filter(e => !e.constant && !e.key.length && !e.vectorized);
@@ -5833,6 +5929,10 @@ function lintLore({ books, entries }, char, g, chatText, chatIsKorean) {
 
 function normText(t) {
     return String(t || '').toLowerCase().replace(/\s+/g, ' ').replace(/[“”"'‘’]/g, '').trim();
+}
+
+function isReadonlyBook(name) {
+    return !!loreCheckCache?.books?.find(b => b.name === name && b.readonly);
 }
 
 async function runLoreCheck() {
@@ -5915,7 +6015,7 @@ async function runLoreAi() {
 async function applyLoreKeys(entryRef, addKeys) {
     const char = getCurrentCharacter();
     const c = ctx();
-    const data = await c.loadWorldInfo(entryRef.book);
+    const data = await loadWorld(entryRef.book);
     const e = data?.entries?.[entryRef.uid];
     if (!e) { toastr.error('로어북 항목을 찾지 못했어요'); return false; }
     const before = [...(e.key || [])];
@@ -5923,7 +6023,7 @@ async function applyLoreKeys(entryRef, addKeys) {
     const add = addKeys.map(k => String(k).trim()).filter(k => k && !have.has(k.toLowerCase()));
     if (!add.length) { toastr.info('이미 다 들어 있는 키워드예요'); return false; }
     e.key = [...before, ...add];
-    await c.saveWorldInfo(entryRef.book, data, true);
+    await saveWorld(entryRef.book, data);
     try { c.reloadWorldInfoEditor?.(entryRef.book, true); } catch { /* optional */ }
     await logApply(char, { kind: 'lore-keys', label: `로어북 키워드: ${entryRef.name} (+${add.join(', ')})`, world: entryRef.book, uid: entryRef.uid, before, after: e.key });
     toastr.success(`키워드 ${add.length}개를 추가했어요`);
@@ -5971,6 +6071,10 @@ function renderLoreCheck() {
         <section class="bt-card">
             ${cardHead('Lorebook', '로어북 검사', `${escapeHtml(new Date(d.time).toLocaleString())}`)}
             ${d.books.length ? `<div class="bt-lore-books">${books}</div>` : ''}
+            <details class="bt-disclosure bt-disclosure-sm" ${d.books.length ? '' : 'open'}><summary><span>찾아본 곳</span>${ico('chevron-down')}</summary><ul class="bt-list bt-lore-diag">${(d.diag || []).map(x => `<li>${escapeHtml(x)}</li>`).join('')}</ul>
+                <div class="bt-lore-manual">${field('검사할 로어북 직접 추가', '<select id="bt_lore_manual" class="bt-input"><option value="">불러오는 중…</option></select>', '연결이 안 잡힐 때')}
+                <div class="bt-actions"><button type="button" id="bt_lore_manual_add" class="bt-btn bt-btn-sm">${ico('plus')}<span>추가하고 다시 검사</span></button>${d.books.some(b => b.kind === 'manual') ? `<button type="button" id="bt_lore_manual_clear" class="bt-btn bt-btn-sm">${ico('xmark')}<span>직접 추가한 것 빼기</span></button>` : ''}</div></div>
+            </details>
             <div class="bt-lore-stats">
                 <div><b>${active.length}</b><span>켜진 항목</span></div>
                 <div><b>${constTok.toLocaleString()}</b><span>상시 토큰 (매 턴)</span></div>
@@ -6001,23 +6105,48 @@ function renderLoreCheck() {
             ${aiIssues ? `<section class="bt-card">${cardHead('Issues', '고칠 곳', '키워드 추가와 내용 바꾸기는 원본이 백업돼서 적용 기록에서 되돌릴 수 있어요.')}<div class="bt-stack">${aiIssues}</div></section>` : ''}
             ${missing ? `<section class="bt-card">${cardHead('Missing', '있으면 좋은 항목')}<div class="bt-stack">${missing}</div></section>` : ''}` : ''}</div>`;
     $id('lore_ai')?.addEventListener('click', runLoreAi);
+    (async () => {
+        const sel = $id('lore_manual');
+        if (!sel) return;
+        const names = await allWorldNames();
+        sel.innerHTML = names.length ? names.map(n => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join('') : '<option value="">로어북 목록을 못 읽었어요</option>';
+    })();
+    $id('lore_manual_add')?.addEventListener('click', async () => {
+        const name = $id('lore_manual')?.value;
+        const ch = getCurrentCharacter();
+        if (!name || !ch) return;
+        const cd = await loadCharData(ch);
+        cd.manualBooks = [...new Set([...(cd.manualBooks || []), name])];
+        await saveCharData(ch, cd);
+        runLoreCheck();
+    });
+    $id('lore_manual_clear')?.addEventListener('click', async () => {
+        const ch = getCurrentCharacter();
+        if (!ch) return;
+        const cd = await loadCharData(ch);
+        cd.manualBooks = [];
+        await saveCharData(ch, cd);
+        runLoreCheck();
+    });
     $id('lore_chat')?.addEventListener('click', runLoreChatCheck);
     $id('lore_card')?.addEventListener('click', runLoreCardCheck);
     bindLoreAiViews(d);
     el.querySelectorAll('.bt-lore-addkeys').forEach(b => b.addEventListener('click', async () => {
         const x = ai.issues[Number(b.dataset.i)];
+        if (isReadonlyBook(x?.entry?.book)) { toastr.info('카드 내장 로어북은 가져와서 연결한 뒤에 고칠 수 있어요'); return; }
         if (x?.entry && await applyLoreKeys(x.entry, x.add_keys || [])) { b.classList.add('disabled'); b.querySelector('span').textContent = '추가됨'; }
     }));
     el.querySelectorAll('.bt-lore-replace').forEach(b => b.addEventListener('click', async () => {
         const x = ai.issues[Number(b.dataset.i)];
         if (!x?.entry) return;
+        if (isReadonlyBook(x.entry.book)) { toastr.info('카드 내장 로어북은 가져와서 연결한 뒤에 고칠 수 있어요'); return; }
         const ok = await applyReplace({ kind: 'lore', world: x.entry.book, uid: x.entry.uid, label: `로어북: ${x.entry.name}` }, x.paste, { tag: '수정' });
         if (ok) { b.classList.add('disabled'); b.querySelector('span').textContent = '적용됨'; }
     }));
     el.querySelectorAll('.bt-lore-mcopy').forEach(b => b.addEventListener('click', () => { const m = ai.missing[Number(b.dataset.idx)]; if (m) copyText(`[${(m.keys || []).join(', ')}]\n${m.content}`); }));
     el.querySelectorAll('.bt-lore-madd').forEach(b => b.addEventListener('click', async () => {
         const m = ai.missing[Number(b.dataset.idx)];
-        const book = d.books.find(x => x.kind === 'char' && !x.error)?.name || d.books.find(x => !x.error)?.name;
+        const book = d.books.find(x => x.kind === 'char' && !x.error)?.name || d.books.find(x => !x.error && !x.readonly)?.name;
         if (!m || !book) { toastr.warning('항목을 넣을 로어북이 없어요'); return; }
         const char = getCurrentCharacter();
         const uid = await addLoreEntry(book, { comment: m.name, keys: (m.keys || []).filter(Boolean), content: m.content });
@@ -6036,8 +6165,10 @@ async function loreReferenceText(char, maxChars = 8000) {
     const items = [];
     for (const b of books) {
         try {
-            const data = await ctx().loadWorldInfo(b.name);
-            for (const e of Object.values(data?.entries || {})) {
+            const list = b.kind === 'embedded'
+                ? (char?.data?.character_book?.entries || []).map(e => ({ ...e, key: e.keys, disable: e.enabled === false }))
+                : Object.values((await loadWorld(b.name))?.entries || {});
+            for (const e of list) {
                 if (e.disable || !String(e.content || '').trim()) continue;
                 items.push({ constant: !!e.constant, text: `- [${e.comment || (e.key || []).slice(0, 3).join(', ') || `#${e.uid}`}${e.constant ? ' · constant' : ` · keys: ${(e.key || []).slice(0, 4).join(', ')}`}] ${String(e.content).trim()}` });
             }
@@ -6273,6 +6404,7 @@ function bindLoreAiViews(d) {
         const x = chat?.violations?.[Number(b.dataset.i)];
         if (!x) return;
         let ok;
+        if (x.where === 'lore' && isReadonlyBook(x.entry?.book)) { toastr.info('카드 내장 로어북은 가져와서 연결한 뒤에 고칠 수 있어요'); return; }
         if (x.where === 'lore' && x.entry) ok = await applyReplace({ kind: 'lore', world: x.entry.book, uid: x.entry.uid, label: `로어북: ${x.entry.name}` }, x.paste, { tag: '수정', note: x.problem });
         else ok = await openApplyDialog({ field: x.where, text: x.paste, reason: x.problem });
         if (ok !== false && x.where === 'lore') { b.classList.add('disabled'); b.querySelector('span').textContent = '적용됨'; }

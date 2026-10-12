@@ -1373,3 +1373,7 @@
 #bt_panel .bt-legacy-pill.on .fa-solid { color: var(--bt-accent); }
 #bt_panel #bt_legacy_card .bt-switches { margin-top: 12px; }
 #bt_panel #bt_legacy_preview { max-height: 260px; overflow-y: auto; }
+#bt_panel .bt-lore-diag { font-size: 12px; margin: 6px 0 10px; }
+#bt_panel .bt-lore-manual .bt-field { margin-top: 4px; }
+#bt_panel .bt-lore-kind-persona, #bt_panel .bt-lore-kind-manual { background: var(--bt-surface-3); color: var(--bt-fg); }
+#bt_panel .bt-lore-kind-embedded { background: color-mix(in srgb, var(--bt-bad) 12%, transparent); color: var(--bt-bad); }
