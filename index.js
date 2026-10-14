@@ -459,6 +459,7 @@ function currentProfile() {
 async function applyTestPrompt() {
     const s = getSettings();
     const undo = [];
+    const remember = { profile: '', preset: '', at: Date.now() };
     if (s.testProfile) {
         const target = getProfiles().find(p => p.id === s.testProfile);
         const cur = currentProfile();
@@ -467,6 +468,7 @@ async function applyTestPrompt() {
         else if (cur.id !== target.id) {
             await ctx().executeSlashCommandsWithOptions(`/profile ${target.name}`);
             await sleep(600);
+            remember.profile = cur.name;
             undo.push(async () => { await ctx().executeSlashCommandsWithOptions(`/profile ${cur.name}`); await sleep(400); });
         }
     }
@@ -477,16 +479,37 @@ async function applyTestPrompt() {
             if (cur !== s.testPreset) {
                 await selectPresetByName(s.testPreset);
                 await sleep(300);
-                if (cur) undo.push(async () => { await selectPresetByName(cur); await sleep(200); });
+                if (cur) { remember.preset = cur; undo.push(async () => { await selectPresetByName(cur); await sleep(200); }); }
             }
         } catch (e) { toastr.warning(`테스트용 프리셋으로 바꾸지 못했어요: ${e.message}`); }
     }
+    // remembered in settings so an interrupted test (closed tab, crash) can be undone on the next start
+    if (remember.profile || remember.preset) { s.testRestore = remember; saveSettings(); }
     let done = false;
     return async () => {
         if (done) return;
         done = true;
         for (const f of undo.reverse()) { try { await f(); } catch (e) { console.warn(LOG, 'restore failed', e); } }
+        if (s.testRestore) { delete s.testRestore; saveSettings(); }
     };
+}
+
+/** A test that was cut off left the test preset/profile on — switch back to what was used before. */
+async function restoreInterruptedTestPrompt({ silent = false } = {}) {
+    const s = getSettings();
+    const r = s.testRestore;
+    if (!r || running) return false;
+    try {
+        if (r.preset) await selectPresetByName(r.preset);
+        if (r.profile) await ctx().executeSlashCommandsWithOptions(`/profile ${r.profile}`);
+        delete s.testRestore;
+        saveSettings();
+        if (!silent) toastr.info(`지난 테스트가 중간에 끊겨서 ${[r.preset && `프리셋 “${r.preset}”`, r.profile && `연결 “${r.profile}”`].filter(Boolean).join(', ')}(으)로 되돌려 놨어요.`, '봇 테스터', { timeOut: 8000 });
+        return true;
+    } catch (e) {
+        console.warn(LOG, 'interrupted test restore failed', e);
+        return false;
+    }
 }
 
 function testPromptLabel() {
@@ -1759,7 +1782,7 @@ function switchTab(name) {
     document.querySelectorAll('#bt_panel .bt-page').forEach(p => { p.style.display = p.dataset.page === name ? '' : 'none'; });
     const body = $id('body');
     if (body) body.scrollTop = 0;
-    if (name === 'doctor') { runDoctorLocal(true); refreshDietList(); }
+    if (name === 'doctor') { runDoctorLocal(true); refreshDietList(); renderRescue(); }
     if (name === 'settings') {
         const s = getSettings();
         fillProfileSelect($id('testerprofile'), s.testerProfile);
@@ -2449,6 +2472,12 @@ function registerCommands() {
         name: 'bottest-diet',
         callback: async () => { togglePanel(true); switchTab('doctor'); await refreshDietList(); scrollPanelTo($id('diet_card')); return ''; },
         helpString: '토큰 다이어트: 카드·로어북을 캐릭터성은 살리고 길이만 줄여요.',
+    }));
+
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'bottest-rescue',
+        callback: async () => { togglePanel(true); switchTab('doctor'); await renderRescue(); scrollPanelTo($id('rescue_card')); return ''; },
+        helpString: '캐붕 응급처치: 봇 테스터가 이 채팅에 넣은 것과 카드에서 바꾼 것을 보고 되돌려요.',
     }));
 
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
@@ -3489,7 +3518,7 @@ function charWorldName(char) {
     if (!char) return '';
     return char?.data?.extensions?.world
         || char?.extensions?.world
-        || (getCurrentCharacter()?.avatar === char.avatar ? (document.querySelector('#character_world')?.value || '') : '')
+        || (editorBelongsTo(char) ? (document.querySelector('#character_world')?.value || '') : '')
         || worldNameCache[char.avatar]
         || '';
 }
@@ -3872,6 +3901,7 @@ async function runChatDoctor() {
 function doctorPageHtml() {
     return `
     <div class="bt-page" data-page="doctor" style="display:none">
+${rescueCardHtml()}
       <section class="bt-card">
         ${cardHead('Card doctor', '카드 진단', '토큰이 과하지 않은지, GPT·Claude·Gemini가 캐릭터를 잘 연기할 수 있는 카드인지, 실제 롤플에서 아쉬운 점이 뭔지 찾아줘요.')}
         <div class="bt-vset-btns">
@@ -4067,6 +4097,7 @@ function renderDoctorForChar(data) {
     renderLoreCheck();
     renderKindResults();
     renderDedup();
+    renderRescue();
     renderFunAnalysis(data);
     renderDoctorCard(data?.doctor?.card);
     renderDoctorChat(data?.doctor?.chat);
@@ -4113,16 +4144,34 @@ function normalizeField(f) {
     return 'description';
 }
 
+/**
+ * True only when SillyTavern's character editor is showing this character.
+ * SillyTavern fires CHAT_CHANGED BEFORE it refills the editor, so right after switching
+ * characters the editor still holds the PREVIOUS character's text.
+ */
+function editorBelongsTo(char) {
+    if (!char?.avatar) return false;
+    const av = document.querySelector('#avatar_url_pole')?.value;
+    return !!av && av === char.avatar;
+}
+
+function editorProblem() {
+    if (!document.querySelector('#description_textarea')) return '캐릭터 편집 칸을 찾지 못했어요. 캐릭터 편집 화면을 한 번 열었다가 다시 시도해 주세요.';
+    return '캐릭터 편집 화면이 아직 이 캐릭터로 바뀌지 않았어요. 캐릭터 편집 화면(카드 정보)을 한 번 열고 다시 시도해 주세요.';
+}
+
+/** Editor value of a field — null when the editor is missing or shows another character. */
 function readField(key) {
     const sel = APPLY_FIELDS[key]?.sel;
     const el = sel ? document.querySelector(sel) : null;
-    return el ? String(el.value ?? '') : null;
+    if (!el || !editorBelongsTo(getCurrentCharacter())) return null;
+    return String(el.value ?? '');
 }
 
 function writeField(key, value) {
     const sel = APPLY_FIELDS[key]?.sel;
     const el = sel ? document.querySelector(sel) : null;
-    if (!el) throw new Error('캐릭터 편집 칸을 찾지 못했어요. 캐릭터 편집 화면을 한 번 열었다가 다시 시도해 주세요.');
+    if (!el || !editorBelongsTo(getCurrentCharacter())) throw new Error(editorProblem());
     el.value = value;
     // SillyTavern listens with jQuery; a native input event reaches it and triggers the (debounced) character save
     el.dispatchEvent(new Event('input', { bubbles: true }));
@@ -4166,7 +4215,7 @@ async function removeLoreEntry(worldName, uid) {
 
 async function logApply(char, item) {
     const cd = await loadCharData(char);
-    cd.applyLog = [{ id: Date.now(), time: Date.now(), ...item }, ...(cd.applyLog || [])].slice(0, 30);
+    cd.applyLog = [{ id: Date.now() * 1000 + Math.floor(Math.random() * 1000), time: Date.now(), ...item }, ...(cd.applyLog || [])].slice(0, 30);
     await saveCharData(char, cd);
     renderApplyLog(cd);
     renderContPick(cd);
@@ -4174,10 +4223,11 @@ async function logApply(char, item) {
         // remember the card before and after this edit so old chats can keep the earlier version
         try {
             const now = cardFieldsNow(char);
+            if (!now || item.quietVersion) throw new Error('skip');
             let c2 = await recordCardVersion(char, await loadCharData(char), { fields: { ...now, [item.field]: String(item.before ?? '') }, time: Date.now() - 1, label: '수정 전' });
             c2 = await recordCardVersion(char, c2, { fields: now, time: Date.now(), label: '수정 후' });
             await legacyOnChatChanged();
-        } catch (e) { console.warn(LOG, 'version record failed', e); }
+        } catch (e) { if (e.message !== 'skip') console.warn(LOG, 'version record failed', e); }
     }
 }
 
@@ -4258,7 +4308,8 @@ async function openApplyDialog({ field, text, reason = '' }) {
     }
 }
 
-async function undoApply(id) {
+async function undoApply(id, { quiet = false } = {}) {
+    const say = quiet ? { success() {}, info() {}, error() {}, warning() {} } : toastr;
     const char = getCurrentCharacter();
     if (!char) return;
     const cd = await loadCharData(char);
@@ -4269,29 +4320,31 @@ async function undoApply(id) {
         if (item.kind === 'lore-edit') {
             const data = await loadWorld(item.world);
             const e = data?.entries?.[item.uid];
-            if (!e) { toastr.info('그 로어북 항목은 이미 없어요'); }
-            else { e.content = item.before ?? ''; await saveWorld(item.world, data); try { c.reloadWorldInfoEditor?.(item.world, true); } catch { /* optional */ } toastr.success('로어북 항목을 요약 전으로 되돌렸어요'); }
+            if (!e) { say.info('그 로어북 항목은 이미 없어요'); }
+            else { e.content = item.before ?? ''; await saveWorld(item.world, data); try { c.reloadWorldInfoEditor?.(item.world, true); } catch { /* optional */ } say.success('로어북 항목을 요약 전으로 되돌렸어요'); }
         } else if (item.kind === 'lore-keys') {
             const data = await loadWorld(item.world);
             const e = data?.entries?.[item.uid];
-            if (!e) { toastr.info('그 로어북 항목은 이미 없어요'); }
-            else { e.key = [...(item.before || [])]; await saveWorld(item.world, data); try { c.reloadWorldInfoEditor?.(item.world, true); } catch { /* optional */ } toastr.success('로어북 키워드를 되돌렸어요'); }
+            if (!e) { say.info('그 로어북 항목은 이미 없어요'); }
+            else { e.key = [...(item.before || [])]; await saveWorld(item.world, data); try { c.reloadWorldInfoEditor?.(item.world, true); } catch { /* optional */ } say.success('로어북 키워드를 되돌렸어요'); }
         } else if (item.kind === 'lore') {
             const ok = await removeLoreEntry(item.world, item.uid);
-            toastr[ok ? 'success' : 'info'](ok ? '추가했던 로어북 항목을 지웠어요' : '그 로어북 항목은 이미 없어요');
+            say[ok ? 'success' : 'info'](ok ? '추가했던 로어북 항목을 지웠어요' : '그 로어북 항목은 이미 없어요');
         } else {
             const cur = readField(item.field);
-            if (cur !== null && cur !== item.after && c.callGenericPopup) {
+            if (!quiet && cur !== null && cur !== item.after && c.callGenericPopup) {
                 const r = await c.callGenericPopup('적용한 뒤에 이 칸이 또 바뀌었어요. 그래도 적용 전 내용으로 되돌릴까요?', c.POPUP_TYPE.CONFIRM);
                 if (r !== c.POPUP_RESULT.AFFIRMATIVE && r !== true && r !== 1) return;
             }
             writeField(item.field, item.before ?? '');
-            toastr.success(`${item.label}을(를) 적용 전으로 되돌렸어요`);
+            say.success(`${item.label}을(를) 적용 전으로 되돌렸어요`);
         }
         item.undone = Date.now();
         await saveCharData(char, cd);
         renderApplyLog(cd);
+        if (!quiet) renderRescue();
     } catch (e) {
+        if (quiet) throw e;
         toastr.error(`되돌리기 실패: ${e.message}`);
     }
 }
@@ -4479,8 +4532,8 @@ const DIET_PRINCIPLES = [
 ].join('\n');
 
 function rawCardValue(char, applyKey) {
-    const fromEditor = readField(applyKey);
-    if (fromEditor !== null && fromEditor !== '') return fromEditor;
+    const fromEditor = editorBelongsTo(char) ? readField(applyKey) : null;
+    if (fromEditor !== null) return fromEditor;
     const d = char?.data || {};
     return String({
         description: char?.description, personality: char?.personality, scenario: char?.scenario,
@@ -4710,7 +4763,7 @@ async function applyReplace(item, newText, { tag = '요약', note = '' } = {}) {
             await logApply(char, { kind: 'lore-edit', label: `${item.label} (${tag})`, world: item.world, uid: item.uid, before, after: text });
         } else {
             const before = readField(item.field);
-            if (before === null) throw new Error('캐릭터 편집 칸을 찾지 못했어요. 캐릭터 편집 화면을 한 번 열었다가 다시 시도해 주세요.');
+            if (before === null) throw new Error(editorProblem());
             writeField(item.field, text);
             await logApply(char, { kind: 'field', field: item.field, label: `${item.label} (${tag})`, before, after: text });
         }
@@ -7116,8 +7169,56 @@ const LEGACY_MODES = {
     diff: { label: '달라진 점만 AI로 요약 (토큰 가장 적음)' },
 };
 
+/** The card as stored for this character — null when SillyTavern has not loaded it fully yet. */
+function cardFieldsFromChar(char) {
+    if (!char || char.shallow) return null;
+    const d = char.data || {};
+    return {
+        description: String(char.description ?? d.description ?? ''),
+        personality: String(char.personality ?? d.personality ?? ''),
+        scenario: String(char.scenario ?? d.scenario ?? ''),
+        mes_example: String(char.mes_example ?? d.mes_example ?? ''),
+        char_note: String(d.extensions?.depth_prompt?.prompt ?? ''),
+        system_prompt: String(d.system_prompt ?? ''),
+        post_history: String(d.post_history_instructions ?? ''),
+    };
+}
+
+/** Current card: the editor (includes unsaved edits) only when it really shows this character. */
 function cardFieldsNow(char) {
-    return Object.fromEntries(LEGACY_FIELDS.map(([k]) => [k, String(rawCardValue(char, k) || '')]));
+    if (editorBelongsTo(char)) {
+        const out = {};
+        for (const [k] of LEGACY_FIELDS) {
+            const el = document.querySelector(APPLY_FIELDS[k]?.sel || '#__none');
+            out[k] = el ? String(el.value ?? '') : '';
+        }
+        return out;
+    }
+    return cardFieldsFromChar(char);
+}
+
+function textSimilarity(a, b) {
+    const A = dedupNorm(a); const B = dedupNorm(b);
+    if (!A && !B) return 1;
+    if (!A || !B) return 0;
+    if (A === B) return 1;
+    // long texts: compare evenly spaced samples to stay fast
+    const cap = (t) => (t.length > 6000 ? Array.from({ length: 30 }, (_, i) => t.slice(Math.floor(i * t.length / 30), Math.floor(i * t.length / 30) + 200)).join('') : t);
+    return dice(cap(A), cap(B));
+}
+
+/** True when these card fields look like ANOTHER character's card (the v3.0 mix-up). */
+function looksLikeOtherCharacter(fields, char) {
+    if (!fields) return false;
+    const desc = (fields.description || '').trim();
+    if (desc.length < 40) return false;
+    for (const other of ctx().characters || []) {
+        if (!other || other.avatar === char?.avatar || other.shallow) continue;
+        const od = String(other.description ?? other.data?.description ?? '').trim();
+        if (od.length < 40) continue;
+        if (od === desc || textSimilarity(od, desc) >= 0.9) return true;
+    }
+    return false;
 }
 
 function hashText(t) {
@@ -7134,7 +7235,8 @@ function fieldsHash(f) {
 /** Records the current card as a version if it is new. Returns the (possibly updated) char data. */
 async function recordCardVersion(char, cd, { fields = null, time = Date.now(), label = '' } = {}) {
     const f = fields || cardFieldsNow(char);
-    if (!LEGACY_FIELDS.some(([k]) => f[k].trim())) return cd;
+    if (!f || !LEGACY_FIELDS.some(([k]) => (f[k] || '').trim())) return cd;
+    if (looksLikeOtherCharacter(f, char)) { console.warn(LOG, 'refused to record another character\'s card as a version'); return cd; }
     const h = fieldsHash(f);
     cd.cardVersions = cd.cardVersions || [];
     if (cd.cardVersions.some(v => v.hash === h)) return cd;
@@ -7144,7 +7246,7 @@ async function recordCardVersion(char, cd, { fields = null, time = Date.now(), l
         await saveCharData(char, cd);
         return cd;
     }
-    cd.cardVersions.push({ id: `v${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`, hash: h, time, fields: f, label });
+    cd.cardVersions.push({ id: `v${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`, hash: h, time, fields: f, label, v: 2 });
     cd.cardVersions.sort((a, b) => a.time - b.time);
     if (cd.cardVersions.length > 8) cd.cardVersions = [cd.cardVersions[0], ...cd.cardVersions.slice(-7)];
     await saveCharData(char, cd);
@@ -7237,6 +7339,8 @@ async function saveLegacyMeta(v) {
 /** Locks the open chat to a card version (builds the injection text). */
 async function legacyLock(char, cd, version, { mode = getSettings().legacyMode || 'changed', auto = false } = {}) {
     const now = cardFieldsNow(char);
+    if (!now) throw new Error('카드를 아직 불러오지 못했어요. 잠시 뒤 다시 시도해 주세요.');
+    if (!versionSafeFor(version, char)) throw new Error('고른 버전이 다른 캐릭터의 카드처럼 보여서 넣지 않았어요.');
     let text = mode === 'diff' ? await legacyDiffText(char, cd, version.fields, now) : legacyChangedText(version.fields, now);
     if (!text) { await legacyUnlock({ keepDecision: true, silent: true }); return null; }
     await setLegacyInject(text);
@@ -7251,26 +7355,71 @@ async function legacyUnlock({ keepDecision = true, silent = false } = {}) {
     if (!silent) toastr.info('이 채팅은 이제 지금 카드로 진행해요');
 }
 
+/**
+ * v3.0–3.0.1 could save the PREVIOUS character's card as a version (SillyTavern refills the editor
+ * after CHAT_CHANGED). Drops those versions once; chats locked to them are unlocked.
+ */
+async function purgeBadVersions(char, cd) {
+    if (cd.versionsChecked >= 2) return { cd, dropped: 0 };
+    const now = cardFieldsFromChar(char);
+    if (!now) return { cd, dropped: 0 };
+    const nowHash = fieldsHash(now);
+    const before = (cd.cardVersions || []).length;
+    cd.cardVersions = (cd.cardVersions || []).filter(v => {
+        if (looksLikeOtherCharacter(v.fields, char)) return false;
+        if (v.v === 2 || v.label) return true; // recorded safely, or around an edit made in the editor
+        return v.hash === nowHash; // old automatic snapshot: keep only if it is exactly the current card
+    });
+    cd.versionsChecked = 2;
+    await saveCharData(char, cd);
+    return { cd, dropped: before - cd.cardVersions.length };
+}
+
+/** A version is safe to lock a chat to only if it is clearly this character's earlier card. */
+function versionSafeFor(v, char) {
+    return !!v && !looksLikeOtherCharacter(v.fields, char);
+}
+
+/** True when the card changed enough that an old chat would feel different (not a typo fix). */
+function bigChange(oldF, newF) {
+    let changed = 0; let total = 0;
+    for (const [k] of LEGACY_FIELDS) {
+        const a = (oldF?.[k] || '').trim(); const b = (newF?.[k] || '').trim();
+        const w = Math.max(a.length, b.length);
+        total += w;
+        if (a !== b) changed += w * (1 - textSimilarity(a, b));
+    }
+    return total > 0 && changed / total >= 0.08;
+}
+
 /** Runs on every chat change: remembers card versions and keeps old chats on their old version. */
 async function legacyOnChatChanged() {
     const char = getCurrentCharacter();
     if (!char) return;
     try {
         let cd = await loadCharData(char);
+        const purged = await purgeBadVersions(char, cd);
+        cd = purged.cd;
         cd = await recordCardVersion(char, cd);
         const s = getSettings();
         const meta = legacyMeta();
         const msgs = (ctx().chat || []).filter(m => m && !m.is_system);
         if (meta?.on) {
-            // card changed again since the note was built → rebuild the AI-free text silently
-            const nowHash = fieldsHash(cardFieldsNow(char));
             const v = (cd.cardVersions || []).find(x => x.id === meta.versionId);
-            if (v && meta.curHash !== nowHash && meta.mode !== 'diff') await legacyLock(char, cd, v, { mode: 'changed', auto: meta.auto });
+            if (!versionSafeFor(v, char) || looksLikeOtherCharacter({ description: (meta.text || '').replace(/^[\s\S]*?### Description \(earlier version\)\n/, '').split('\n### ')[0] }, char)) {
+                // locked to a version that was recorded wrongly → take it out of this chat
+                await legacyUnlock({ keepDecision: false, silent: true });
+                toastr.warning('이 채팅에 잘못 들어가 있던 “예전 캐해”를 뺐어요. 다른 캐릭터의 카드가 섞여 들어갔을 수 있어요(봇 테스터 v3.0 버그).', '봇 테스터', { timeOut: 9000 });
+            } else {
+                // card changed again since the note was built → rebuild the AI-free text silently
+                const nowF = cardFieldsNow(char);
+                if (nowF && meta.curHash !== fieldsHash(nowF) && meta.mode !== 'diff') await legacyLock(char, cd, v, { mode: 'changed', auto: meta.auto });
+            }
         } else if (!meta && s.legacyAuto !== false && msgs.length >= 3) {
             const start = chatStartTime();
             const v = versionForStart(cd, start);
             const latest = (cd.cardVersions || []).slice(-1)[0];
-            if (v && latest && v.id !== latest.id) {
+            if (v && latest && v.id !== latest.id && v.v === 2 && versionSafeFor(v, char) && bigChange(v.fields, cardFieldsNow(char))) {
                 const m = await legacyLock(char, cd, v, { mode: 'changed', auto: true });
                 if (m) toastr.info('카드를 고치기 전에 시작한 채팅이라, 예전 캐해로 이어가요. 봇 테스터 원작 탭에서 끌 수 있어요.', '봇 테스터', { timeOut: 6000 });
             }
@@ -7279,6 +7428,7 @@ async function legacyOnChatChanged() {
         console.warn(LOG, 'legacy check failed', e);
     }
     renderLegacyCard();
+    renderRescue();
 }
 
 // --- UI ---
@@ -7378,6 +7528,193 @@ function bindLegacyUI() {
 
 
 // ---------------------------------------------------------------------------
+// 캐붕 응급처치 (rescue): see and undo everything Bot Tester changed for this character / chat
+// ---------------------------------------------------------------------------
+
+let rescueBase = '';
+
+function rescueCardHtml() {
+    return `
+      <section class="bt-card bt-card-warn" id="bt_rescue_card">
+        ${cardHead('Rescue', '캐붕 응급처치', '봇이 갑자기 이상해졌으면 여기부터 보세요. 봇 테스터가 이 채팅에 넣은 것과 카드에서 바꾼 것을 한눈에 보고, 빼거나 예전 카드로 되돌려요.')}
+        <div id="bt_rescue_view"><p class="bt-note">캐릭터 채팅을 열면 보여요.</p></div>
+      </section>`;
+}
+
+function hangulRatio(t) {
+    const s = String(t || '');
+    const letters = (s.match(/[A-Za-z가-힣ぁ-ゟ゠-ヿ一-鿿]/g) || []).length;
+    return letters ? (s.match(/[가-힣]/g) || []).length / letters : 0;
+}
+
+function changeWord(sim) {
+    if (sim >= 0.97) return ['거의 그대로', 'ok'];
+    if (sim >= 0.8) return ['조금 바뀜', 'ok'];
+    if (sim >= 0.5) return ['꽤 바뀜', 'warn'];
+    return ['크게 바뀜', 'bad'];
+}
+
+async function renderRescue() {
+    const el = $id('rescue_view');
+    if (!el) return;
+    const char = getCurrentCharacter();
+    if (!char) { el.innerHTML = '<p class="bt-note">캐릭터 채팅을 열면 보여요.</p>'; return; }
+    const cd = await loadCharData(char);
+    const meta = legacyMeta();
+    const note = currentChatNote() || '';
+    const hasNoteBlock = chatNoteBlockRe().test(note);
+    const now = cardFieldsNow(char);
+
+    // --- this chat ---
+    const chatRows = [];
+    if (meta?.on) {
+        const tok = await countTokens(meta.text || '').catch(() => 0);
+        chatRows.push(`<div class="bt-rescue-row bad">
+            <div><b>${ico('clock-rotate-left')} 예전 캐해 (매 턴 들어감${tok ? ` · ${tok.toLocaleString()} 토큰` : ''})</b>
+            <small>${escapeHtml(new Date(meta.versionTime || meta.at).toLocaleString())} 버전 카드를 이 채팅에 붙잡아 두고 있어요${meta.auto ? ' · 자동으로 들어감' : ''}. 지금 카드와 섞여서 캐릭터가 흔들릴 수 있어요.</small></div>
+            <button type="button" class="bt-btn bt-btn-sm" id="bt_rescue_legacy_off">${ico('xmark')}<span>빼기</span></button>
+        </div>`);
+    }
+    if (hasNoteBlock) {
+        chatRows.push(`<div class="bt-rescue-row warn">
+            <div><b>${ico('note-sticky')} 작가 노트의 봇 테스터 블록</b>
+            <small>“이 채팅에서는 이렇게 연기”라는 요약이 작가 노트에 들어 있어요. 카드보다 우선이라 지금 카드와 다르면 그쪽으로 끌려가요.</small></div>
+            <button type="button" class="bt-btn bt-btn-sm" id="bt_rescue_note_off">${ico('xmark')}<span>빼기</span></button>
+        </div>`);
+    }
+    const tr = getSettings().testRestore;
+    if (tr && !running) {
+        chatRows.push(`<div class="bt-rescue-row bad">
+            <div><b>${ico('sliders')} 테스트 전용 프롬이 아직 켜져 있어요</b>
+            <small>테스트가 중간에 끊겨서 원래 ${[tr.preset && `프리셋 “${escapeHtml(tr.preset)}”`, tr.profile && `연결 “${escapeHtml(tr.profile)}”`].filter(Boolean).join(', ')}(으)로 못 돌아갔어요. 평소 롤플도 테스트용 설정으로 돌아가는 중이에요.</small></div>
+            <button type="button" class="bt-btn bt-btn-sm" id="bt_rescue_prompt_back">${ico('rotate-left')}<span>원래대로</span></button>
+        </div>`);
+    }
+    const chatHtml = chatRows.length
+        ? `${chatRows.join('')}<div class="bt-actions"><button type="button" class="bt-btn bt-btn-primary bt-btn-wide" id="bt_rescue_chat_all">${ico('broom')}<span>봇 테스터가 넣은 것 모두 빼기</span></button></div>`
+        : `<p class="bt-rescue-clean">${ico('circle-check')} 이 채팅에는 봇 테스터가 넣은 게 없어요.</p>`;
+
+    // --- card changes ---
+    const versions = (cd.cardVersions || []).filter(v => versionSafeFor(v, char));
+    const active = (cd.applyLog || []).filter(x => !x.undone);
+    let cardHtml = '';
+    if (!now) {
+        cardHtml = '<p class="bt-note">카드를 아직 불러오지 못했어요. 캐릭터 편집 화면을 한 번 열어 주세요.</p>';
+    } else if (!versions.length) {
+        cardHtml = '<p class="bt-note">비교할 예전 카드 버전이 없어요. 봇 테스터로 고친 적이 없거나, 버전을 저장하기 전에 고친 거예요.</p>';
+    } else {
+        const first = versions.find(v => v.label === '수정 전') || versions[0];
+        if (!versions.some(v => v.id === rescueBase)) rescueBase = first.id;
+        const base = versions.find(v => v.id === rescueBase);
+        const rows = LEGACY_FIELDS.map(([k, label]) => {
+            const a = base.fields?.[k] || ''; const b = now[k] || '';
+            if (a.trim() === b.trim()) return '';
+            const sim = textSimilarity(a, b);
+            const [word, cls] = changeWord(sim);
+            const langNote = hangulRatio(a) > 0.5 && hangulRatio(b) < 0.2 ? ' · 한국어 → 영어' : '';
+            return `<div class="bt-rescue-field">
+                <div class="bt-rescue-field-head"><b>${escapeHtml(label)}</b><span class="bt-tag bt-rescue-${cls}">${word}${langNote}</span><small>${a.length.toLocaleString()} → ${b.length.toLocaleString()}자</small>
+                <button type="button" class="bt-btn bt-btn-sm bt-rescue-field-back" data-k="${k}">${ico('rotate-left')}<span>이 칸만 되돌리기</span></button></div>
+                <details class="bt-disclosure bt-disclosure-sm"><summary><span>그때 내용 보기</span>${ico('chevron-down')}</summary><pre class="bt-paste">${escapeHtml(a || '(비어 있음)')}</pre></details>
+            </div>`;
+        }).filter(Boolean);
+        const opts = versions.slice().reverse().map(v => `<option value="${v.id}">${escapeHtml(new Date(v.time).toLocaleString())}${v.label ? ` · ${escapeHtml(v.label)}` : ''}${v.hash === fieldsHash(now) ? ' · 지금 카드' : ''}</option>`).join('');
+        cardHtml = `
+            ${field('비교할 예전 카드', `<select id="bt_rescue_base" class="bt-input">${opts}</select>`, '봇 테스터가 기억하는 버전')}
+            ${rows.length ? `<div class="bt-stack bt-rescue-fields">${rows.join('')}</div>
+            <div class="bt-actions"><button type="button" class="bt-btn bt-btn-primary bt-btn-wide" id="bt_rescue_card_back">${ico('clock-rotate-left')}<span>카드 전체를 이 버전으로 되돌리기</span></button></div>`
+            : `<p class="bt-rescue-clean">${ico('circle-check')} 이 버전과 지금 카드가 같아요.</p>`}`;
+    }
+    const loreActive = active.filter(x => x.kind !== 'field');
+    const undoAllHtml = active.length ? `
+        <div class="bt-rescue-row">
+            <div><b>${ico('list-check')} 봇 테스터로 적용한 수정 ${active.length}개</b><small>${loreActive.length ? `로어북 수정 ${loreActive.length}개 포함. ` : ''}최신 것부터 차례로 전부 되돌려요.</small></div>
+            <button type="button" class="bt-btn bt-btn-sm" id="bt_rescue_undo_all">${ico('rotate-left')}<span>전부 되돌리기</span></button>
+        </div>` : '';
+
+    el.innerHTML = `
+        <h4 class="bt-subhead">이 채팅에 들어간 것</h4>
+        ${chatHtml}
+        <h4 class="bt-subhead">카드에서 바뀐 것</h4>
+        ${cardHtml}
+        ${undoAllHtml}
+        <p class="bt-note bt-rescue-tip">되돌린 뒤에도 이상하면: ① <b>스와이프로 답장을 다시 받아</b> 보세요(이미 나온 이상한 답장을 봇이 따라 해요). ② Gemini Flash처럼 가벼운 모델은 카드가 영어로 바뀌면 한국어 말투를 잃기 쉬워요. 예시 대사·첫 메시지는 한국어로 두는 게 안전해요.</p>`;
+
+    $id('rescue_prompt_back')?.addEventListener('click', async () => { await restoreInterruptedTestPrompt(); renderRescue(); });
+    $id('rescue_base')?.addEventListener('change', (e) => { rescueBase = e.target.value; renderRescue(); });
+    $id('rescue_legacy_off')?.addEventListener('click', async () => { await legacyUnlock(); renderRescue(); renderLegacyCard(); });
+    $id('rescue_note_off')?.addEventListener('click', async () => { await unpinAnchorFromChatNote(); renderRescue(); });
+    $id('rescue_chat_all')?.addEventListener('click', async () => {
+        if (legacyMeta()?.on) await legacyUnlock({ silent: true });
+        if (chatNoteBlockRe().test(currentChatNote() || '')) await unpinAnchorFromChatNote();
+        if (getSettings().testRestore) await restoreInterruptedTestPrompt({ silent: true });
+        toastr.success('이 채팅에서 봇 테스터가 넣은 걸 모두 뺐어요');
+        renderRescue(); renderLegacyCard();
+    });
+    el.querySelectorAll('.bt-rescue-field-back').forEach(b => b.addEventListener('click', () => restoreCardToVersion(rescueBase, [b.dataset.k])));
+    $id('rescue_card_back')?.addEventListener('click', () => restoreCardToVersion(rescueBase));
+    $id('rescue_undo_all')?.addEventListener('click', undoAllApplies);
+}
+
+/** Writes an earlier version back into the card (all fields, or only `keys`). Each change is undoable. */
+async function restoreCardToVersion(versionId, keys = null) {
+    if (running) return;
+    const char = getCurrentCharacter();
+    if (!char) return;
+    const cd = await loadCharData(char);
+    const v = (cd.cardVersions || []).find(x => x.id === versionId);
+    if (!versionSafeFor(v, char)) { toastr.error('그 버전은 되돌릴 수 없어요'); return; }
+    if (!editorBelongsTo(char)) { toastr.warning(editorProblem()); return; }
+    const now = cardFieldsNow(char);
+    const targets = LEGACY_FIELDS.filter(([k]) => (!keys || keys.includes(k)) && (v.fields[k] || '').trim() !== (now[k] || '').trim());
+    if (!targets.length) { toastr.info('이미 그 버전과 같아요'); return; }
+    const c = ctx();
+    if (c.callGenericPopup) {
+        const r = await c.callGenericPopup(`${targets.map(([, l]) => l).join(', ')} 칸을 ${new Date(v.time).toLocaleString()} 버전으로 되돌릴까요? 지금 내용은 적용 기록에 백업돼서 다시 되돌릴 수 있어요.`, c.POPUP_TYPE.CONFIRM);
+        if (r !== c.POPUP_RESULT.AFFIRMATIVE && r !== true && r !== 1) return;
+    }
+    try {
+        for (const [k, label] of targets) {
+            const before = readField(k);
+            writeField(k, v.fields[k] || '');
+            await logApply(char, { kind: 'field', field: k, label: `${label} (예전 버전으로)`, before, after: v.fields[k] || '', quietVersion: true });
+        }
+        await recordCardVersion(char, await loadCharData(char), { label: '되돌림' });
+        if (legacyMeta()?.on) await legacyOnChatChanged();
+        toastr.success(`${targets.length}개 칸을 예전 버전으로 되돌렸어요`);
+    } catch (e) {
+        toastr.error(`되돌리기 실패: ${e.message}`);
+    }
+    runDoctorLocal(true);
+    renderRescue();
+}
+
+async function undoAllApplies() {
+    if (running) return;
+    const char = getCurrentCharacter();
+    if (!char) return;
+    const c = ctx();
+    let cd = await loadCharData(char);
+    const active = (cd.applyLog || []).filter(x => !x.undone);
+    if (!active.length) return;
+    if (active.some(x => x.kind === 'field') && !editorBelongsTo(char)) { toastr.warning(editorProblem()); return; }
+    if (c.callGenericPopup) {
+        const r = await c.callGenericPopup(`봇 테스터로 적용한 수정 ${active.length}개를 최신 것부터 전부 되돌릴까요?`, c.POPUP_TYPE.CONFIRM);
+        if (r !== c.POPUP_RESULT.AFFIRMATIVE && r !== true && r !== 1) return;
+    }
+    let ok = 0; let fail = 0;
+    for (const item of active) { // applyLog is newest first
+        try { await undoApply(item.id, { quiet: true }); ok++; } catch { fail++; }
+    }
+    cd = await loadCharData(char);
+    await recordCardVersion(char, cd, { label: '되돌림' });
+    toastr[fail ? 'warning' : 'success'](`${ok}개 되돌렸어요${fail ? `, ${fail}개는 실패했어요` : ''}`);
+    runDoctorLocal(true);
+    renderRescue();
+}
+
+
+// ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
 
@@ -7392,7 +7729,7 @@ function bindLegacyUI() {
     };
 
     if (document.getElementById('extensionsMenu')) setup();
-    eventSource.on(event_types.APP_READY, () => setTimeout(legacyOnChatChanged, 1500));
+    eventSource.on(event_types.APP_READY, () => setTimeout(async () => { await restoreInterruptedTestPrompt(); legacyOnChatChanged(); }, 1500));
     eventSource.on(event_types.APP_READY, setup);
     eventSource.on(event_types.CHAT_CHANGED, () => {
         renderAnchorNote();

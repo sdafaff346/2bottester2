@@ -1377,3 +1377,35 @@
 #bt_panel .bt-lore-manual .bt-field { margin-top: 4px; }
 #bt_panel .bt-lore-kind-persona, #bt_panel .bt-lore-kind-manual { background: var(--bt-surface-3); color: var(--bt-fg); }
 #bt_panel .bt-lore-kind-embedded { background: color-mix(in srgb, var(--bt-bad) 12%, transparent); color: var(--bt-bad); }
+
+/* ---------- v3.1: rescue (캐붕 응급처치) ---------- */
+#bt_panel #bt_rescue_card .bt-subhead:first-child { margin-top: 0; }
+#bt_panel .bt-rescue-row { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; margin-bottom: 8px; border-radius: 11px; background: var(--bt-surface-2); border: 1px solid var(--bt-line); }
+#bt_panel .bt-rescue-row > div { flex: 1; min-width: 0; display: grid; gap: 3px; }
+#bt_panel .bt-rescue-row b { font-size: 13px; font-weight: 650; }
+#bt_panel .bt-rescue-row b .fa-solid { margin-right: 5px; }
+#bt_panel .bt-rescue-row small { font-size: 12px; line-height: 1.55; color: var(--bt-muted); }
+#bt_panel .bt-rescue-row .bt-btn { flex: none; }
+#bt_panel .bt-rescue-row.bad { border-color: color-mix(in srgb, var(--bt-bad) 40%, transparent); background: color-mix(in srgb, var(--bt-bad) 7%, transparent); }
+#bt_panel .bt-rescue-row.bad b .fa-solid { color: var(--bt-bad); }
+#bt_panel .bt-rescue-row.warn { border-color: color-mix(in srgb, var(--bt-warn) 40%, transparent); background: color-mix(in srgb, var(--bt-warn) 7%, transparent); }
+#bt_panel .bt-rescue-row.warn b .fa-solid { color: var(--bt-warn); }
+#bt_panel .bt-rescue-clean { display: flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--bt-muted); }
+#bt_panel .bt-rescue-clean .fa-solid { color: var(--bt-good); }
+#bt_panel .bt-rescue-fields { margin-top: 10px; }
+#bt_panel .bt-rescue-field { padding: 9px 11px; border-radius: 10px; border: 1px solid var(--bt-line); background: var(--bt-surface); }
+#bt_panel .bt-rescue-field-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+#bt_panel .bt-rescue-field-head b { font-size: 13px; }
+#bt_panel .bt-rescue-field-head small { color: var(--bt-faint); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+#bt_panel .bt-rescue-field-head .bt-btn { margin-left: auto; }
+#bt_panel .bt-rescue-field .bt-disclosure { margin-top: 6px; }
+#bt_panel .bt-rescue-field .bt-paste { max-height: 220px; overflow-y: auto; }
+#bt_panel .bt-rescue-ok { color: var(--bt-good); background: color-mix(in srgb, var(--bt-good) 12%, transparent); box-shadow: none; }
+#bt_panel .bt-rescue-warn { color: var(--bt-warn); background: color-mix(in srgb, var(--bt-warn) 13%, transparent); box-shadow: none; }
+#bt_panel .bt-rescue-bad { color: var(--bt-bad); background: color-mix(in srgb, var(--bt-bad) 13%, transparent); box-shadow: none; }
+#bt_panel .bt-rescue-tip { margin-top: 12px; }
+@media (max-width: 768px) {
+    #bt_panel .bt-rescue-row { flex-wrap: wrap; }
+    #bt_panel .bt-rescue-row .bt-btn { width: 100%; }
+    #bt_panel .bt-rescue-field-head .bt-btn { margin-left: 0; width: 100%; }
+}
