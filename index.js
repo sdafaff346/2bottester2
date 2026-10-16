@@ -285,7 +285,127 @@ function cleanNamuMarkup(raw) {
         .trim();
 }
 
+const decodeEntities = (s) => String(s)
+    .replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'").replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n))).replace(/&amp;/g, '&');
+
+const WIKI_NOISE_NAMES = new Set(['reflist', 'references', 'clear', 'clr', 'toc', 'stub', 'delete', 'cleanup', 'spoiler', 'dablink', 'for', 'about', 'main', 'see also', 'further', 'disambig', 'ref', 'sfn', 'efn', 'notelist', 'portal', 'commons', 'defaultsort', 'displaytitle', 'nihongo foot', 'quote box end', 'scroll box end', 'construction', 'wip']);
+const isWikiNoiseTemplate = (name) => {
+    const n = name.toLowerCase().replace(/_/g, ' ').trim();
+    return /^[A-Z]+$/.test(name.trim()) || n.startsWith('#') || n.includes(':') || WIKI_NOISE_NAMES.has(n)
+        || /^(cite|citation)\b/.test(n) || /^lang-/.test(n) || /navbox|^nav\b|\bnav$|navigation/.test(n);
+};
+const WIKI_SKIP_KEYS = /^(image\d*|images?|caption|imagewidth|imagesize|width|size|gallery|signature|bgcolor|color|colour|style|class|align|float|title-?color|header-?color|text-?color)$/i;
+
+/** Turns one innermost {{template|…}} into readable text (infobox fields become "key: value" lines). */
+function renderWikiTemplate(inner) {
+    const parts = inner.split('|');
+    const name = parts.shift().trim();
+    if (!name || isWikiNoiseTemplate(name)) return '';
+    const named = [];
+    const pos = [];
+    for (const p of parts) {
+        const eq = p.indexOf('=');
+        if (eq > 0 && /^[\w\s\-]+$/.test(p.slice(0, eq))) {
+            const key = p.slice(0, eq).trim();
+            const val = p.slice(eq + 1).trim();
+            if (val && !WIKI_SKIP_KEYS.test(key)) named.push(`${key.replace(/_/g, ' ')}: ${val.replace(/\s*\n\s*/g, ' ')}`);
+        } else if (p.trim()) {
+            pos.push(p.trim());
+        }
+    }
+    if (named.length >= 2) return `\n${named.join('\n')}\n`;
+    if (/^(convert|cvt)$/i.test(name) && pos.length >= 2) return `${pos[0]} ${pos[1]}`;
+    const all = [...pos, ...named.map(x => x.split(': ').slice(1).join(': '))];
+    if (!all.length) return '';
+    return all.length === 1 ? all[0] : `${all[0]} (${all.slice(1).join(', ')})`;
+}
+
+/** MediaWiki wikitext (fandom ?action=raw) → plain text. */
+function cleanWikitext(raw) {
+    let s = String(raw).replace(/\r/g, '');
+    s = s
+        .replace(/<!--[\s\S]*?-->/g, '')
+        .replace(/<ref[^>]*\/>/gi, '')
+        .replace(/<ref[^>]*>[\s\S]*?<\/ref>/gi, '')
+        .replace(/<(gallery|noinclude|references|mapframe|imagemap)[^>]*>[\s\S]*?<\/\1>/gi, '')
+        .replace(/__[A-Z]+__/g, '')
+        .replace(/^[*#]+\s*(?=\S)/gm, '- ')                          // lists (before headings add their own #)
+        .replace(/^\|-\|\s*([^=\n]+?)\s*=\s*$/gm, '\n## $1\n')       // tabber tabs
+        .replace(/<\/?(tabber|tabview|includeonly|onlyinclude|center|div|span|small|big|font|poem|blockquote)[^>]*>/gi, '\n')
+        .replace(/<br\s*\/?>/gi, '\n');
+    // links: interlanguage / files / categories out, the rest → label
+    s = s.replace(/\[\[[a-z]{2,3}(?:-[a-z]+)?:[^\]]*\]\]/g, '');
+    for (let i = 0; i < 6; i++) {
+        const before = s;
+        s = s
+            .replace(/\[\[(?!\s*(?:File|Image|Category|Media|파일|분류|ファイル|画像|カテゴリ)\s*:)([^\[\]|]*)\|([^\[\]]*)\]\]/gi, '$2')
+            .replace(/\[\[(?!\s*(?:File|Image|Category|Media|파일|분류|ファイル|画像|カテゴリ)\s*:)([^\[\]|]*)\]\]/gi, '$1')
+            .replace(/\[\[\s*(?:File|Image|Category|Media|파일|분류|ファイル|画像|カテゴリ)\s*:[^\[\]]*\]\]/gi, '');
+        if (s === before) break;
+    }
+    // templates, innermost first
+    for (let i = 0; i < 25 && s.includes('{{'); i++) {
+        const before = s;
+        s = s.replace(/\{\{([^{}]*)\}\}/g, (_, inner) => renderWikiTemplate(inner));
+        if (s === before) break;
+    }
+    s = s.replace(/\{\{|\}\}/g, '');
+    // tables
+    s = s.split('\n').map(line => {
+        const l = line.trim();
+        if (/^\{\||^\|\}/.test(l)) return '';
+        if (/^\|-/.test(l)) return '';
+        if (/^\|\+/.test(l)) return l.slice(2).trim();
+        if (/^[|!]/.test(l)) {
+            return l.slice(1).split(/\|\||!!/).map(c => c.replace(/^[^|]*?=\s*"[^"]*"\s*\|/, '').replace(/^\s*(?:style|class|width|align|colspan|rowspan|scope)\s*=[^|]*\|/i, '').trim()).filter(Boolean).join(' | ');
+        }
+        return line;
+    }).join('\n');
+    s = s
+        .replace(/\[(?:https?:)?\/\/[^\s\]]+\s+([^\]]+)\]/g, '$1')
+        .replace(/\[(?:https?:)?\/\/[^\]]+\]/g, '')
+        .replace(/'{2,5}/g, '')
+        .replace(/^(=+)\s*(.*?)\s*\1\s*$/gm, (_, eq, t) => `${'#'.repeat(Math.min(eq.length, 4))} ${t}`)
+        .replace(/^;\s*/gm, '')
+        .replace(/^:+\s*/gm, '')
+        .replace(/<[^>]{0,200}>/g, '');
+    return decodeEntities(s)
+        .split('\n').map(l => l.replace(/[ \t]+/g, ' ').trim())
+        .filter((l, i, a) => l || (a[i - 1] ?? '') !== '')
+        .join('\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
+/** Fandom page → ?action=raw (wikitext). Follows one #REDIRECT. */
+async function fetchFandomRaw(u, depth = 0) {
+    const r = new URL(u.href);
+    r.hash = '';
+    const title = r.searchParams.get('title');
+    r.search = '';
+    if (title) r.searchParams.set('title', title);
+    r.searchParams.set('action', 'raw');
+    const raw = await visit(r.href, false);
+    const redirect = String(raw || '').match(/^\s*#(?:REDIRECT|넘겨주기|転送)\s*\[\[([^\]|#]+)/i);
+    if (!redirect && (!raw || looksBlocked(raw) || /^\s*<(!doctype|html)/i.test(raw))) throw new Error('raw not available');
+    if (redirect && depth < 1) {
+        const m = u.pathname.match(/^(\/[a-z]{2,3}(?:-[a-z]+)?)?\/wiki\//i);
+        const next = new URL(`${u.origin}${m?.[1] || ''}/wiki/${encodeURIComponent(redirect[1].trim().replace(/ /g, '_'))}`);
+        return fetchFandomRaw(next, depth + 1);
+    }
+    const text = cleanWikitext(raw);
+    if (text.length < 200) throw new Error('raw too short');
+    const name = decodeURIComponent((title || u.pathname.split('/wiki/')[1] || '').replace(/_/g, ' '));
+    return `# ${name}\n\n${text}`;
+}
+
 async function fetchFandom(u) {
+    try {
+        return await fetchFandomRaw(u);
+    } catch (e) {
+        console.warn(LOG, 'fandom ?action=raw failed, trying api.php', e);
+    }
     const m = u.pathname.match(/^(\/[a-z]{2,3}(?:-[a-z]+)?)?\/wiki\/(.+)$/i);
     if (m) {
         const langPrefix = m[1] || '';
@@ -320,7 +440,147 @@ async function fetchNamu(u) {
     return htmlToText(await visit(u.href));
 }
 
+/** pixiv 百科事典 article markup (*見出し, [[リンク>URL]], [pixivimage:…]) → plain text. */
+function cleanPixivMarkup(raw) {
+    return decodeEntities(String(raw).replace(/\r/g, ''))
+        .replace(/^```\w*\s*$/gm, '')
+        .replace(/^\*\*(?!\*)(.+?)\*\*\s*$/gm, '$1')                  // **bold line** is emphasis, not a heading
+        .replace(/^\*\*\*\s*(.+)$/gm, '#### $1')
+        .replace(/^\*\*\s*(.+)$/gm, '### $1')
+        .replace(/^\*\s*(.+)$/gm, '## $1')
+        .replace(/^-+(?=[^\s-])/gm, '- ')
+        .replace(/\[jumpuri:\s*([^>\]]+?)\s*>[^\]]*\]/gi, '$1')
+        .replace(/\[(?:pixivimage|pixivillust|pixivnovel|pixivuser|pixivbooth|uploadedimage|twitter|youtube|nicovideo|niconico|amazon|booth|spotify|soundcloud)\s*:[^\]]*\]/gi, '')
+        .replace(/\[\[([^\[\]>]*?)\s*>\s*[^\[\]]*\]\]/g, '$1')
+        .replace(/\[\[([^\[\]]*)\]\]/g, '$1')
+        .replace(/^>\|\|?$|^\|\|<$/gm, '')
+        .replace(/^\|\|?(.*)\|\|?$/gm, (_, row) => row.split('|')
+            .map(c => c.replace(/^\s*(?:(?:LEFT|CENTER|RIGHT|BOLD|BGCOLOR\([^)]*\)|COLOR\([^)]*\)|SIZE\(\d+\)):)*/i, '').replace(/^[~!^]+/, '').replace(/\*\*/g, '').trim())
+            .filter(Boolean).join(' | '))
+        .replace(/\*\*([^*\n]+?)\*\*/g, '$1')
+        .split('\n').map(l => l.replace(/[ \t]+/g, ' ').trim())
+        .filter((l, i, a) => l || (a[i - 1] ?? '') !== '')
+        .join('\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
+/**
+ * r.jina.ai reader, called straight from the browser (it allows CORS).
+ * Not through /proxy/ or /api/search/visit — those go via the SillyTavern server, which pixiv blocks.
+ * `url` must already be a normalized href (new URL(...).href) so names are encoded exactly once.
+ */
+async function jinaRead(url) {
+    const res = await fetch(`https://r.jina.ai/${url}`, { headers: { Accept: 'text/plain' } });
+    if (!res.ok) throw new Error(`jina HTTP ${res.status}`);
+    const text = await res.text();
+    if (looksBlocked(text)) throw new Error('jina returned a blocked page');
+    return text;
+}
+
+/** Drops jina's "Title: / URL Source: / Markdown Content:" header. */
+const jinaBody = (md) => {
+    const i = md.indexOf('Markdown Content:');
+    return i >= 0 ? md.slice(i + 'Markdown Content:'.length) : md;
+};
+
+/** Longest ``` fenced block in a markdown page (the /source page renders the article source as one). */
+function longestFence(md) {
+    let best = '';
+    for (const m of md.matchAll(/^```[^\n]*\n([\s\S]*?)\n```\s*$/gm)) if (m[1].length > best.length) best = m[1];
+    return best.trim();
+}
+
+/** Article markdown from jina → plain text, cut before 関連記事 (related articles, comments, ads). */
+function cleanPixivJinaArticle(md) {
+    let s = jinaBody(md).replace(/\r/g, '');
+    const cut = s.search(/^(?:#+\s*)?(?:関連記事|親記事|コメント)\s*$/m);
+    if (cut > 0) s = s.slice(0, cut);
+    return s
+        .replace(/!\[[^\]]*\]\([^)]*\)/g, '')                       // images
+        .replace(/\[([^\]]*)\]\((?:[^()]|\([^)]*\))*\)/g, '$1')      // [text](url) → text
+        .replace(/^(.+)\n=+\s*$/gm, '# $1')                         // setext headings
+        .replace(/^(.+)\n-{3,}\s*$/gm, '## $1')
+        .split('\n').map(l => l.replace(/[ \t]+/g, ' ').trim())
+        .filter((l, i, a) => l || (a[i - 1] ?? '') !== '')
+        .join('\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
+/** Picks the source text block out of a pixiv /history/…/source page. */
+function pixivSourceFromHtml(html) {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    let best = '';
+    doc.querySelectorAll('pre, textarea, code').forEach(el => {
+        const t = el.textContent || '';
+        if (t.length > best.length) best = t;
+    });
+    return best.trim();
+}
+
+/**
+ * pixiv 百科事典: the article page is full of comments, related works and ads, so we read the
+ * latest revision's source instead: /a/<name> → /history/<name> → /history/<name>/<rev>/source.
+ */
+/** Article name from /a/<name> or /history/<name>/…, decoded (so it is encoded exactly once later). */
+function pixivArticleName(u) {
+    const path = decodeURIComponent(u.pathname);
+    return path.match(/^(?:\/[a-z]{2}(?:-[a-z]+)?)?\/a\/([^/]+)/i)?.[1]
+        || path.match(/^\/history\/([^/]+)/i)?.[1]
+        || '';
+}
+
+/**
+ * @param via 'jina' (r.jina.ai from the browser) | 'server' (SillyTavern's /api/search/visit)
+ */
+async function fetchPixivSource(u, via = 'server') {
+    const name = pixivArticleName(u);
+    if (!name) throw new Error('not an article url');
+    const seg = encodeURIComponent(name);
+    const read = via === 'jina' ? jinaRead : (url) => visit(url);
+    let rev = decodeURIComponent(u.pathname).match(/^\/history\/[^/]+\/(\d+)/)?.[1];
+    if (!rev) {
+        const hist = await read(`https://dic.pixiv.net/history/${seg}`);
+        const ids = [...hist.matchAll(/\/history\/[^"'\s/<>()]+\/(\d+)(?:\/source)?(?=["'?#)\s]|$)/gm)].map(x => Number(x[1]));
+        if (!ids.length) throw new Error('no revisions found');
+        rev = String(Math.max(...ids));
+    }
+    const page = await read(`https://dic.pixiv.net/history/${seg}/${rev}/source`);
+    const src = via === 'jina' ? longestFence(page) : pixivSourceFromHtml(page);
+    const text = cleanPixivMarkup(src);
+    if (text.length < 200 || looksBlocked(text)) throw new Error('source too short');
+    return `# ${name}\n\n${text}`;
+}
+
+/** The plain article page through jina, cut before 関連記事. */
+async function fetchPixivJinaArticle(u) {
+    const name = pixivArticleName(u);
+    const target = name ? `https://dic.pixiv.net/a/${encodeURIComponent(name)}` : u.href;
+    let text = cleanPixivJinaArticle(await jinaRead(target));
+    const titleAt = name ? text.search(new RegExp(`^#\\s*${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'm')) : -1;
+    if (titleAt > 0) text = text.slice(titleAt);                      // drop site menu above the article title
+    if (text.length < 200) throw new Error('article too short');
+    return name && !text.startsWith('#') ? `# ${name}\n\n${text}` : text;
+}
+
+/**
+ * pixiv blocks requests coming from the SillyTavern server, so the jina reader (browser → r.jina.ai)
+ * goes first. Order: jina source → jina article → server source → server article.
+ */
 async function fetchPixiv(u) {
+    const tries = [
+        ['jina source', () => fetchPixivSource(u, 'jina')],
+        ['jina article', () => fetchPixivJinaArticle(u)],
+        ['server source', () => fetchPixivSource(u, 'server')],
+    ];
+    for (const [label, run] of tries) {
+        try {
+            return await run();
+        } catch (e) {
+            console.warn(LOG, `pixiv ${label} failed`, e);
+        }
+    }
     return htmlToText(await visit(u.href), ['#article-body', 'article', 'main']);
 }
 
