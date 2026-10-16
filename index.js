@@ -64,7 +64,7 @@ const defaultSettings = Object.freeze({
     profileMaxTokens: 16000,
     // custom prompt instructions (appended to the built-in instructions per feature)
     customPrompts: null,     // { global, tester, eval, voice, doctor, diet, nsfw }
-    // NSFW profile (adult characters only)
+    // NSFW profile
     nsfwOn: false,
     nsfwLevel: 'medium',     // soft | medium | explicit
     nsfwSections: '',        // one section per line ('' = default list)
@@ -2552,7 +2552,7 @@ function registerCommands() {
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'bottest-nsfw',
         callback: async () => { togglePanel(true); switchTab('voice'); scrollPanelTo($id('nsfw_card')); await runNsfwProfile(); return ''; },
-        helpString: 'NSFW 프로필 만들기 (원작에서 성인인 캐릭터만, 먼저 나이를 확인해요).',
+        helpString: 'NSFW 프로필 만들기 (캐릭터의 친밀한 장면 설정을 정리해요).',
     }));
 
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
@@ -7794,7 +7794,7 @@ async function undoAllApplies() {
 // ---------------------------------------------------------------------------
 // Custom prompt instructions (프롬프트 지시문 커스텀)
 // The creator's own instructions are appended to the built-in system prompt of each feature.
-// Built-in output formats and the NSFW age check are never replaced.
+// Built-in output formats (JSON shape) are never replaced.
 // ---------------------------------------------------------------------------
 
 const PROMPT_SLOTS = {
@@ -7804,7 +7804,7 @@ const PROMPT_SLOTS = {
     voice: { label: '말투·성격', desc: '말투·성격 프로필, 언어 짝별 검증' },
     doctor: { label: '진단', desc: '재미 분석, AI 심층 진단, 채팅 아쉬운 점, 로어북·봇 종류 검사' },
     diet: { label: '줄이기·고쳐 쓰기', desc: '토큰 다이어트, 기준 스타일로 고치기, 중복 정리' },
-    nsfw: { label: 'NSFW 프로필', desc: 'NSFW 프로필 만들기 (나이 확인 단계에는 쓰이지 않아요)' },
+    nsfw: { label: 'NSFW 프로필', desc: 'NSFW 프로필 만들기' },
 };
 
 function customPrompts() {
@@ -7892,15 +7892,11 @@ function bindCustomPromptUI() {
 }
 
 // ---------------------------------------------------------------------------
-// NSFW profile (NSFW 프로필) — adult (18+) canon characters only
+// NSFW profile (NSFW 프로필)
 //
-// Safety design:
-//  1) local scan of the card for minor signals (school grades, ages under 18, …)
-//  2) a separate AI age check that only sees the card, the reference and names —
-//     never the creator's notes, AU settings or custom instructions
-//  3) the profile prompt repeats the adult-only rules AFTER any custom instruction
-//  4) the result is scanned again and discarded if it mentions minors
-// None of these steps can be switched off.
+// Writes an intimacy profile for a fictional character, grounded in the canon
+// personality and voice so intimate scenes stay in character.
+// Off by default; turned on per user in the settings tab.
 // ---------------------------------------------------------------------------
 
 const NSFW_LEVELS = {
@@ -8054,7 +8050,7 @@ function nsfwSettingsCardHtml() {
       <section class="bt-card" id="bt_set_nsfw">
         ${cardHead('🔞', 'NSFW 프로필', '말투 탭에서 캐릭터의 친밀한 장면 설정을 정리해요.')}
         <div class="bt-switches">
-          ${toggle('nsfwon', '기능 켜기', '성인(18+) 사용자만 켜 주세요')}
+          ${toggle('nsfwon', '기능 켜기', '성인용 내용이 나와요')}
           ${toggle('nsfweval', '원작 평가에 NSFW 프로필도 참고', '친밀한 장면에서 캐릭터답게 굴었는지도 봐요')}
         </div>
         ${field('수위', `<select id="bt_nsfwlevel" class="bt-input">${Object.entries(NSFW_LEVELS).map(([k, v]) => `<option value="${k}">${v.label}</option>`).join('')}</select>`)}
