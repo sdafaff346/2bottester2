@@ -51,7 +51,7 @@
 | `/bottest-run turns=8` | 8턴 자동 테스트 (+ 설정에 따라 자동 평가) |
 | `/bottest-eval` | 현재 채팅 평가 |
 | `/bottest-eval mode=card` | 카드만 평가 |
-| `/bottest-nsfw` | NSFW 프로필 만들기 (성인 캐릭터만) |
+| `/bottest-nsfw` | NSFW 프로필 만들기 |
 
 ---
 
