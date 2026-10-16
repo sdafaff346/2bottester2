@@ -1409,3 +1409,123 @@
     #bt_panel .bt-rescue-row .bt-btn { width: 100%; }
     #bt_panel .bt-rescue-field-head .bt-btn { margin-left: 0; width: 100%; }
 }
+
+/* ==========================================================================
+   v3.2 — readability (both PC and mobile), text size, settings jump bar,
+   custom prompt chips, NSFW profile
+   ========================================================================== */
+
+/* stronger secondary text — the old 64% / 42% was hard to read on glass */
+#bt_panel {
+    --bt-muted: color-mix(in srgb, var(--bt-fg) 76%, transparent);
+    --bt-faint: color-mix(in srgb, var(--bt-fg) 56%, transparent);
+    --bt-line: color-mix(in srgb, var(--bt-fg) 13%, transparent);
+    width: 480px;
+    font-size: 14.5px;
+    line-height: 1.6;
+}
+#bt_panel .bt-desc { font-size: 13px; line-height: 1.7; }
+#bt_panel .bt-note { font-size: 12.5px; line-height: 1.65; }
+#bt_panel .bt-field-label { font-size: 12.5px; color: color-mix(in srgb, var(--bt-fg) 82%, transparent); }
+#bt_panel .bt-field-hint { font-size: 11.5px; }
+#bt_panel .bt-prose { font-size: 14px; line-height: 1.75; }
+#bt_panel .bt-list { font-size: 13.5px; line-height: 1.7; }
+#bt_panel .bt-quote, #bt_panel .bt-paste { font-size: 13px; }
+#bt_panel .bt-switch-text { font-size: 13.5px; }
+#bt_panel .bt-switch-text small { font-size: 12px; }
+#bt_panel .bt-card-head h3 { font-size: 16.5px; }
+#bt_panel .bt-tab { font-size: 12px; }
+#bt_panel .bt-page { gap: 14px; }
+
+/* text size setting (panel body only, header and tabs stay fixed) */
+#bt_panel[data-textsize='sm'] .bt-body { zoom: 0.92; }
+#bt_panel[data-textsize='lg'] .bt-body { zoom: 1.1; }
+#bt_panel[data-textsize='xl'] .bt-body { zoom: 1.2; }
+
+/* settings jump bar — sticks to the top of the scrolling body */
+#bt_panel .bt-jump {
+    position: sticky;
+    top: -2px;
+    z-index: 3;
+    display: flex;
+    gap: 6px;
+    overflow-x: auto;
+    margin: 0 -14px;
+    padding: 6px 14px 10px;
+    scrollbar-width: none;
+    background: linear-gradient(180deg, var(--bt-tint) 70%, transparent);
+}
+#bt_panel .bt-jump::-webkit-scrollbar { display: none; }
+#bt_panel .bt-jump-btn {
+    flex: none;
+    padding: 6px 12px;
+    border-radius: 999px;
+    font-size: 12.5px;
+    font-weight: 650;
+    color: var(--bt-muted);
+    background: var(--bt-surface-2);
+    box-shadow: inset 0 0 0 1px var(--bt-line);
+    transition: color 0.15s, background 0.15s;
+}
+#bt_panel .bt-jump-btn:hover { color: var(--bt-fg); background: color-mix(in srgb, var(--bt-accent) 14%, transparent); }
+#bt_panel .bt-page > .bt-card { scroll-margin-top: 54px; }
+
+/* custom prompt slot chips */
+#bt_panel .bt-cp-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+#bt_panel .bt-cp-chip {
+    position: relative;
+    padding: 6px 12px;
+    border-radius: 10px;
+    font-size: 12.5px;
+    font-weight: 650;
+    color: var(--bt-muted);
+    background: var(--bt-surface-2);
+    box-shadow: inset 0 0 0 1px var(--bt-line);
+}
+#bt_panel .bt-cp-chip.filled::after { content: ''; position: absolute; top: 5px; right: 5px; width: 6px; height: 6px; border-radius: 50%; background: var(--bt-accent); }
+#bt_panel .bt-cp-chip.active { color: var(--bt-fg); background: color-mix(in srgb, var(--bt-accent) 16%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--bt-accent) 45%, transparent); }
+#bt_panel #bt_cp_desc { margin: 0 0 8px; }
+#bt_panel #bt_cp_text { min-height: 120px; }
+
+/* NSFW profile */
+#bt_panel #bt_nsfw_card .bt-eyebrow { color: var(--bt-bad); }
+#bt_panel #bt_nsfw_card .bt-eyebrow::before { background: linear-gradient(90deg, var(--bt-bad), transparent); }
+#bt_panel #bt_nsfw_meta:empty { display: none; }
+#bt_panel .bt-nsfw-ok { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 9px 12px; border-radius: 11px; font-size: 12.5px; font-weight: 600; color: var(--bt-good); background: color-mix(in srgb, var(--bt-good) 10%, transparent); border: 1px solid color-mix(in srgb, var(--bt-good) 28%, transparent); }
+#bt_panel .bt-nsfw-ok > span { flex: 1; min-width: 0; }
+#bt_panel .bt-nsfw-block { display: grid; gap: 10px; padding: 13px 14px; border-radius: 12px; background: color-mix(in srgb, var(--bt-bad) 8%, transparent); border: 1px solid color-mix(in srgb, var(--bt-bad) 38%, transparent); }
+#bt_panel .bt-nsfw-block-head { display: flex; align-items: center; gap: 8px; color: var(--bt-bad); font-size: 14px; }
+#bt_panel .bt-sub-label { font-size: 11.5px; font-weight: 700; color: var(--bt-muted); }
+#bt_panel .bt-nsfw-summary { padding: 12px 14px; border-radius: 12px; background: var(--bt-surface); border: 1px solid var(--bt-line); }
+#bt_panel .bt-nsfw-line > span { display: block; font-size: 12px; font-weight: 650; color: var(--bt-muted); }
+#bt_panel .bt-nsfw-line .bt-quote { margin-top: 4px; }
+#bt_panel #bt_nsfw_card .bt-vcard .bt-list { margin-top: 6px; }
+
+/* ---------- mobile: taller panel, bigger tap targets, readable tabs ---------- */
+@media (max-width: 768px) {
+    #bt_panel {
+        width: auto;
+        max-height: 82vh;
+        max-height: 82dvh;
+        font-size: 15px;
+    }
+    #bt_panel .bt-tab { font-size: 11.5px; padding: 8px 2px 7px; }
+    #bt_panel .bt-tab .fa-solid { font-size: 15px; }
+    #bt_panel .bt-body { padding: 2px 12px 16px; }
+    #bt_panel .bt-card { padding: 16px 15px 17px; }
+    #bt_panel .bt-desc, #bt_panel .bt-note { font-size: 13.5px; }
+    #bt_panel .bt-prose { font-size: 15px; }
+    #bt_panel .bt-list { font-size: 14.5px; }
+    #bt_panel .bt-switch-text { font-size: 14.5px; }
+    #bt_panel .bt-switch-text small { font-size: 12.5px; }
+    #bt_panel .bt-switch-track { width: 42px; height: 25px; }
+    #bt_panel .bt-switch-track::after { width: 19px; height: 19px; }
+    #bt_panel .bt-switch input:checked + .bt-switch-track::after { transform: translateX(17px); }
+    #bt_panel .bt-iconbtn { width: 38px; height: 38px; }
+    #bt_panel .bt-jump { margin: 0 -12px; padding: 6px 12px 10px; }
+    #bt_panel .bt-jump-btn, #bt_panel .bt-cp-chip { padding: 8px 14px; font-size: 13.5px; }
+    #bt_panel .bt-footer { padding: 12px 14px calc(12px + env(safe-area-inset-bottom, 0px)); font-size: 13px; }
+}
+@media (max-width: 380px) {
+    #bt_panel .bt-tab { font-size: 10.5px; }
+}
