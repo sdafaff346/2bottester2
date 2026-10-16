@@ -1409,3 +1409,12 @@
     #bt_panel .bt-rescue-row .bt-btn { width: 100%; }
     #bt_panel .bt-rescue-field-head .bt-btn { margin-left: 0; width: 100%; }
 }
+
+
+/* Adult-only NSFW profile panel */
+#bt_panel #bt_nsfw_card .bt-switch { margin: 12px 0; }
+#bt_panel #bt_nsfw_card .bt-field { margin-top: 10px; }
+#bt_panel #bt_nsfw_view { display: grid; gap: 12px; padding-top: 10px; }
+#bt_panel #bt_nsfw_view .bt-explain { padding-top: 10px; border-top: 1px solid var(--bt-line); }
+#bt_panel #bt_nsfw_view .bt-explain:first-child { border-top: 0; padding-top: 0; }
+#bt_panel #bt_nsfw_copy:disabled { opacity: .45; cursor: not-allowed; }
