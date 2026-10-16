@@ -105,7 +105,7 @@ function charKey(char) {
     return STORE_PREFIX + (char?.avatar || char?.name || 'unknown');
 }
 
-const emptyCharData = () => ({ urls: [], refText: '', authorNote: '', history: [], names: null, voiceProfile: null, voiceResults: {}, doctor: null, runs: [], abBaselineId: null, abLast: null, applyLog: [], funProfile: null, caehBase: '', caehCaution: '', anchorText: '', anchorTime: 0, anchorBind: false, contLast: null, sourceLang: 'auto', botKind: 'single', rosterText: '', voiceMember: '', memberVoice: {}, nsfwProfile: null });
+const emptyCharData = () => ({ urls: [], refText: '', authorNote: '', history: [], names: null, voiceProfile: null, voiceResults: {}, doctor: null, runs: [], abBaselineId: null, abLast: null, applyLog: [], funProfile: null, caehBase: '', caehCaution: '', anchorText: '', anchorTime: 0, anchorBind: false, contLast: null, sourceLang: 'auto', botKind: 'single', rosterText: '', voiceMember: '', memberVoice: {}, nsfwProfile: null, nsfwRequest: '' });
 
 async function loadCharData(char) {
     if (!char) return emptyCharData();
@@ -1297,11 +1297,16 @@ async function runEvaluation({ useChat = true, messages = 0 } = {}) {
             return;
         }
         result.overall = Math.max(0, Math.min(100, Math.round(Number(result.overall) || 0)));
+        const nsfwUsed = !!(s.nsfwOn && s.nsfwUseInEval && charData?.nsfwProfile?.result);
         const entry = {
             time: Date.now(),
             mode: useChat ? 'chat' : 'card',
             chatId: ctx().getCurrentChatId?.() ?? '',
             result,
+            nsfwUsed,
+            nsfwConfidence: nsfwUsed ? (charData.nsfwProfile.result.confidence || null) : null,
+            nsfwConfidenceNote: nsfwUsed ? (charData.nsfwProfile.result.confidence_note || null) : null,
+            nsfwRequest: nsfwUsed ? (charData.nsfwRequest || null) : null,
         };
         charData.history = [entry, ...(charData.history || [])].slice(0, 20);
         await saveCharData(char, charData);
@@ -1546,7 +1551,9 @@ ${voicePageHtml()}
 ${doctorPageHtml()}
 
     <div class="bt-page" data-page="settings" style="display:none">
-      <nav class="bt-jump" aria-label="설정 바로가기">${[['set_models', '연결'], ['set_testprompt', '테스트 프롬'], ['set_reroll', '리롤'], ['set_eval', '평가'], ['set_prompts', '지시문'], ['set_nsfw', 'NSFW'], ['set_ui', '화면'], ['set_sound', '알림']].map(([id, l]) => `<button type="button" class="bt-jump-btn" data-to="bt_${id}">${l}</button>`).join('')}</nav>
+      <nav class="bt-jump" aria-label="설정 바로가기">${[['set_models', '연결'], ['set_testprompt', '테스트 프롬'], ['set_reroll', '속도·리롤'], ['set_eval', '평가'], ['set_prompts', '지시문'], ['set_nsfw', 'NSFW'], ['set_ui', '화면'], ['set_sound', '알림']].map(([id, l]) => `<button type="button" class="bt-jump-btn" data-to="bt_${id}">${l}</button>`).join('')}</nav>
+
+      <div class="bt-set-group"><span>모델 연결</span><small>어떤 모델로 돌릴지</small></div>
       <section class="bt-card" id="bt_set_models">
         ${cardHead('Models', '연결')}
         ${field('테스터용 연결', '<select id="bt_testerprofile" class="bt-input"></select>', '생각(Reasoning)을 끈 빠른 모델 추천')}
@@ -1565,11 +1572,12 @@ ${doctorPageHtml()}
       </section>
 
       <section class="bt-card" id="bt_set_reroll">
-        ${cardHead('Reroll', '오래 걸리면 다시 요청', '응답을 기다리는 동안 패널 아래쪽(접으면 위쪽)에 다시 요청 버튼이 생겨요. 시간을 정해두면 자동으로도 다시 보내요.')}
+        ${cardHead('Timing', '속도와 다시 요청', '응답을 기다리는 동안 패널 아래쪽(접으면 위쪽)에 다시 요청 버튼이 생겨요. 시간을 정해두면 자동으로도 다시 보내요.')}
         <div class="bt-grid2">
           ${field('자동 리롤 (초)', '<input id="bt_rerollsec" class="bt-input bt-num" type="number" min="0" max="1800" step="10">', '0이면 끔')}
           ${field('자동 리롤 횟수', '<input id="bt_rerollmax" class="bt-input bt-num" type="number" min="0" max="5" step="1">', '요청 하나당')}
         </div>
+        ${field('턴 사이 대기 (ms)', '<input id="bt_delay" class="bt-input bt-num" type="number" min="0" max="30000" step="100">', '자동 테스트에서 다음 메시지를 보내기 전 쉬는 시간')}
         <p class="bt-note">생각(Reasoning)하는 모델은 긴 평가에 몇 분씩 걸리기도 해요. 너무 짧게 잡으면 멀쩡한 요청도 다시 보내니 2~3분 이상을 추천해요.</p>
       </section>
 
@@ -1577,11 +1585,7 @@ ${doctorPageHtml()}
         ${cardHead('Evaluation', '평가')}
         <div class="bt-grid2">
           ${field('응답 언어', '<input id="bt_language" class="bt-input" type="text">')}
-          ${field('최근 메시지 수', '<input id="bt_evalmsgs" class="bt-input bt-num" type="number" min="2" max="200">')}
-          ${field('원작 자료 최대 글자', '<input id="bt_refmax" class="bt-input bt-num" type="number" min="1000" max="200000" step="1000">')}
-          ${field('평가 최대 토큰', '<input id="bt_evaltokens" class="bt-input bt-num" type="number" min="2000" max="64000" step="500">')}
-          ${field('프로필 최대 토큰', '<input id="bt_proftokens" class="bt-input bt-num" type="number" min="4000" max="64000" step="500">')}
-          ${field('테스트 메시지 최대 토큰', '<input id="bt_testertokens" class="bt-input bt-num" type="number" min="1024" max="16000" step="256">')}
+          ${field('최근 메시지 수', '<input id="bt_evalmsgs" class="bt-input bt-num" type="number" min="2" max="200">', '평가에 넣을 분량')}
         </div>
         ${field('고칠 문장 언어', `<select id="bt_pastelang" class="bt-input">
             <option value="en">영어 (토큰 절약 · 고유명사는 한국어+원어)</option>
@@ -1599,10 +1603,23 @@ ${doctorPageHtml()}
           ${toggle('pastelines', '고칠 문장 속 대사는 원래 언어 유지', '설명은 영어로 줄여도, 따옴표 안의 대사는 캐릭터가 채팅에서 쓰는 언어로 남겨서 말투·사투리를 지켜요')}
           ${toggle('loreref', '연결된 로어북을 기준 자료로 쓰기', '평가할 때 로어북 설정과 어긋나는 답장도 찾아요. 원작 자료가 없어도 로어북만으로 평가할 수 있어요.')}
         </div>
+        <details class="bt-disclosure bt-disclosure-sm">
+          <summary><span>분량 한도 (고급)</span>${ico('chevron-down')}</summary>
+          <div class="bt-grid2">
+            ${field('원작 자료 최대 글자', '<input id="bt_refmax" class="bt-input bt-num" type="number" min="1000" max="200000" step="1000">')}
+            ${field('평가 최대 토큰', '<input id="bt_evaltokens" class="bt-input bt-num" type="number" min="2000" max="64000" step="500">')}
+            ${field('프로필 최대 토큰', '<input id="bt_proftokens" class="bt-input bt-num" type="number" min="4000" max="64000" step="500">')}
+            ${field('테스트 메시지 최대 토큰', '<input id="bt_testertokens" class="bt-input bt-num" type="number" min="1024" max="16000" step="256">')}
+          </div>
+          <p class="bt-note">결과가 중간에 잘리면 올리고, 모델이 길이 제한으로 거절하면 내려요. 모르겠으면 그대로 두세요.</p>
+        </details>
       </section>
 
+      <div class="bt-set-group"><span>AI 지시</span><small>프롬프트에 더할 내용</small></div>
 ${customPromptCardHtml()}
 ${nsfwSettingsCardHtml()}
+
+      <div class="bt-set-group"><span>내 환경</span><small>보이는 방식과 알림</small></div>
       <section class="bt-card" id="bt_set_ui">
         ${cardHead('Interface', '화면')}
         <div class="bt-grid2">
@@ -1614,14 +1631,13 @@ ${nsfwSettingsCardHtml()}
               <option value="ice">아이스 블루</option>
               <option value="theme">테마 색 따르기</option>
             </select>`)}
-          ${field('턴 사이 대기 (ms)', '<input id="bt_delay" class="bt-input bt-num" type="number" min="0" max="30000" step="100">')}
+          ${field('글자 크기', `<select id="bt_textsize" class="bt-input">
+              <option value="sm">작게</option>
+              <option value="md">보통</option>
+              <option value="lg">크게</option>
+              <option value="xl">아주 크게</option>
+            </select>`, '패널 본문에만')}
         </div>
-        ${field('글자 크기', `<select id="bt_textsize" class="bt-input">
-            <option value="sm">작게</option>
-            <option value="md">보통</option>
-            <option value="lg">크게</option>
-            <option value="xl">아주 크게</option>
-          </select>`, '패널 본문에만 적용돼요')}
         <div class="bt-switches">
           ${toggle('automin', '모바일 테스트 중 패널 자동 접기')}
         </div>
@@ -1735,7 +1751,23 @@ function bindPanel() {
     const ts = $id('textsize');
     ts.value = s.textSize || 'md';
     ts.addEventListener('change', () => { s.textSize = ts.value; $id('panel').dataset.textsize = ts.value; saveSettings(); });
-    document.querySelectorAll('#bt_panel .bt-jump-btn').forEach(b => b.addEventListener('click', () => scrollPanelTo(document.getElementById(b.dataset.to))));
+    const jumpBtns = [...document.querySelectorAll('#bt_panel .bt-jump-btn')];
+    jumpBtns.forEach(b => b.addEventListener('click', () => scrollPanelTo(document.getElementById(b.dataset.to))));
+    // highlight the section currently under the jump bar
+    const spy = () => {
+        const body = $id('body');
+        if (!body || !jumpBtns.length) return;
+        const line = body.getBoundingClientRect().top + 64;
+        let cur = jumpBtns[0];
+        for (const b of jumpBtns) {
+            const el = document.getElementById(b.dataset.to);
+            if (el && el.getBoundingClientRect().top <= line) cur = b;
+        }
+        jumpBtns.forEach(b => b.classList.toggle('active', b === cur));
+    };
+    const raf = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (f => setTimeout(f, 16));
+    $id('body').addEventListener('scroll', () => { if (!spy.q) { spy.q = raf(() => { spy.q = 0; spy(); }); } }, { passive: true });
+    spy();
     ac.addEventListener('change', () => { s.accent = ac.value; $id('panel').dataset.accent = ac.value; saveSettings(); });
     bindNum('proftokens', 'profileMaxTokens');
     const se = $id('searchengine');
@@ -2311,6 +2343,11 @@ function renderResult(entry, prevEntry) {
             </div>
         </section>`}
         ${r.summary ? `<section class="bt-card bt-summary">${ico('quote-left')}<div class="bt-prose">${prose(r.summary)}</div></section>` : ''}
+        ${entry.nsfwUsed ? `<section class="bt-card bt-nsfw-eval-info">
+            <div class="bt-nsfw-eval-head">${ico('sparkles')}<span>NSFW 프로필 반영</span></div>
+            ${entry.nsfwConfidence ? `<div class="bt-nsfw-conf bt-conf-row-${escapeHtml(entry.nsfwConfidence)}">${ico('gauge-high')}<span class="bt-nsfw-conf-label">신뢰도</span>${confTag(entry.nsfwConfidence)}${entry.nsfwConfidenceNote ? `<small>${escapeHtml(entry.nsfwConfidenceNote)}</small>` : ''}</div>` : ''}
+            ${entry.nsfwRequest ? `<div class="bt-nsfw-eval-req">${ico('quote-left')}<div><span class="bt-sub-label">NSFW 요청사항</span><p>${escapeHtml(truncate(entry.nsfwRequest, 300))}</p></div></div>` : ''}
+        </section>` : ''}
         ${cats ? `<section class="bt-card">${cardHead('', '항목별 점수')}<div class="bt-meters">${cats}</div></section>` : ''}
         ${r.per_character?.length ? `<section class="bt-card">${cardHead('', '캐릭터별')}<div class="bt-meters">${r.per_character.map(c => meterHtml(escapeHtml(c.name || ''), c.score ?? null, { sub: c.comment })).join('')}</div></section>` : ''}
         ${r.strengths?.length ? `<section class="bt-card">${cardHead('', '잘 된 점')}${renderList(r.strengths, 'bt-list-check')}</section>` : ''}
@@ -2348,6 +2385,12 @@ function renderRawResult(raw, where = 'result') {
 function resultToMarkdown(entry) {
     const r = entry.result || {};
     const lines = [`# 원작 일치도 ${r.overall}%`, '', r.summary || '', ''];
+    if (entry.nsfwUsed) {
+        lines.push('## NSFW 프로필 반영');
+        if (entry.nsfwConfidence) lines.push(`- 신뢰도: ${CONF_LABEL[entry.nsfwConfidence] || entry.nsfwConfidence}${entry.nsfwConfidenceNote ? ` · ${entry.nsfwConfidenceNote}` : ''}`);
+        if (entry.nsfwRequest) lines.push(`- 요청사항: ${entry.nsfwRequest}`);
+        lines.push('');
+    }
     if (r.categories?.length) {
         lines.push('## 항목별 점수');
         r.categories.forEach(c => lines.push(`- ${c.name}: ${c.score}% — ${c.comment || ''}`));
@@ -3507,7 +3550,7 @@ function renderVoiceForChar(data) {
     writeNamesToUI(data.names);
     renderVoiceProfile(data.voiceProfile);
     renderVoiceResults(data);
-    renderNsfwProfile(data.nsfwProfile);
+    renderNsfwProfile(data.nsfwProfile, data.nsfwRequest || '');
 }
 
 
@@ -6652,14 +6695,14 @@ async function loadVoiceData(char) {
     const slot = cd.memberVoice?.[who] || {};
     const r = rosterOf(cd).find(x => x.name === who);
     const names = slot.names || Object.assign(emptyNames(), { ko: who, ...(r?.orig ? (/[぀-ヿ一-鿿]/.test(r.orig) ? { ja: r.orig } : { en: r.orig }) : {}) });
-    return { ...cd, names, voiceProfile: slot.voiceProfile || null, voiceResults: slot.voiceResults || {}, nsfwProfile: slot.nsfwProfile || null, __member: who };
+    return { ...cd, names, voiceProfile: slot.voiceProfile || null, voiceResults: slot.voiceResults || {}, nsfwProfile: slot.nsfwProfile || null, nsfwRequest: slot.nsfwRequest || '', __member: who };
 }
 
 async function saveVoiceData(char, vd) {
     if (!vd.__member) { await saveCharData(char, vd); return; }
     const cd = await loadCharData(char);
     cd.memberVoice = cd.memberVoice || {};
-    cd.memberVoice[vd.__member] = { names: vd.names, voiceProfile: vd.voiceProfile, voiceResults: vd.voiceResults, nsfwProfile: vd.nsfwProfile || null };
+    cd.memberVoice[vd.__member] = { names: vd.names, voiceProfile: vd.voiceProfile, voiceResults: vd.voiceResults, nsfwProfile: vd.nsfwProfile || null, nsfwRequest: vd.nsfwRequest || '' };
     await saveCharData(char, cd);
 }
 
@@ -7893,7 +7936,9 @@ function nsfwSystem(vd, level) {
         NO_SHIP_RULE,
         'Explanations in natural Korean. Sample lines stay in the language and register the character uses in the chat (keep dialect, first person and how they address {{user}}).',
         pasteLangRule(vd),
-        'Limits: canon_basis ≤ 6, each section body ≤ 4 sentences and ≤ 5 bullets, sample_lines ≤ 6, boundaries ≤ 6, ooc_risks ≤ 5, card_paste ≤ 1200 characters.',
+        'If a "[Creator\'s request for this character]" block is present, treat it as the top priority for what to emphasise, and weave it into the relevant sections instead of answering it separately. If part of it would clash with the canon personality, follow it anyway but note the clash in "ooc_risks" so the creator can see the cost. List in "requests_applied" how you handled each request; leave it empty when no request was given.',
+        'Set "confidence" by how much solid material you actually had (reference text, voice profile, well-known canon) — "low" when you are mostly extrapolating from a thin card. Put the reason in "confidence_note" as one short Korean sentence.',
+        'Limits: canon_basis ≤ 6, each section body ≤ 4 sentences and ≤ 5 bullets, sample_lines ≤ 6, boundaries ≤ 6, ooc_risks ≤ 5, requests_applied ≤ 6, card_paste ≤ 1200 characters.',
     ].filter(Boolean).join('\n\n');
     const hard = [
         'JSON rules: straight double quotes, escape " inside strings, no trailing commas. Output ONE JSON object only:',
@@ -7902,7 +7947,9 @@ function nsfwSystem(vd, level) {
         ' "sample_lines": [{"situation": "<Korean>", "line": "<in-character line>"}],',
         ' "boundaries": ["<what this character will not do or say>"],',
         ' "ooc_risks": [{"risk": "<common out-of-character mistake>", "fix": "<how to keep it in character>"}],',
-        ' "card_paste": "<compact block to add to the card (PASTE TEXT LANGUAGE rule)>", "confidence": "high"|"medium"|"low"}',
+        ' "requests_applied": [{"request": "<the creator asked for this>", "how": "<how it was reflected, in Korean>"}],',
+        ' "card_paste": "<compact block to add to the card (PASTE TEXT LANGUAGE rule)>",',
+        ' "confidence": "high"|"medium"|"low", "confidence_note": "<1 short Korean sentence on why>"}',
     ].join('\n');
     return `${withCustom(base, 'nsfw')}\n\n${hard}`;
 }
@@ -7915,6 +7962,7 @@ function sanitizeNsfw(r) {
     r.sections = (r.sections || []).filter(x => x && typeof x === 'object').map(x => ({ ...x, body: stripShipping(x.body), bullets: noShipList(x.bullets) }));
     r.sample_lines = (r.sample_lines || []).filter(x => x && !hasShip(`${x.situation} ${x.line}`));
     r.ooc_risks = (r.ooc_risks || []).filter(x => x && !hasShip(`${x.risk} ${x.fix}`));
+    r.requests_applied = (r.requests_applied || []).filter(x => x && typeof x === 'object' && (x.request || x.how));
     return r;
 }
 
@@ -7941,15 +7989,18 @@ async function runNsfwProfile() {
         const level = NSFW_LEVELS[s.nsfwLevel] ? s.nsfwLevel : 'medium';
         const n = vd.names || {};
         const vp = vd.voiceProfile?.profile;
+        const req = String($id('nsfw_request')?.value ?? vd.nsfwRequest ?? '').trim();
+        vd.nsfwRequest = req;
         const prompt = [
             `[Character] ${voiceName(char, vd)} / 日: ${n.ja || ''} / EN: ${n.en || ''} / KO: ${n.ko || ''}`,
+            req ? `[Creator's request for this character — follow it unless it breaks the character]\n${truncate(req, 2000)}` : '',
             vp ? `[Voice & personality profile]\n${truncate(JSON.stringify({ speech: vp.speech?.ko_official || vp.speech?.ja, canon: vp.personality?.canon }, null, 1), 5000)}` : '',
             vd.refText ? `[Reference material]\n${truncate(vd.refText, 6000)}` : '',
             `[Character card]\n${truncate(card, 8000)}`,
             'Now output the JSON profile.',
         ].filter(Boolean).join('\n\n');
         const out = await requestJsonComplete({ system: nsfwSystem(vd, level), prompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: '🔞 NSFW 프로필 정리 중…' });
-        await saveNsfw(char, vd, { time: Date.now(), level, result: sanitizeNsfw(out) });
+        await saveNsfw(char, vd, { time: Date.now(), level, request: req, result: sanitizeNsfw(out) });
         setStatus('✅ NSFW 프로필 완성');
         toastr.success('NSFW 프로필을 만들었어요');
         setMinimized(false);
@@ -7964,13 +8015,16 @@ async function runNsfwProfile() {
     }
 }
 
-/** Short reference block for the evaluation prompt (only for an age-checked profile). */
+/** Short reference block for the evaluation prompt. */
 function nsfwEvalBlock(cd) {
     const s = getSettings();
     const p = cd?.nsfwProfile;
     if (!s.nsfwOn || !s.nsfwUseInEval || !p?.result) return '';
     const r = p.result;
+    const req = cd?.nsfwRequest;
     const body = [
+        r.confidence ? `Confidence: ${r.confidence}${r.confidence_note ? ` (${r.confidence_note})` : ''}` : '',
+        req ? `Creator's NSFW request: ${truncate(req, 500)}` : '',
         r.summary,
         ...(r.sections || []).map(x => `- ${x.title}: ${x.body || ''}`),
         r.boundaries?.length ? `Boundaries: ${r.boundaries.join('; ')}` : '',
@@ -7983,6 +8037,9 @@ function nsfwCardHtml() {
       <section class="bt-card" id="bt_nsfw_card">
         ${cardHead('🔞', 'NSFW 프로필', '원작 성격·말투를 바탕으로, 이 캐릭터의 친밀한 장면 설정을 정리해요.')}
         <div id="bt_nsfw_off" class="bt-callout" style="display:none">${ico('lock')}<div class="bt-prose"><p>NSFW 프로필은 꺼져 있어요. 설정 탭에서 켤 수 있어요.</p></div></div>
+        <div id="bt_nsfw_req_wrap">
+          ${field('요청사항', '<textarea id="bt_nsfw_request" class="bt-input" rows="3" placeholder="이 캐릭터에 원하는 걸 적어주세요&#10;예) 주도권은 유저 쪽, 존댓말 유지&#10;예) 질투 많은 쪽으로, 애프터케어 꼼꼼하게"></textarea>', '이 캐릭터에만 적용돼요 · 캐릭터마다 따로 저장')}
+        </div>
         <div class="bt-actions" id="bt_nsfw_actions">
           <button type="button" id="bt_nsfw_run" class="bt-btn bt-btn-primary bt-btn-wide">${ico('sparkles')}<span>NSFW 프로필 만들기</span></button>
           <button type="button" id="bt_nsfw_gate" class="bt-btn" style="display:none">${ico('gear')}<span>설정에서 켜기</span></button>
@@ -8009,7 +8066,7 @@ function nsfwSettingsCardHtml() {
       </section>`;
 }
 
-function renderNsfwProfile(p) {
+function renderNsfwProfile(p, req) {
     const view = $id('nsfw_view');
     if (!view) return;
     const s = getSettings();
@@ -8017,6 +8074,8 @@ function renderNsfwProfile(p) {
     $id('nsfw_off').style.display = on ? 'none' : '';
     $id('nsfw_run').style.display = on ? '' : 'none';
     $id('nsfw_gate').style.display = on ? 'none' : '';
+    $id('nsfw_req_wrap').style.display = on ? '' : 'none';
+    if (req !== undefined) $id('nsfw_request').value = req || '';
     const meta = $id('nsfw_meta');
     if (!on) { view.innerHTML = ''; meta.textContent = ''; return; }
     meta.textContent = `수위: ${NSFW_LEVELS[s.nsfwLevel]?.label || NSFW_LEVELS.medium.label}${p?.time ? ` · ${new Date(p.time).toLocaleString()}` : ''}`;
@@ -8033,8 +8092,10 @@ function renderNsfwProfile(p) {
         </article>`).join('');
     const lines = (r.sample_lines || []).map(x => `<div class="bt-nsfw-line">${x.situation ? `<span>${escapeHtml(x.situation)}</span>` : ''}<blockquote class="bt-quote">${escapeHtml(x.line || '')}</blockquote></div>`).join('');
     const risks = (r.ooc_risks || []).map(x => `<li><b>${escapeHtml(x.risk || '')}</b>${x.fix ? `<div class="bt-muted">${escapeHtml(x.fix)}</div>` : ''}</li>`).join('');
+    const applied = (r.requests_applied || []).map(x => `<li><b>${escapeHtml(x.request || '')}</b>${x.how ? `<div class="bt-muted">${escapeHtml(x.how)}</div>` : ''}</li>`).join('');
     view.innerHTML = `
-        ${r.confidence ? `<div class="bt-nsfw-ok">${ico('circle-check')}<span>NSFW 프로필</span>${confTag(r.confidence)}</div>` : ''}
+        ${r.confidence ? `<div class="bt-nsfw-conf bt-conf-row-${escapeHtml(r.confidence)}">${ico('gauge-high')}<span class="bt-nsfw-conf-label">신뢰도</span>${confTag(r.confidence)}${r.confidence_note ? `<small>${escapeHtml(r.confidence_note)}</small>` : ''}</div>` : ''}
+        ${applied ? `<article class="bt-vcard bt-nsfw-req-card"><div class="bt-vcard-head"><h4>${ico('list-check')} 요청사항 반영</h4></div><ul class="bt-list">${applied}</ul></article>` : (p.request ? `<div class="bt-nsfw-req-echo">${ico('quote-left')}<div><span class="bt-sub-label">이 프로필에 넣은 요청</span><p>${escapeHtml(truncate(p.request, 300))}</p></div></div>` : '')}
         ${r.summary ? `<div class="bt-summary bt-nsfw-summary">${ico('quote-left')}<div class="bt-prose">${prose(r.summary)}</div></div>` : ''}
         ${r.canon_basis?.length ? `<details class="bt-disclosure bt-disclosure-sm" open><summary><span>원작 성격에서 나오는 부분</span>${ico('chevron-down')}</summary>${renderList(r.canon_basis)}</details>` : ''}
         ${sections}
@@ -8051,6 +8112,9 @@ function renderNsfwProfile(p) {
     view.querySelector('.bt-nsfw-apply')?.addEventListener('click', () => openApplyDialog({ field: 'description', text: r.card_paste || '', reason: 'NSFW 프로필' }));
     $id('nsfw_copyall')?.addEventListener('click', () => copyText([
         `# NSFW 프로필 — ${$id('charname')?.textContent || ''}`,
+        r.confidence ? `(${CONF_LABEL[r.confidence] || r.confidence}${r.confidence_note ? ` · ${r.confidence_note}` : ''})` : '',
+        p.request ? `\n## 요청사항\n${p.request}` : '',
+        r.requests_applied?.length ? `\n## 요청사항 반영\n${r.requests_applied.map(x => `- ${x.request || ''}: ${x.how || ''}`).join('\n')}` : '',
         r.summary || '',
         ...(r.sections || []).map(x => `\n## ${x.title}\n${x.body || ''}${(x.bullets || []).map(b => `\n- ${b}`).join('')}`),
         r.sample_lines?.length ? `\n## 예시 대사\n${r.sample_lines.map(x => `- (${x.situation || ''}) ${x.line || ''}`).join('\n')}` : '',
@@ -8068,7 +8132,11 @@ function renderNsfwProfile(p) {
 
 function bindNsfwUI() {
     const s = getSettings();
-    const refresh = async () => { const ch = getCurrentCharacter(); renderNsfwProfile(ch ? (await loadVoiceData(ch)).nsfwProfile : null); };
+    const refresh = async () => {
+        const ch = getCurrentCharacter();
+        const vd = ch ? await loadVoiceData(ch) : null;
+        renderNsfwProfile(vd?.nsfwProfile || null, vd?.nsfwRequest || '');
+    };
     const on = $id('nsfwon');
     on.checked = !!s.nsfwOn;
     on.addEventListener('change', async () => {
@@ -8093,6 +8161,14 @@ function bindNsfwUI() {
     sec.value = s.nsfwSections || '';
     sec.addEventListener('input', () => { s.nsfwSections = sec.value; saveSettings(); });
     $id('nsfwsections_reset').addEventListener('click', () => { s.nsfwSections = ''; sec.value = ''; saveSettings(); toastr.info('기본 항목으로 돌렸어요'); });
+    const rq = $id('nsfw_request');
+    rq.addEventListener('change', async () => {
+        const ch = getCurrentCharacter();
+        if (!ch) return;
+        const vd = await loadVoiceData(ch);
+        vd.nsfwRequest = rq.value.trim();
+        await saveVoiceData(ch, vd);
+    });
     $id('nsfw_run').addEventListener('click', runNsfwProfile);
     $id('nsfw_gate').addEventListener('click', () => { switchTab('settings'); scrollPanelTo($id('set_nsfw')); });
 }
