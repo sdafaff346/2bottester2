@@ -1418,3 +1418,29 @@
 #bt_panel #bt_nsfw_view .bt-explain { padding-top: 10px; border-top: 1px solid var(--bt-line); }
 #bt_panel #bt_nsfw_view .bt-explain:first-child { border-top: 0; padding-top: 0; }
 #bt_panel #bt_nsfw_copy:disabled { opacity: .45; cursor: not-allowed; }
+
+
+/* Expanded NSFW profile tools: options, editable JSON, export and reversible history */
+#bt_panel #bt_nsfw_card .bt-nsfw-options { margin-bottom: 12px; }
+#bt_panel #bt_nsfw_card .bt-nsfw-switches { margin: 10px 0 14px; }
+#bt_panel #bt_nsfw_card .bt-wrap-actions { flex-wrap: wrap; align-items: center; }
+#bt_panel #bt_nsfw_card .bt-nsfw-editor-wrap[hidden] { display: none !important; }
+#bt_panel #bt_nsfw_card .bt-nsfw-editor-wrap { margin-top: 14px; padding: 12px; border: 1px solid var(--bt-line); border-radius: 10px; background: color-mix(in srgb, var(--bt-surface) 82%, transparent); }
+#bt_panel #bt_nsfw_card textarea.bt-nsfw-editor { min-height: 260px; max-height: 65vh; font-family: var(--bt-font-mono); font-size: 12px; line-height: 1.55; white-space: pre; overflow: auto; }
+#bt_panel #bt_nsfw_card .bt-nsfw-history { margin-top: 12px; }
+#bt_panel #bt_nsfw_card .bt-nsfw-sources ul { margin: 8px 0 0; padding-left: 20px; overflow-wrap: anywhere; }
+#bt_panel #bt_nsfw_card .bt-nsfw-sources a { color: var(--bt-accent-ink); }
+#bt_panel #bt_nsfw_card .bt-nsfw-samples { display: grid; gap: 9px; }
+#bt_panel #bt_nsfw_card .bt-nsfw-sample { border-left: 2px solid var(--bt-accent-line); padding: 8px 10px; background: color-mix(in srgb, var(--bt-surface) 70%, transparent); border-radius: 0 8px 8px 0; }
+#bt_panel #bt_nsfw_card .bt-nsfw-sample > b { display: block; font-size: 12px; margin-bottom: 4px; color: var(--bt-accent-ink); }
+#bt_panel #bt_nsfw_card .bt-nsfw-sample blockquote { margin: 5px 0; padding-left: 10px; border-left: 2px solid var(--bt-line-strong); }
+#bt_panel #bt_nsfw_card .bt-nsfw-sample small { display: block; color: var(--bt-muted); font-size: 11.5px; }
+#bt_panel #bt_nsfw_card #bt_nsfw_restore:disabled,
+#bt_panel #bt_nsfw_card #bt_nsfw_copy:disabled,
+#bt_panel #bt_nsfw_card #bt_nsfw_copy_json:disabled,
+#bt_panel #bt_nsfw_card #bt_nsfw_export:disabled { opacity: .45; cursor: not-allowed; }
+@media (max-width: 768px) {
+    #bt_panel #bt_nsfw_card .bt-wrap-actions .bt-btn { flex: 1 1 100%; }
+    #bt_panel #bt_nsfw_card .bt-nsfw-options { grid-template-columns: 1fr; }
+    #bt_panel #bt_nsfw_card textarea.bt-nsfw-editor { min-height: 200px; max-height: 50vh; }
+}
