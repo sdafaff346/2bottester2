@@ -7585,7 +7585,12 @@ async function recordCardVersion(char, cd, { fields = null, time = Date.now(), l
     }
     cd.cardVersions.push({ id: `v${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`, hash: h, time, fields: f, label, v: 2 });
     cd.cardVersions.sort((a, b) => a.time - b.time);
-    if (cd.cardVersions.length > 8) cd.cardVersions = [cd.cardVersions[0], ...cd.cardVersions.slice(-7)];
+    if (cd.cardVersions.length > 12) {
+        // keep the first, any version a chat is locked to, and the newest ones
+        const pinned = new Set(cd.pinnedVersions || []);
+        const keep = new Set([cd.cardVersions[0].id, ...cd.cardVersions.slice(-8).map(v => v.id)]);
+        cd.cardVersions = cd.cardVersions.filter(v => keep.has(v.id) || pinned.has(v.id));
+    }
     await saveCharData(char, cd);
     return cd;
 }
@@ -7681,7 +7686,12 @@ async function legacyLock(char, cd, version, { mode = getSettings().legacyMode |
     let text = mode === 'diff' ? await legacyDiffText(char, cd, version.fields, now) : legacyChangedText(version.fields, now);
     if (!text) { await legacyUnlock({ keepDecision: true, silent: true }); return null; }
     await setLegacyInject(text);
-    const meta = { on: true, versionId: version.id, versionTime: version.time, mode, text, curHash: fieldsHash(now), auto, at: Date.now() };
+    const meta = { on: true, versionId: version.id, versionTime: version.time, fields: version.fields, mode, text, curHash: fieldsHash(now), auto, at: Date.now() };
+    // remember that a chat uses this version so trimming old versions never drops it
+    if (version.id && !(cd.pinnedVersions || []).includes(version.id)) {
+        cd.pinnedVersions = [...(cd.pinnedVersions || []), version.id].slice(-30);
+        await saveCharData(char, cd);
+    }
     await saveLegacyMeta(meta);
     return meta;
 }
@@ -7742,8 +7752,20 @@ async function legacyOnChatChanged() {
         const meta = legacyMeta();
         const msgs = (ctx().chat || []).filter(m => m && !m.is_system);
         if (meta?.on) {
-            const v = (cd.cardVersions || []).find(x => x.id === meta.versionId);
-            if (!versionSafeFor(v, char) || looksLikeOtherCharacter({ description: (meta.text || '').replace(/^[\s\S]*?### Description \(earlier version\)\n/, '').split('\n### ')[0] }, char)) {
+            // the version may have been trimmed from the list; the chat keeps its own copy (v3.2.1+)
+            let v = (cd.cardVersions || []).find(x => x.id === meta.versionId);
+            if (!v && meta.fields) v = { id: meta.versionId, time: meta.versionTime, fields: meta.fields };
+            else if (v && !(cd.pinnedVersions || []).includes(v.id)) { // chats locked before v3.2.1
+                cd.pinnedVersions = [...(cd.pinnedVersions || []), v.id].slice(-30);
+                await saveCharData(char, cd);
+            }
+            const textDesc = (meta.text || '').includes('### Description (earlier version)\n')
+                ? (meta.text || '').split('### Description (earlier version)\n')[1].split('\n### ')[0] : '';
+            // only a card that really looks like ANOTHER character counts as the v3.0 mix-up
+            const foreign = (v && !versionSafeFor(v, char)) || looksLikeOtherCharacter({ description: textDesc }, char);
+            if (!v && !foreign) {
+                // older lock whose version was trimmed: keep the note as it is, just don't rebuild it
+            } else if (foreign) {
                 // locked to a version that was recorded wrongly → take it out of this chat
                 await legacyUnlock({ keepDecision: false, silent: true });
                 toastr.warning('이 채팅에 잘못 들어가 있던 “예전 캐해”를 뺐어요. 다른 캐릭터의 카드가 섞여 들어갔을 수 있어요(봇 테스터 v3.0 버그).', '봇 테스터', { timeOut: 9000 });
