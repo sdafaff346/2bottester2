@@ -1611,3 +1611,63 @@
 @media (max-width: 380px) {
     #bt_panel .bt-tab { font-size: 10.5px; }
 }
+
+/* ==========================================================
+   v3.3 — safer applying: active strip, merge preview, verify
+   ========================================================== */
+.bt-active { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 12px 0; }
+.bt-active-chip {
+    display: inline-flex; align-items: center; gap: 6px; min-height: 28px; padding: 3px 10px;
+    border-radius: 999px; border: 1px solid var(--bt-line); background: var(--bt-surface-2);
+    color: var(--bt-fg); font: inherit; font-size: 0.82em; font-weight: 600; cursor: pointer;
+    transition: border-color .2s var(--bt-ease, ease), transform .15s var(--bt-ease, ease);
+}
+.bt-active-chip:hover { border-color: var(--bt-accent-line, var(--bt-accent)); transform: translateY(-1px); }
+.bt-active-chip i { font-size: 0.95em; opacity: 0.85; }
+.bt-active-chip.warn { border-color: color-mix(in srgb, var(--bt-warn) 55%, transparent); color: var(--bt-warn); }
+.bt-active-chip.bad { border-color: color-mix(in srgb, var(--bt-bad) 60%, transparent); color: var(--bt-bad); }
+.bt-active-chip.busy { border-color: var(--bt-accent-line, var(--bt-accent)); color: var(--bt-accent-ink, var(--bt-accent)); }
+.bt-active-chip.busy i { animation: bt-spin 1.6s linear infinite; }
+@keyframes bt-spin { to { transform: rotate(360deg); } }
+
+.bt-apply-dialog .bt-apply-modes { display: flex; flex-wrap: wrap; gap: 6px 16px; }
+.bt-apply-dialog .bt-apply-modes label { display: inline-flex; align-items: center; gap: 6px; font-weight: 500; }
+.bt-apply-dialog .bt-apply-modes small { opacity: 0.7; font-weight: 400; }
+.bt-apply-dialog .bt-apply-preview { display: grid; gap: 8px; }
+.bt-apply-dialog .bt-apply-preview:empty { display: none; }
+.bt-apply-dialog .bt-apply-stats { display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 8px 10px; border-radius: 8px; background: rgba(127, 127, 127, 0.12); font-size: 0.88em; font-variant-numeric: tabular-nums; }
+.bt-apply-dialog .bt-apply-stats.warn { box-shadow: inset 3px 0 0 #dfa24a; }
+.bt-apply-dialog .bt-apply-warn { margin: 0; font-size: 0.88em; line-height: 1.6; color: #d9902e; word-break: keep-all; }
+.bt-apply-dialog .bt-apply-changes { display: grid; gap: 6px; max-height: 240px; overflow: auto; }
+.bt-apply-dialog .bt-apply-change { display: grid; gap: 3px; padding: 7px 10px; border-radius: 8px; border: 1px solid rgba(127, 127, 127, 0.25); font-size: 0.86em; line-height: 1.55; }
+.bt-apply-dialog .bt-apply-change del { opacity: 0.6; text-decoration-color: #c85a5c; }
+.bt-apply-dialog .bt-apply-change ins { text-decoration: none; }
+.bt-apply-dialog .bt-apply-change ins::before { content: '→ '; opacity: 0.6; }
+.bt-apply-dialog .bt-apply-change .bt-tag { justify-self: start; font-size: 0.8em; }
+.bt-apply-dialog .bt-apply-conflicts { padding: 8px 10px; border-radius: 8px; background: rgba(223, 162, 74, 0.12); font-size: 0.86em; line-height: 1.6; }
+.bt-apply-dialog .bt-apply-conflicts ul, .bt-apply-dialog .bt-apply-dropped { margin: 4px 0 0; padding-left: 18px; }
+.bt-apply-dialog .bt-apply-dropped { font-size: 0.86em; line-height: 1.6; }
+.bt-apply-dialog .bt-apply-text:disabled { opacity: 0.55; }
+.bt-apply-dialog .bt-apply-verify { display: grid; grid-template-columns: auto 1fr; align-items: start; gap: 4px 8px; padding: 10px; border-radius: 8px; border: 1px solid rgba(127, 127, 127, 0.3); font-weight: 500; }
+.bt-apply-dialog .bt-apply-verify input { margin-top: 3px; }
+.bt-apply-dialog .bt-apply-verify small { grid-column: 2; opacity: 0.72; font-weight: 400; line-height: 1.55; word-break: keep-all; }
+
+.bt-log-btns { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+.bt-verify-tag { margin-left: 4px; vertical-align: 1px; font-size: 0.78em; }
+.bt-verify-tag.ok { color: var(--bt-good); border-color: color-mix(in srgb, var(--bt-good) 50%, transparent); }
+.bt-verify-tag.warn { color: var(--bt-warn); border-color: color-mix(in srgb, var(--bt-warn) 50%, transparent); }
+.bt-verify-tag.bad { color: var(--bt-bad); border-color: color-mix(in srgb, var(--bt-bad) 50%, transparent); }
+.bt-verify-tag.busy { color: var(--bt-accent-ink, var(--bt-accent)); }
+
+@media (max-width: 640px) {
+    .bt-active { padding: 6px 10px 0; }
+    .bt-active-chip { min-height: 32px; font-size: 0.8em; }
+    .bt-log-btns { justify-content: flex-start; }
+}
+@media (prefers-reduced-motion: reduce) { .bt-active-chip.busy i { animation: none; } }
+/* SillyTavern stretches form inputs inside popups; keep the v3.3 radios/checkbox their natural size */
+.bt-apply-dialog .bt-apply-modes label,
+.bt-apply-dialog label.bt-apply-verify { display: flex !important; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+.bt-apply-dialog .bt-apply-modes input[type="radio"],
+.bt-apply-dialog .bt-apply-verify input[type="checkbox"] { flex: none; width: 16px !important; height: 16px; min-width: 16px; margin: 0 !important; accent-color: #c9a56b; }
+.bt-apply-dialog .bt-apply-verify small { flex-basis: 100%; padding-left: 24px; }

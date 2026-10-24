@@ -35,13 +35,13 @@ const defaultSettings = Object.freeze({
     notifyOn: false,        // 브라우저 알림 (다른 탭에 있을 때)
     funReference: '',       // creator's proven fun style (from 재미 분석)
     loreAsReference: true,  // use linked lorebooks as reference material in evaluation
-    pasteLang: 'en',        // language of ready-to-paste fixes: en | card | ko
+    pasteLang: 'card',      // language of ready-to-paste fixes: card | en | ko (v3.3: card by default)
     testPreset: '',         // preset (프롬) used for bot replies during tests ('' = keep current)
     testProfile: '',        // connection profile used for bot replies during tests ('' = keep current)
     testPromptVoice: true,  // also use the test preset/profile for voice sample lines
     autoRerollSec: 180,     // re-send a request automatically when it takes longer than this (0 = off)
     autoRerollMax: 1,       // how many automatic re-sends per request
-    legacyAuto: true,       // chats started before a card edit keep the earlier characterization
+    legacyAuto: false,      // chats started before a card edit keep the earlier characterization (v3.3: off by default)
     legacyMode: 'changed',  // changed = earlier text of changed fields | diff = AI summary of differences
     pasteKeepLines: true,   // spoken lines inside quotes keep the character's chat language
     funReferenceSamples: '', // short quotes from the reference bot (format examples for restyle)
@@ -71,18 +71,37 @@ const defaultSettings = Object.freeze({
     nsfwUseInEval: false,
     // readability
     textSize: 'md',          // sm | md | lg | xl
+    // v3.3 safer applying
+    applyMode: 'merge',      // merge = AI works the fix into the right place | append = add at the end
+    verifyAfterApply: true,  // after applying, test the same messages and keep the fix only if it helps
+    verifyRuns: 2,           // B tests per verification
+    verifyRule: 'strict',    // strict = keep only clear improvements | lenient = revert only clear regressions
+    settingsRev: 0,
 });
+
+/** One-time changes to saved settings when a version changes a default for safety. */
+function migrateSettings(s) {
+    if ((s.settingsRev || 0) < 33) {
+        // v3.3: English paste text and automatic old-chat locks made some bots worse → safer defaults
+        if (s.pasteLang === 'en') s.pasteLang = 'card';
+        s.legacyAuto = false;
+        s.settingsRev = 33;
+        s._migrated33 = true;
+        saveSettings();
+    }
+}
 
 function getSettings() {
     const { extensionSettings } = ctx();
     if (!extensionSettings[MODULE]) {
-        extensionSettings[MODULE] = structuredClone(defaultSettings);
+        extensionSettings[MODULE] = { ...structuredClone(defaultSettings), settingsRev: 33 }; // new install: nothing to migrate
     }
     for (const key of Object.keys(defaultSettings)) {
         if (!Object.hasOwn(extensionSettings[MODULE], key)) {
             extensionSettings[MODULE][key] = defaultSettings[key];
         }
     }
+    if ((extensionSettings[MODULE].settingsRev || 0) < 33) migrateSettings(extensionSettings[MODULE]);
     return extensionSettings[MODULE];
 }
 
@@ -944,6 +963,19 @@ function sourceOrigin(cd) {
  * Language rule for ready-to-paste text (card / lorebook fixes). Explanations stay Korean;
  * paste text is compact English by default to save tokens, proper nouns stay Korean (+ original).
  */
+/** Main language of the open character's card, from its letters ('' when unclear). */
+function cardMainLanguage() {
+    const char = getCurrentCharacter();
+    const f = char ? cardFieldsNow(char) : null;
+    const t = f ? [f.description, f.personality, f.scenario, f.mes_example].join('\n') : '';
+    const count = (re) => (t.match(re) || []).length;
+    const ko = count(/[가-힣]/g); const ja = count(/[ぁ-ゟ゠-ヿ]/g); const en = count(/[A-Za-z]/g) / 4; // ~4 letters per word vs 1 syllable
+    const total = ko + ja + en;
+    if (total < 20) return '';
+    const [name, n] = [['Korean', ko], ['Japanese', ja], ['English', en]].sort((a, b) => b[1] - a[1])[0];
+    return n / total >= 0.6 ? name : '';
+}
+
 function pasteLangRule(cd, { keys = false } = {}) {
     const s = getSettings();
     const origin = sourceOrigin(cd);
@@ -958,7 +990,14 @@ function pasteLangRule(cd, { keys = false } = {}) {
         ? 'Spoken lines inside quotes (sample dialogue, example messages, catchphrases, first-message dialogue) stay in the language the character speaks in the chat, so the voice and dialect are preserved.'
         : 'Spoken lines are written in English too.';
     const keyLine = keys ? 'Lorebook trigger KEYWORDS are an exception: they stay in the languages people actually type in chat (Korean names, nicknames, plus original-script names).' : '';
-    if (s.pasteLang === 'card') return ['PASTE TEXT LANGUAGE: ready-to-paste card/lorebook text ("paste", "text", "content", "rewrite") uses the same language as the card. Explanations stay in Korean.', keyLine].filter(Boolean).join('\n');
+    if (s.pasteLang === 'card') {
+        const lang = cardMainLanguage();
+        return [
+            `PASTE TEXT LANGUAGE: ready-to-paste card/lorebook text ("paste", "text", "content", "rewrite") is written in the SAME language and style as the card${lang ? ` (this card is written mainly in ${lang})` : ''}. When a paste goes into one specific field, match that field's language and formatting. Do not translate the card. Explanations stay in Korean.`,
+            '- Keep macros exactly: {{char}}, {{user}}, <START>.',
+            keyLine,
+        ].filter(Boolean).join('\n');
+    }
     if (s.pasteLang === 'ko') return ['PASTE TEXT LANGUAGE: ready-to-paste card/lorebook text ("paste", "text", "content", "rewrite") is written in Korean. Explanations stay in Korean.', orig, keyLine].filter(Boolean).join('\n');
     return [
         'PASTE TEXT LANGUAGE — overrides any other instruction about the language of ready-to-paste text ("paste", "text", "content", "rewrite", new lore entries):',
@@ -1203,6 +1242,7 @@ async function sendAsUserAndWait(text) {
     await waitIdle();
     const ta = document.getElementById('send_textarea');
     if (!ta) throw new Error('입력창을 찾을 수 없어요');
+    const before = (ctx().chat || []).length;
     ta.value = text;
     ta.dispatchEvent(new Event('input', { bubbles: true }));
     let first = true;
@@ -1213,6 +1253,17 @@ async function sendAsUserAndWait(text) {
         await sleep(150);
         await waitIdle();
     }, { onAbandon: async () => { clickStop(); await sleep(400); await waitIdle(30000).catch(() => {}); } });
+    // A test graded on missing replies gives nonsense advice → stop instead of carrying on
+    const chat = ctx().chat || [];
+    const sent = chat.slice(before).some(m => m?.is_user);
+    const last = chat[chat.length - 1];
+    if (!sent) {
+        ta.value = '';
+        throw new Error('테스트 메시지가 채팅에 들어가지 않았어요. API가 연결돼 있는지 확인해 주세요');
+    }
+    if (!last || last.is_user || last.is_system || !String(last.mes || '').trim()) {
+        throw new Error('봇 답장이 오지 않았어요. API 연결이나 오류 알림을 확인해 주세요');
+    }
 }
 
 function lastBotReply() {
@@ -1238,6 +1289,7 @@ async function runTest(turnsOverride, opts = {}) {
     const s = getSettings();
     const fixedScript = Array.isArray(opts.script) && opts.script.length ? opts.script : null;
     const turns = fixedScript ? fixedScript.length : Math.max(1, Math.min(50, Number(turnsOverride || s.turns) || 5));
+    await flushCardSaves(); // a test that opens a new chat must not race an unsaved card edit
     const charData = await loadCharData(char);
 
     running = true;
@@ -1245,12 +1297,12 @@ async function runTest(turnsOverride, opts = {}) {
     updateRunState();
     if (s.autoMinimize && isNarrow()) setMinimized(true);
 
-    const run = { id: Date.now(), time: Date.now(), role: opts.role || '', script: [], replies: [], chatId: '', eval: null };
+    const run = { id: Date.now(), time: Date.now(), role: opts.role || '', script: [], replies: [], chatId: '', eval: null, epoch: charData.cardEpoch || 0, cardHash: cardHashNow(char) };
     let handedOff = false;
     let restorePrompt = async () => {};
     try {
         restorePrompt = await applyTestPrompt();
-        if (s.newChat || fixedScript) {
+        if (s.newChat || fixedScript || opts.forceNewChat) {
             await ctx().executeSlashCommandsWithOptions('/newchat');
             await sleep(500);
             await waitIdle();
@@ -1280,19 +1332,22 @@ async function runTest(turnsOverride, opts = {}) {
         if (stopRequested) {
             setStatus('⏹ 테스트를 중단했어요');
             toastr.info('테스트 중단됨');
-            return;
+            return null;
         }
 
         // keep the run for A/B comparison
         const cd = await loadCharData(char);
-        cd.runs = [run, ...(cd.runs || [])].slice(0, 8);
+        // keep the baseline (A) even when many verification runs pile up
+        const keepA = (cd.runs || []).find(r => r.id === cd.abBaselineId);
+        cd.runs = [run, ...(cd.runs || [])].slice(0, 12);
+        if (keepA && !cd.runs.includes(keepA)) cd.runs.push(keepA);
         if (!cd.abBaselineId || !cd.runs.some(r => r.id === cd.abBaselineId)) cd.abBaselineId = run.id;
         await saveCharData(char, cd);
         renderAbPanel(cd);
 
         setStatus('✅ 테스트 완료');
         toastr.success('테스트 대화 완료!');
-        if (s.autoEvalAfterTest || fixedScript) {
+        if (s.autoEvalAfterTest || fixedScript || opts.forceEval) {
             running = false;
             updateRunState();
             handedOff = true;
@@ -1300,8 +1355,9 @@ async function runTest(turnsOverride, opts = {}) {
             if (entry) {
                 const cd2 = await loadCharData(char);
                 const r = (cd2.runs || []).find(x => x.id === run.id);
+                run.eval = { overall: entry.result.overall, fun: entry.result.fun, categories: entry.result.categories || [], summary: entry.result.summary || '' };
                 if (r) {
-                    r.eval = { overall: entry.result.overall, fun: entry.result.fun, categories: entry.result.categories || [], summary: entry.result.summary || '' };
+                    r.eval = run.eval;
                     await saveCharData(char, cd2);
                 }
                 renderAbPanel(cd2);
@@ -1317,10 +1373,12 @@ async function runTest(turnsOverride, opts = {}) {
                 }
             }
         }
+        return run;
     } catch (e) {
         console.error(LOG, e);
         setStatus(`❌ 오류: ${e.message}`);
         toastr.error(`테스트 실패: ${e.message}`);
+        return null;
     } finally {
         await restorePrompt();
         if (!handedOff) {
@@ -1484,6 +1542,7 @@ async function requestJson({ system, prompt, profileId = '', maxTokens = 4000, l
 
 
 async function runEvaluation({ useChat = true, messages = 0 } = {}) {
+    await flushCardSaves();
     if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
     const char = getCurrentCharacter();
     if (!char) { toastr.error('1:1 캐릭터 채팅을 열어주세요'); return; }
@@ -1714,6 +1773,7 @@ function buildPanel() {
     <button type="button" class="bt-tab" data-tab="doctor" title="카드 진단">${ico('stethoscope')}<span>진단</span></button>
     <button type="button" class="bt-tab" data-tab="settings" title="설정">${ico('sliders')}<span>설정</span></button>
   </nav>
+  <div id="bt_active" class="bt-active" style="display:none" aria-live="polite"></div>
 
   <div id="bt_body" class="bt-body">
 
@@ -1841,6 +1901,25 @@ ${doctorPageHtml()}
         <p class="bt-note">생각(Reasoning)하는 모델은 긴 평가에 몇 분씩 걸리기도 해요. 너무 짧게 잡으면 멀쩡한 요청도 다시 보내니 2~3분 이상을 추천해요.</p>
       </section>
 
+      <section class="bt-card" id="bt_set_apply">
+        ${cardHead('Apply', '제안 적용', '카드를 고칠 때 어떻게 넣고, 효과를 어떻게 확인할지 정해요.')}
+        ${field('넣는 방식', `<select id="bt_applymode" class="bt-input">
+            <option value="merge">알맞은 자리에 고쳐 넣기 (추천 · 부딪히는 문장은 바꿈)</option>
+            <option value="append">끝에 붙이기</option>
+          </select>`)}
+        <div class="bt-switches">
+          ${toggle('verifyapply', '적용한 뒤 자동으로 검증', '같은 테스트 메시지로 고친 카드를 다시 테스트·평가해서, 좋아졌을 때만 남기고 아니면 되돌려요')}
+        </div>
+        <div class="bt-grid2">
+          ${field('검증 기준', `<select id="bt_verifyrule" class="bt-input">
+              <option value="strict">확실히 좋아졌을 때만 남기기 (+3점 이상)</option>
+              <option value="lenient">확실히 나빠졌을 때만 되돌리기 (−3점 이하)</option>
+            </select>`)}
+          ${field('검증 테스트 횟수', '<input id="bt_verifyruns" class="bt-input bt-num" type="number" min="1" max="4" step="1">', '고친 카드로 돌릴 횟수. 많을수록 정확하지만 오래 걸려요')}
+        </div>
+        <p class="bt-note">재미 점수가 5점 이상 떨어지면 원작 점수가 올라도 되돌려요. 평가 점수는 매번 ±2~3점쯤 흔들려서, 그 안의 차이는 “차이 없음”으로 봐요.</p>
+      </section>
+
       <section class="bt-card" id="bt_set_eval">
         ${cardHead('Evaluation', '평가')}
         <div class="bt-grid2">
@@ -1848,9 +1927,9 @@ ${doctorPageHtml()}
           ${field('최근 메시지 수', '<input id="bt_evalmsgs" class="bt-input bt-num" type="number" min="2" max="200">', '평가에 넣을 분량')}
         </div>
         ${field('고칠 문장 언어', `<select id="bt_pastelang" class="bt-input">
-            <option value="en">영어 (토큰 절약 · 고유명사는 한국어+원어)</option>
-            <option value="card">카드와 같은 언어</option>
+            <option value="card">카드와 같은 언어 (추천)</option>
             <option value="ko">한국어</option>
+            <option value="en">영어 (토큰 절약 · 가벼운 모델은 말투가 흔들릴 수 있어요)</option>
           </select>`, '복사·적용하는 문장')}
         ${field('웹 검색 방식', `<select id="bt_searchengine" class="bt-input">
             <option value="auto">자동 (키 불필요)</option>
@@ -2050,8 +2129,18 @@ function bindPanel() {
     bindCheck('lorebook', 'includeLorebook');
     bindCheck('loreref', 'loreAsReference');
     bindCheck('pastelines', 'pasteKeepLines');
+    const am = $id('applymode');
+    am.value = s.applyMode === 'append' ? 'append' : 'merge';
+    am.addEventListener('change', () => { s.applyMode = am.value; saveSettings(); });
+    bindCheck('verifyapply', 'verifyAfterApply');
+    const vr = $id('verifyrule');
+    vr.value = s.verifyRule === 'lenient' ? 'lenient' : 'strict';
+    vr.addEventListener('change', () => { s.verifyRule = vr.value; saveSettings(); });
+    const vn = $id('verifyruns');
+    vn.value = s.verifyRuns;
+    vn.addEventListener('change', () => { s.verifyRuns = Math.max(1, Math.min(4, Number(vn.value) || 2)); vn.value = s.verifyRuns; saveSettings(); });
     const pl = $id('pastelang');
-    pl.value = ['en', 'card', 'ko'].includes(s.pasteLang) ? s.pasteLang : 'en';
+    pl.value = ['en', 'card', 'ko'].includes(s.pasteLang) ? s.pasteLang : 'card';
     pl.addEventListener('change', () => { s.pasteLang = pl.value; saveSettings(); });
 
     const scen = $id('scenario');
@@ -2191,7 +2280,7 @@ let lastStatus = { kind: '', text: '' };
 /** Called from updateRunState: plays the sound when a long task finishes. */
 function trackRunForSound() {
     if (running && !wasRunning) { runStartedAt = Date.now(); lastStatus = { kind: '', text: '' }; stopRequested = false; getAudio(); }
-    if (!running && wasRunning && Date.now() - runStartedAt > 1500 && lastStatus.kind !== 'stop') {
+    if (!running && wasRunning && !verifying && Date.now() - runStartedAt > 1500 && lastStatus.kind !== 'stop') {
         notifyFinish(lastStatus.kind === 'error' || lastStatus.kind === 'warn' ? 'error' : 'ok', lastStatus.text);
     }
     wasRunning = running;
@@ -2423,6 +2512,7 @@ function updateRunState() {
     document.querySelectorAll('#bt_panel .bt-vset-btn').forEach(b => b.classList.toggle('disabled', running));
     $id('restyle_run')?.classList.toggle('disabled', running || !restyleSource());
     $id('panel')?.classList.toggle('bt-busy', running);
+    renderActiveStrip();
     if (running) { $id('ab_runb')?.classList.add('disabled'); $id('ab_pin')?.classList.add('disabled'); }
     else { const ch = getCurrentCharacter(); if (ch) loadCharData(ch).then(renderAbPanel); }
 }
@@ -4508,11 +4598,55 @@ function readField(key) {
 function writeField(key, value) {
     const sel = APPLY_FIELDS[key]?.sel;
     const el = sel ? document.querySelector(sel) : null;
-    if (!el || !editorBelongsTo(getCurrentCharacter())) throw new Error(editorProblem());
+    const char = getCurrentCharacter();
+    if (!el || !editorBelongsTo(char)) throw new Error(editorProblem());
     el.value = value;
-    // SillyTavern listens with jQuery; a native input event reaches it and triggers the (debounced) character save
-    el.dispatchEvent(new Event('input', { bubbles: true }));
+    // SillyTavern listens with jQuery; an input event triggers its (1 s debounced) character save
     if (window.jQuery) window.jQuery(el).trigger('input');
+    else el.dispatchEvent(new Event('input', { bubbles: true }));
+    // Opening another chat before that save lands refills the editor from the OLD card and the edit is
+    // lost, so every write is tracked until SillyTavern has really saved it (see flushCardSaves).
+    const pr = waitCardSaved(char, key, value).finally(() => pendingCardSaves.delete(pr));
+    pendingCardSaves.add(pr);
+}
+
+const pendingCardSaves = new Set();
+
+/** The saved value of one editor field in SillyTavern's character list. */
+function savedFieldValue(ch, key) {
+    const d = ch?.data || {};
+    switch (key) {
+        case 'first_mes': return String(ch?.first_mes ?? d.first_mes ?? '');
+        default: return cardFieldsFromChar(ch)?.[key] ?? '';
+    }
+}
+
+async function waitCardSaved(char, key, value, timeoutMs = 15000) {
+    const norm = (t) => String(t ?? '').replace(/\r\n?/g, '\n').trim();
+    const want = norm(value);
+    const start = Date.now();
+    let kicked = false;
+    while (Date.now() - start < timeoutMs) {
+        const ch = (ctx().characters || []).find(x => x?.avatar === char?.avatar);
+        if (ch && !ch.shallow && norm(savedFieldValue(ch, key)) === want) return true;
+        // SillyTavern saves 1 s after the last input; nudge its save button if it has not happened yet
+        if (!kicked && Date.now() - start > 1800 && editorBelongsTo(char)) {
+            kicked = true;
+            try { window.jQuery?.('#create_button').trigger('click'); } catch { /* ignore */ }
+        }
+        await sleep(200);
+    }
+    console.warn(LOG, 'card save not confirmed for', key);
+    return false;
+}
+
+/** Waits until every card edit made by Bot Tester is saved by SillyTavern. False if one was not confirmed. */
+async function flushCardSaves() {
+    if (!pendingCardSaves.size) return true;
+    setStatus('💾 카드 저장을 확인하는 중…');
+    const ok = (await Promise.all([...pendingCardSaves])).every(Boolean);
+    if (!ok) toastr.warning('카드 저장이 확인되지 않았어요. 캐릭터 편집 화면에서 저장됐는지 한 번 확인해 주세요.', '봇 테스터', { timeOut: 8000 });
+    return ok;
 }
 
 async function addLoreEntry(worldName, { comment, keys, content }) {
@@ -4552,8 +4686,11 @@ async function removeLoreEntry(worldName, uid) {
 
 async function logApply(char, item) {
     const cd = await loadCharData(char);
-    cd.applyLog = [{ id: Date.now() * 1000 + Math.floor(Math.random() * 1000), time: Date.now(), ...item }, ...(cd.applyLog || [])].slice(0, 30);
+    const id = Date.now() * 1000 + Math.floor(Math.random() * 1000);
+    cd.cardEpoch = (cd.cardEpoch || 0) + 1; // every change starts a new "card state" for A/B baselines
+    cd.applyLog = [{ id, time: Date.now(), ...item }, ...(cd.applyLog || [])].slice(0, 30);
     await saveCharData(char, cd);
+    renderActiveStrip();
     renderApplyLog(cd);
     renderContPick(cd);
     if (item.kind === 'field' && LEGACY_FIELDS.some(([k]) => k === item.field)) {
@@ -4566,6 +4703,111 @@ async function logApply(char, item) {
             await legacyOnChatChanged();
         } catch (e) { if (e.message !== 'skip') console.warn(LOG, 'version record failed', e); }
     }
+    return id;
+}
+
+// ---------------------------------------------------------------------------
+// v3.3 safer applying
+//  1) a suggestion is worked INTO the field (replacing what it contradicts) instead of appended
+//  2) the dialog shows how much the field grows, what was replaced and what was dropped
+//  3) after applying, the same test messages run again; the change stays only if it clearly helped
+//  4) one change at a time: a new apply waits until the previous one is verified or accepted
+// ---------------------------------------------------------------------------
+
+let verifying = null; // { itemId, step } while a verification runs
+
+const VERIFY_LABEL = {
+    pending: '검증 중', kept: '효과 있음 · 유지', reverted: '효과 없음 · 되돌림', worse: '나빠짐 · 되돌림',
+    'kept-manual': '직접 유지', accepted: '검증 없이 확정', unverified: '검증 안 함', aborted: '검증 중단',
+};
+
+function cardHashNow(char) {
+    const f = char ? cardFieldsNow(char) : null;
+    return f ? fieldsHash(f) : '';
+}
+
+/** Lines of `oldT` that disappeared in `newT` without being listed as an intended change. */
+function droppedLines(oldT, newT, changes = []) {
+    const norm = (x) => dedupNorm(x);
+    const nt = norm(newT);
+    const replaced = changes.map(c => norm(c.before || '')).filter(Boolean);
+    return String(oldT || '').split('\n').map(l => l.trim()).filter(l => l.length >= 12)
+        .filter(l => { const n = norm(l); return n && !nt.includes(n) && !replaced.some(r => r.includes(n) || n.includes(r)); });
+}
+
+async function mergeSuggestion(key, current, suggestion, reason) {
+    const char = getCurrentCharacter();
+    const cd = await loadCharData(char);
+    const s = getSettings();
+    const label = APPLY_FIELDS[key]?.label || key;
+    const system = withCustom([
+        'You edit ONE field of a SillyTavern character card so that it includes a requested improvement. You are a careful copy editor, not a rewriter.',
+        'Rules:',
+        '- Put the improvement where it belongs: inside the paragraph, section or list about that topic. Add it at the end only when no fitting place exists.',
+        '- If the current text already says something that contradicts the improvement, REPLACE that sentence instead of keeping both. If it already says the same thing, merge them into one sentence.',
+        '- Everything else stays exactly as written: wording, order, line breaks, headings, formatting, macros ({{char}}, {{user}}, <START>), quoted dialogue.',
+        '- Use the same language, tone and format as the current field. Do not translate anything. Do not add rule lists, emphasis words (MUST, NEVER, 반드시, 절대, !!) or meta comments.',
+        '- Add as few words as possible. Prefer showing behavior on the page over stating facts.',
+        '- If the improvement would make the character blander, nicer or more generic, apply only its useful core.',
+        NO_SHIP_RULE,
+        funGuard(cd),
+        'Output JSON only: {"text":"<the WHOLE field after editing>","changes":[{"before":"<sentence that was replaced or merged; empty string for a pure insertion>","after":"<the new or edited sentence>"}],"conflicts":["<Korean: a sentence in the card that contradicted the improvement, and what you did with it>"],"note":"<Korean, one line: where you put it>"}',
+    ].filter(Boolean).join('\n'), 'global');
+    const prompt = `[Field: ${label}]\n<<<CURRENT\n${current}\nCURRENT>>>\n\n[Improvement to work in]\n${suggestion}${reason ? `\n\n[Why]\n${reason}` : ''}`;
+    const est = Math.ceil((current.length + suggestion.length) / 2);
+    const data = await requestJson({ system, prompt, profileId: s.evalProfile, maxTokens: Math.min(32000, Math.max(4000, est * 2 + 1500)), label: '🧩 제안을 알맞은 자리에 고쳐 넣는 중…', quietTruncation: true });
+    const text = String(data?.text ?? '').replace(/^\s*<<<CURRENT\s*|\s*CURRENT>>>\s*$/g, '');
+    if (!text.trim() || data.__truncated) throw new Error('AI가 칸 전체를 돌려주지 않았어요');
+    const changes = (Array.isArray(data.changes) ? data.changes : []).map(c => ({ before: String(c?.before || ''), after: String(c?.after || '') })).filter(c => c.after || c.before);
+    return { text, changes, conflicts: (Array.isArray(data.conflicts) ? data.conflicts : []).map(String).filter(Boolean), note: String(data.note || '') };
+}
+
+/** Preview of what an edit does to the field: size, replaced sentences, conflicts, dropped lines. */
+async function applyPreviewHtml(before, after, merged) {
+    const [tb, ta] = await Promise.all([countTokens(before).catch(() => 0), countTokens(after).catch(() => 0)]);
+    const dc = after.length - before.length;
+    const pct = before.length ? Math.round(dc / before.length * 100) : 100;
+    const warn = [];
+    if (before.length > 200 && pct >= 30) warn.push(`칸이 ${pct}% 길어져요. 길어진 만큼 원래 문장의 힘이 약해질 수 있어요.`);
+    const dropped = merged ? droppedLines(before, after, merged.changes) : [];
+    if (dropped.length) warn.push(`요청하지 않은 문장 ${dropped.length}개가 빠지거나 바뀌었어요. 아래에서 확인하세요.`);
+    const added = merged ? merged.changes.map(c => c.after).join('\n') : (after.startsWith(before) ? after.slice(before.length) : after);
+    if (hangulRatio(before) > 0.5 && added.trim().length > 20 && hangulRatio(added) < 0.35) warn.push('한국어 칸에 다른 언어 문장이 섞여요. 가벼운 모델은 말투가 흔들릴 수 있어요. 설정 탭 → 고칠 문장 언어를 “카드와 같은 언어”로 두는 걸 추천해요.');
+    const changes = merged?.changes?.length ? `<div class="bt-apply-changes">${merged.changes.slice(0, 12).map(c => `
+        <div class="bt-apply-change">${c.before ? `<del>${escapeHtml(truncate(c.before, 300))}</del>` : '<span class="bt-tag">새 문장</span>'}<ins>${escapeHtml(truncate(c.after, 400))}</ins></div>`).join('')}</div>` : '';
+    const conflicts = merged?.conflicts?.length ? `<div class="bt-apply-conflicts"><b>${ico('triangle-exclamation')} 원래 카드와 부딪히던 부분</b><ul>${merged.conflicts.slice(0, 6).map(x => `<li>${escapeHtml(x)}</li>`).join('')}</ul></div>` : '';
+    const droppedHtml = dropped.length ? `<details class="bt-disclosure bt-disclosure-sm"><summary><span>빠지거나 바뀐 다른 문장 ${dropped.length}개</span>${ico('chevron-down')}</summary><ul class="bt-apply-dropped">${dropped.slice(0, 10).map(l => `<li>${escapeHtml(truncate(l, 200))}</li>`).join('')}</ul></details>` : '';
+    return `
+        <div class="bt-apply-stats ${warn.length ? 'warn' : ''}">
+            <span>${before.length.toLocaleString()}자 → <b>${after.length.toLocaleString()}자</b> (${dc >= 0 ? '+' : ''}${dc.toLocaleString()}자${before.length ? `, ${pct >= 0 ? '+' : ''}${pct}%` : ''})</span>
+            ${tb || ta ? `<span>토큰 ${tb.toLocaleString()} → <b>${ta.toLocaleString()}</b></span>` : ''}
+        </div>
+        ${warn.map(w => `<p class="bt-apply-warn">${ico('triangle-exclamation')} ${escapeHtml(w)}</p>`).join('')}
+        ${merged?.note ? `<p class="bt-apply-note">${ico('location-dot')} ${escapeHtml(merged.note)}</p>` : ''}
+        ${changes}${conflicts}${droppedHtml}`;
+}
+
+/** Latest change that is still waiting for a verdict (blocks stacking several unverified edits). */
+function openUnverified(cd) {
+    return (cd.applyLog || []).find(x => !x.undone && x.verify && ['unverified', 'pending', 'aborted'].includes(x.verify.state));
+}
+
+async function setVerifyState(char, itemId, patch) {
+    const cd = await loadCharData(char);
+    const item = (cd.applyLog || []).find(x => x.id === itemId);
+    if (!item) return null;
+    item.verify = { ...(item.verify || {}), ...patch, at: Date.now() };
+    await saveCharData(char, cd);
+    renderApplyLog(cd);
+    renderActiveStrip();
+    return item;
+}
+
+/** Evaluated test runs made on exactly the card this change started from. */
+function baselineRunsFor(cd, item) {
+    return (cd.runs || []).filter(r => r.eval && r.time < item.time
+        && (r.epoch ?? -1) === item.epochBefore
+        && (!item.beforeHash || !r.cardHash || r.cardHash === item.beforeHash));
 }
 
 /** Opens an editable preview; the user confirms before anything is written. */
@@ -4575,74 +4817,309 @@ async function openApplyDialog({ field, text, reason = '' }) {
     const c = ctx();
     if (c.menuType === 'create') { toastr.warning('새 캐릭터 만들기 화면에서는 적용할 수 없어요'); return; }
     if (!c.callGenericPopup) { copyText(text); return; }
+    if (verifying || running) { toastr.warning('지금은 테스트·검증이 진행 중이에요. 끝난 뒤 적용해 주세요.'); return; }
+    const s = getSettings();
+
+    // one change at a time
+    const cd0 = await loadCharData(char);
+    const open = openUnverified(cd0);
+    if (open) {
+        const r = await c.callGenericPopup(`앞에 적용한 “${escapeHtml(open.label || '')}”을(를) 아직 검증하지 않았어요. 여러 수정을 한꺼번에 쌓으면 어떤 게 효과 있었는지 알 수 없고, 서로 부딪히기 쉬워요.<br><br><b>확인</b>: 그 수정을 검증 없이 확정하고 계속 · <b>취소</b>: 돌아가기 (적용 기록에서 검증할 수 있어요)`, c.POPUP_TYPE.CONFIRM, '', { okButton: '확정하고 계속', cancelButton: '취소' });
+        if (r !== c.POPUP_RESULT.AFFIRMATIVE && r !== true && r !== 1) return;
+        await setVerifyState(char, open.id, { state: 'accepted' });
+    }
 
     let key = normalizeField(field);
+    let mode = s.applyMode === 'append' ? 'append' : 'merge';
     const worldName = charWorldName(char);
+    const mergeCache = {};
     const wrap = document.createElement('div');
     wrap.className = 'bt-apply-dialog';
     wrap.innerHTML = `
         <h3>카드에 적용하기</h3>
-        <p class="bt-apply-note">아래 내용이 그대로 저장돼요. 필요하면 직접 고친 뒤 <b>적용</b>을 누르세요. 원래 내용은 백업돼서 봇 테스터의 <b>진단 → 적용 기록</b>에서 되돌릴 수 있어요.</p>
         ${reason ? `<p class="bt-apply-reason">${escapeHtml(reason)}</p>` : ''}
+        <details class="bt-disclosure bt-disclosure-sm"><summary><span>제안 원문</span>${ico('chevron-down')}</summary><pre class="bt-paste">${escapeHtml(text)}</pre></details>
         <label>적용할 곳
             <select class="bt-apply-field">${Object.entries(APPLY_FIELDS).map(([k, v]) => `<option value="${k}">${v.label}</option>`).join('')}</select>
         </label>
+        <div class="bt-apply-modes">
+            <label><input type="radio" name="bt_apply_mode" value="merge"> 알맞은 자리에 고쳐 넣기 <small>(AI · 부딪히는 문장은 바꿔요)</small></label>
+            <label><input type="radio" name="bt_apply_mode" value="append"> 끝에 붙이기</label>
+        </div>
         <div class="bt-apply-lore">
             <label>항목 이름 <input class="bt-apply-comment" type="text" value="봇 테스터 제안"></label>
             <label>키워드 <small>(쉼표로 구분)</small> <input class="bt-apply-keys" type="text" placeholder="예) 검, 전설의 검"></label>
             <p class="bt-apply-note bt-apply-world"></p>
         </div>
-        <label class="bt-apply-body-label">내용 <small class="bt-apply-hint"></small>
+        <div class="bt-apply-preview"></div>
+        <label class="bt-apply-body-label">저장될 내용 <small class="bt-apply-hint"></small>
             <textarea class="bt-apply-text" rows="14"></textarea>
-        </label>`;
+        </label>
+        <label class="bt-apply-verify"><input type="checkbox" class="bt-apply-verify-on"> 적용한 뒤 같은 메시지로 테스트해서 <b>좋아졌을 때만 남기기</b>
+            <small class="bt-apply-verify-cost"></small></label>`;
     const sel = wrap.querySelector('.bt-apply-field');
     const ta = wrap.querySelector('.bt-apply-text');
     const hint = wrap.querySelector('.bt-apply-hint');
     const loreBox = wrap.querySelector('.bt-apply-lore');
-    const fill = () => {
+    const modes = wrap.querySelector('.bt-apply-modes');
+    const preview = wrap.querySelector('.bt-apply-preview');
+    const vOn = wrap.querySelector('.bt-apply-verify-on');
+    vOn.checked = s.verifyAfterApply !== false;
+    const baseRuns = (cd0.runs || []).filter(r => r.eval && (r.epoch ?? -1) === (cd0.cardEpoch || 0) && (!r.cardHash || r.cardHash === cardHashNow(char)));
+    const turns = baseRuns[0]?.script?.length || Math.max(1, Number(s.turns) || 5);
+    const nB = Math.max(1, Math.min(4, Number(s.verifyRuns) || 2));
+    wrap.querySelector('.bt-apply-verify-cost').textContent = `${baseRuns.length ? '지금 카드로 한 테스트를 기준(A)으로 쓰고, ' : '먼저 지금 카드로 기준 테스트(A)를 1번 하고, '}고친 카드로 ${turns}턴 테스트를 ${nB}번 해서 평가해요. 각각 새 채팅에서 하고, 끝나면 지금 채팅으로 돌아와요.`;
+    wrap.querySelectorAll('input[name="bt_apply_mode"]').forEach(r => { r.checked = r.value === mode; });
+
+    let fillSeq = 0;
+    const fill = async () => {
+        const seq = ++fillSeq;
         key = sel.value;
+        preview.innerHTML = '';
         if (key === 'lorebook') {
-            loreBox.style.display = '';
+            loreBox.style.display = ''; modes.style.display = 'none';
             wrap.querySelector('.bt-apply-world').textContent = worldName
                 ? `“${worldName}” 로어북에 새 항목으로 추가돼요.`
                 : '이 캐릭터에 연결된 로어북이 없어요. 캐릭터 편집 화면의 🌐 버튼으로 로어북을 연결한 뒤 다시 시도해 주세요.';
             ta.value = text;
             hint.textContent = '새 항목의 내용';
-        } else {
-            loreBox.style.display = 'none';
-            const cur = readField(key);
-            if (cur === null) { ta.value = text; hint.textContent = '(편집 칸을 찾지 못함)'; return; }
+            return;
+        }
+        loreBox.style.display = 'none'; modes.style.display = '';
+        const cur = readField(key);
+        if (cur === null) { ta.value = text; hint.textContent = '(편집 칸을 찾지 못함)'; return; }
+        if (mode === 'append' || !cur.trim()) {
             ta.value = cur.trim() ? `${cur.replace(/\s+$/, '')}\n\n${text}` : text;
-            hint.textContent = '현재 내용 끝에 제안을 붙여 뒀어요';
+            hint.textContent = cur.trim() ? '현재 내용 끝에 제안을 붙였어요' : '비어 있던 칸이라 제안만 넣었어요';
+            preview.innerHTML = await applyPreviewHtml(cur, ta.value, null);
+            return;
+        }
+        ta.value = cur; ta.disabled = true;
+        hint.textContent = '알맞은 자리를 찾는 중…';
+        preview.innerHTML = `<p class="bt-apply-note">${ico('spinner')} AI가 제안을 카드의 알맞은 자리에 고쳐 넣고 있어요…</p>`;
+        try {
+            const m = mergeCache[key] || (mergeCache[key] = await mergeSuggestion(key, cur, text, reason));
+            if (seq !== fillSeq) return;
+            ta.value = m.text;
+            hint.textContent = '고쳐 넣은 결과예요. 직접 고쳐도 돼요';
+            preview.innerHTML = await applyPreviewHtml(cur, m.text, m);
+        } catch (e) {
+            if (seq !== fillSeq) return;
+            delete mergeCache[key];
+            console.warn(LOG, 'merge failed', e);
+            ta.value = `${cur.replace(/\s+$/, '')}\n\n${text}`;
+            hint.textContent = '고쳐 넣기에 실패해서 끝에 붙였어요';
+            preview.innerHTML = `<p class="bt-apply-warn">${ico('triangle-exclamation')} 고쳐 넣기 실패: ${escapeHtml(e.message)} — 끝에 붙인 결과를 보여줘요.</p>${await applyPreviewHtml(cur, ta.value, null)}`;
+        } finally {
+            if (seq === fillSeq) ta.disabled = false;
         }
     };
     sel.value = key;
-    fill();
     sel.addEventListener('change', fill);
+    wrap.querySelectorAll('input[name="bt_apply_mode"]').forEach(r => r.addEventListener('change', () => {
+        mode = r.value; s.applyMode = mode; saveSettings(); fill();
+    }));
+    fill();
 
     const res = await c.callGenericPopup(wrap, c.POPUP_TYPE.CONFIRM, '', { okButton: '적용', cancelButton: '취소', wide: true, large: false, allowVerticalScrolling: true });
+    fillSeq++; // ignore a merge that finishes after closing
     if (res !== c.POPUP_RESULT.AFFIRMATIVE && res !== true && res !== 1) return;
+    if (ta.disabled) { toastr.warning('고쳐 넣기가 끝나기 전에 적용을 눌렀어요. 다시 시도해 주세요.'); return; }
+    const verify = vOn.checked;
+    if (s.verifyAfterApply !== verify) { s.verifyAfterApply = verify; saveSettings(); }
+    const finalText = ta.value;
 
     try {
+        // a fair "before" test has to run on the card BEFORE it is written
+        if (verify && !baseRuns.length) {
+            toastr.info('먼저 지금 카드로 기준 테스트(A)를 해요');
+            const a = await runVerifyTest('기준 A', null);
+            if (!a?.eval) { toastr.warning('기준 테스트가 끝나지 않아서 적용하지 않았어요'); return; }
+        }
+        let itemId;
+        const cdB = await loadCharData(char);
+        const epochBefore = cdB.cardEpoch || 0;
+        const beforeHash = cardHashNow(char);
         if (key === 'lorebook') {
-            if (!worldName) { copyText(ta.value); toastr.warning('연결된 로어북이 없어서 내용만 복사했어요'); return; }
+            if (!worldName) { copyText(finalText); toastr.warning('연결된 로어북이 없어서 내용만 복사했어요'); return; }
             const keys = wrap.querySelector('.bt-apply-keys').value.split(/[,，、]/).map(x => x.trim()).filter(Boolean);
             if (!keys.length) { toastr.warning('키워드를 하나 이상 적어주세요'); return; }
-            const uid = await addLoreEntry(worldName, { comment: wrap.querySelector('.bt-apply-comment').value.trim(), keys, content: ta.value });
-            await logApply(char, { kind: 'lore', label: `로어북: ${wrap.querySelector('.bt-apply-comment').value.trim() || '새 항목'}`, world: worldName, uid, after: ta.value });
+            const uid = await addLoreEntry(worldName, { comment: wrap.querySelector('.bt-apply-comment').value.trim(), keys, content: finalText });
+            itemId = await logApply(char, { kind: 'lore', label: `로어북: ${wrap.querySelector('.bt-apply-comment').value.trim() || '새 항목'}`, world: worldName, uid, keys, after: finalText, epochBefore, beforeHash, verify: { state: verify ? 'pending' : 'unverified' } });
             toastr.success('로어북에 새 항목을 추가했어요');
         } else {
             const before = readField(key);
             if (before === null) throw new Error('캐릭터 편집 칸을 찾지 못했어요');
-            writeField(key, ta.value);
-            await logApply(char, { kind: 'field', field: key, label: APPLY_FIELDS[key].label, before, after: ta.value });
-            toastr.success(`${APPLY_FIELDS[key].label}에 적용했어요 (원본 백업됨)`);
+            writeField(key, finalText);
+            itemId = await logApply(char, { kind: 'field', field: key, label: APPLY_FIELDS[key].label, before, after: finalText, mode, epochBefore, beforeHash, verify: { state: verify ? 'pending' : 'unverified' } });
+            const saved = await flushCardSaves();
+            toastr[saved ? 'success' : 'warning'](`${APPLY_FIELDS[key].label}에 적용했어요${saved ? ' (저장됨 · 원본 백업됨)' : ''}`);
+            if (!saved && verify) { await setVerifyState(char, itemId, { state: 'unverified' }); toastr.warning('저장이 확인되지 않아서 검증은 건너뛰었어요'); return; }
         }
-        setStatus('✅ 카드에 적용했어요 — A/B 비교로 효과를 확인해 보세요');
+        if (verify) await verifyApply(itemId);
+        else setStatus('✅ 카드에 적용했어요 — 적용 기록에서 검증할 수 있어요');
     } catch (e) {
         console.error(LOG, e);
         toastr.error(`적용 실패: ${e.message}`);
     }
+}
+
+/** One test run for verification (new chat, always evaluated). Returns the run or null. */
+async function runVerifyTest(role, script) {
+    return runTest(script ? script.length : null, { script, role, forceEval: true, forceNewChat: true, verify: true });
+}
+
+/**
+ * Tests the card after a change with the same messages as the "before" run(s) and keeps the change
+ * only when it clearly helped (strict) / did not clearly hurt (lenient). Otherwise it is undone.
+ */
+async function verifyApply(itemId) {
+    const char = getCurrentCharacter();
+    if (!char) return;
+    if (verifying || running) { toastr.warning('이미 테스트·검증이 진행 중이에요'); return; }
+    const c = ctx();
+    const s = getSettings();
+    let cd = await loadCharData(char);
+    let item = (cd.applyLog || []).find(x => x.id === itemId);
+    if (!item || item.undone) return;
+    const origChat = c.getCurrentChatId?.() || '';
+    const nB = Math.max(1, Math.min(4, Number(s.verifyRuns) || 2));
+    verifying = { itemId, step: '준비' };
+    await setVerifyState(char, itemId, { state: 'pending' });
+    try {
+        let aRuns = baselineRunsFor(cd, item);
+        if (!aRuns.length) {
+            // verifying later from the log: run the "before" test on the old text, then put the change back
+            if (item.kind !== 'field') throw new Error('적용 전에 한 테스트가 없어서 이 로어북 수정은 검증할 수 없어요');
+            if (!editorBelongsTo(char)) throw new Error(editorProblem());
+            verifying.step = '기준 A';
+            renderActiveStrip();
+            writeField(item.field, item.before ?? '');
+            if (!await flushCardSaves()) { writeField(item.field, item.after ?? ''); await flushCardSaves(); throw new Error('카드 저장이 확인되지 않았어요'); }
+            let a;
+            try { a = await runVerifyTest('기준 A', null); } finally { writeField(item.field, item.after ?? ''); await flushCardSaves(); }
+            if (!a?.eval) throw new Error('기준 테스트가 끝나지 않았어요');
+            aRuns = [a];
+        }
+        const script = aRuns[0].script;
+        aRuns = aRuns.filter(r => JSON.stringify(r.script) === JSON.stringify(script));
+        const bRuns = [];
+        for (let i = 0; i < nB; i++) {
+            verifying.step = `B ${i + 1}/${nB}`;
+            renderActiveStrip();
+            const b = await runVerifyTest(`검증 B${i + 1}/${nB}`, script);
+            if (!b?.eval) throw new Error('검증 테스트가 중간에 멈췄어요');
+            bRuns.push(b);
+        }
+        const avg = (rs, f) => rs.reduce((t, r) => t + (Number(f(r)) || 0), 0) / rs.length;
+        const hasFun = (rs) => rs.every(r => Number.isFinite(Number(r.eval?.fun)));
+        const scoreA = avg(aRuns, r => r.eval.overall); const scoreB = avg(bRuns, r => r.eval.overall);
+        const funA = hasFun(aRuns) ? avg(aRuns, r => r.eval.fun) : null; const funB = hasFun(bRuns) ? avg(bRuns, r => r.eval.fun) : null;
+        const delta = Math.round((scoreB - scoreA) * 10) / 10;
+        const funDelta = funA !== null && funB !== null ? Math.round((funB - funA) * 10) / 10 : null;
+        const verdict = delta <= -3 || (funDelta !== null && funDelta <= -5) ? 'worse'
+            : delta >= 3 && (funDelta === null || funDelta > -3) ? 'better' : 'same';
+        const keep = verdict === 'better' || (verdict === 'same' && s.verifyRule === 'lenient');
+        const record = { a: Math.round(scoreA), b: bRuns.map(r => Math.round(Number(r.eval.overall) || 0)), funA: funA === null ? null : Math.round(funA), funB: funB === null ? null : Math.round(funB), delta, funDelta, verdict, aRunId: aRuns[0].id, bRunIds: bRuns.map(r => r.id) };
+        if (!keep) { await undoApply(itemId, { quiet: true }); await flushCardSaves(); }
+        cd = await loadCharData(char);
+        cd.abLast = { a: aRuns[0].id, b: bRuns[bRuns.length - 1].id };
+        if (keep) cd.abBaselineId = bRuns[bRuns.length - 1].id; // the kept card becomes the new baseline
+        await saveCharData(char, cd);
+        item = await setVerifyState(char, itemId, { state: keep ? 'kept' : verdict === 'worse' ? 'worse' : 'reverted', ...record });
+        verifying = null;
+        renderActiveStrip();
+        if (origChat && c.openCharacterChat) { try { await c.openCharacterChat(origChat); } catch (e) { console.warn(LOG, 'reopen chat failed', e); } }
+        renderAbCompare(cd);
+        try { notifyFinish('ok', '수정 검증 끝'); } catch { /* optional */ }
+        await showVerifyResult(char, item);
+    } catch (e) {
+        console.error(LOG, e);
+        verifying = null;
+        await setVerifyState(char, itemId, { state: 'aborted', error: e.message });
+        toastr.warning(`검증을 끝내지 못했어요: ${e.message} — 수정은 적용된 채로 남아 있어요. 적용 기록에서 다시 검증하거나 되돌릴 수 있어요.`, '봇 테스터', { timeOut: 9000 });
+        if (origChat && c.openCharacterChat) { try { await c.openCharacterChat(origChat); } catch { /* ignore */ } }
+    } finally {
+        verifying = null;
+        renderActiveStrip();
+        updateRunState();
+    }
+}
+
+function verifySummaryText(v) {
+    if (!v || v.a === undefined) return '';
+    const f = v.funDelta === null || v.funDelta === undefined ? '' : ` · 재미 ${v.funDelta >= 0 ? '+' : ''}${v.funDelta}`;
+    return `A ${v.a}% → B ${v.b.join('·')}% (${v.delta >= 0 ? '+' : ''}${v.delta}점${f})`;
+}
+
+async function showVerifyResult(char, item) {
+    const v = item?.verify;
+    if (!v) return;
+    const c = ctx();
+    const sum = verifySummaryText(v);
+    if (v.state === 'kept') {
+        toastr.success(`효과가 있어서 남겼어요. ${sum}`, '봇 테스터', { timeOut: 9000 });
+        setStatus(`✅ 검증 완료: 유지 · ${sum}`);
+        return;
+    }
+    const why = v.verdict === 'worse'
+        ? (v.funDelta !== null && v.funDelta <= -5 ? '재미 점수가 떨어졌어요.' : '점수가 떨어졌어요.')
+        : '점수 차이가 평가 오차(±2~3점) 안이라 좋아졌다고 보기 어려워요.';
+    setStatus(`↩️ 검증 완료: 되돌림 · ${sum}`);
+    if (!c.callGenericPopup) { toastr.info(`되돌렸어요. ${why} ${sum}`); return; }
+    const r = await c.callGenericPopup(`<h3>수정을 되돌렸어요</h3><p>${escapeHtml(why)}</p><p><b>${escapeHtml(sum)}</b></p><p class="bt-note">결과 탭에서 A·B 답장을 나란히 볼 수 있어요. 답장을 직접 보고 B가 낫다면 다시 적용해도 돼요.</p>`,
+        c.POPUP_TYPE.CONFIRM, '', { okButton: '그래도 다시 적용', cancelButton: '닫기' });
+    if (r === c.POPUP_RESULT.AFFIRMATIVE || r === true || r === 1) await reapplyItem(char, item.id);
+}
+
+/** Puts an undone change back after the creator looked at the replies themselves. */
+async function reapplyItem(char, itemId) {
+    const cd = await loadCharData(char);
+    const item = (cd.applyLog || []).find(x => x.id === itemId);
+    if (!item || !item.undone) return;
+    try {
+        if (item.kind === 'field') { writeField(item.field, item.after ?? ''); await flushCardSaves(); }
+        else if (item.kind === 'lore') item.uid = await addLoreEntry(item.world, { comment: (item.label || '').replace(/^로어북:\s*/, ''), keys: item.keys || ['봇 테스터'], content: item.after || '' });
+        else throw new Error('이 종류는 다시 적용할 수 없어요');
+        delete item.undone;
+        item.verify = { ...(item.verify || {}), state: 'kept-manual', at: Date.now() };
+        cd.cardEpoch = (cd.cardEpoch || 0) + 1;
+        await saveCharData(char, cd);
+        renderApplyLog(cd);
+        renderActiveStrip();
+        toastr.success('다시 적용했어요');
+    } catch (e) {
+        toastr.error(`다시 적용 실패: ${e.message}`);
+    }
+}
+
+// --- always-visible strip: everything Bot Tester is doing behind the chat ---
+
+async function renderActiveStrip() {
+    const el = $id('active');
+    if (!el) return;
+    const char = getCurrentCharacter();
+    const s = getSettings();
+    const chips = [];
+    if (verifying) chips.push(['flask', `수정 검증 중 (${verifying.step})`, 'busy', 'log']);
+    if (char) {
+        const meta = legacyMeta();
+        if (meta?.on) chips.push(['clock-rotate-left', '이 채팅: 예전 캐해 들어감', 'warn', 'rescue']);
+        if (chatNoteBlockRe().test(currentChatNote() || '')) chips.push(['note-sticky', '작가 노트: 봇 테스터 블록', 'warn', 'rescue']);
+        const cd = await loadCharData(char);
+        const un = (cd.applyLog || []).filter(x => !x.undone && x.verify && ['unverified', 'aborted'].includes(x.verify.state));
+        if (un.length && !verifying) chips.push(['pen-to-square', `검증 안 한 수정 ${un.length}개`, 'warn', 'log']);
+    }
+    if (s.testRestore && !running) chips.push(['sliders', '테스트 전용 프롬이 켜진 채 남음', 'bad', 'rescue']);
+    if (s.legacyAuto) chips.push(['wand-magic-sparkles', '자동 예전 캐해 켜짐', '', 'legacy']);
+    el.style.display = chips.length ? '' : 'none';
+    el.innerHTML = chips.map(([icon, text, cls, go]) => `<button type="button" class="bt-active-chip ${cls}" data-go="${go}" title="눌러서 보기">${ico(icon)}<span>${escapeHtml(text)}</span></button>`).join('');
+    el.querySelectorAll('.bt-active-chip').forEach(b => b.addEventListener('click', () => {
+        const go = b.dataset.go;
+        if (go === 'legacy') { switchTab('source'); scrollPanelTo($id('legacy_card') || document.querySelector('#bt_panel [id*="legacy"]')); return; }
+        switchTab('doctor');
+        scrollPanelTo(go === 'log' ? $id('apply_log') : $id('rescue_card'));
+    }));
 }
 
 async function undoApply(id, { quiet = false } = {}) {
@@ -4674,11 +5151,14 @@ async function undoApply(id, { quiet = false } = {}) {
                 if (r !== c.POPUP_RESULT.AFFIRMATIVE && r !== true && r !== 1) return;
             }
             writeField(item.field, item.before ?? '');
+            await flushCardSaves();
             say.success(`${item.label}을(를) 적용 전으로 되돌렸어요`);
         }
         item.undone = Date.now();
+        cd.cardEpoch = (cd.cardEpoch || 0) + 1;
         await saveCharData(char, cd);
         renderApplyLog(cd);
+        renderActiveStrip();
         if (!quiet) renderRescue();
     } catch (e) {
         if (quiet) throw e;
@@ -4695,15 +5175,29 @@ function renderApplyLog(data) {
     if (!el) return;
     const log = data?.applyLog || [];
     if (!log.length) { el.innerHTML = '<p class="bt-note">아직 적용한 내용이 없어요. 결과 화면의 <i class="fa-solid fa-file-import"></i> 버튼으로 제안을 카드에 바로 넣을 수 있어요.</p>'; return; }
-    el.innerHTML = log.map(item => `
+    const tagCls = { kept: 'ok', 'kept-manual': 'ok', reverted: 'warn', worse: 'bad', pending: 'busy', aborted: 'warn', unverified: 'warn', accepted: '' };
+    el.innerHTML = log.map(item => {
+        const v = item.verify;
+        const tag = v ? `<span class="bt-tag bt-verify-tag ${tagCls[v.state] || ''}">${escapeHtml(VERIFY_LABEL[v.state] || v.state)}</span>` : '';
+        const sum = verifySummaryText(v);
+        const canVerify = !item.undone && v && ['unverified', 'aborted'].includes(v.state) && (item.kind === 'field' || baselineRunsFor(data, item).length);
+        const canReapply = item.undone && v && ['reverted', 'worse'].includes(v.state) && ['field', 'lore'].includes(item.kind);
+        return `
         <div class="bt-log-item ${item.undone ? 'undone' : ''}">
             <div class="bt-log-main">
-                <b>${escapeHtml(item.label || '')}</b>
-                <small>${escapeHtml(new Date(item.time).toLocaleString())}${item.undone ? ' · 되돌림' : ''}</small>
+                <b>${escapeHtml(item.label || '')} ${tag}</b>
+                <small>${escapeHtml(new Date(item.time).toLocaleString())}${item.undone ? ' · 되돌림' : ''}${item.mode === 'merge' ? ' · 제자리에 고쳐 넣음' : ''}${sum ? ` · ${escapeHtml(sum)}` : ''}</small>
             </div>
+            <div class="bt-log-btns">
+            ${canVerify ? `<button type="button" class="bt-btn bt-btn-sm bt-verify" data-id="${item.id}">${ico('flask')}<span>검증</span></button>` : ''}
+            ${canReapply ? `<button type="button" class="bt-btn bt-btn-sm bt-reapply" data-id="${item.id}">${ico('rotate-right')}<span>다시 적용</span></button>` : ''}
             ${item.undone ? '' : `<button type="button" class="bt-btn bt-btn-sm bt-undo" data-id="${item.id}">${ico('rotate-left')}<span>되돌리기</span></button>`}
-        </div>`).join('');
+            </div>
+        </div>`;
+    }).join('');
     el.querySelectorAll('.bt-undo').forEach(b => b.addEventListener('click', () => undoApply(Number(b.dataset.id))));
+    el.querySelectorAll('.bt-verify').forEach(b => b.addEventListener('click', () => verifyApply(Number(b.dataset.id))));
+    el.querySelectorAll('.bt-reapply').forEach(b => b.addEventListener('click', () => reapplyItem(getCurrentCharacter(), Number(b.dataset.id))));
 }
 
 // ---------------------------------------------------------------------------
@@ -7804,7 +8298,7 @@ function legacyCardHtml() {
           <button type="button" id="bt_legacy_unlock" class="bt-btn">${ico('arrow-right')}<span>이 채팅도 지금 카드로</span></button>
         </div>
         <div class="bt-switches">
-          ${toggle('legacyauto', '카드 고치기 전에 시작한 채팅은 자동으로 예전 캐해 유지', '채팅을 열 때 확인해서, 바뀐 칸의 예전 내용을 그 채팅에만 넣어요')}
+          ${toggle('legacyauto', '카드 고치기 전에 시작한 채팅은 자동으로 예전 캐해 유지 (기본 꺼짐)', '채팅을 열 때 확인해서, 바뀐 칸의 예전 내용을 그 채팅에만 넣어요. 켜 두면 패널 위에 표시돼요. 필요한 채팅만 아래 버튼으로 직접 켜는 걸 추천해요')}
         </div>
         <div class="bt-actions">
           <button type="button" id="bt_legacy_snap" class="bt-btn bt-btn-sm">${ico('camera')}<span>지금 카드를 버전으로 저장</span></button>
@@ -7855,7 +8349,7 @@ function bindLegacyUI() {
     const s = getSettings();
     const auto = $id('legacyauto');
     auto.checked = s.legacyAuto !== false;
-    auto.addEventListener('change', () => { s.legacyAuto = auto.checked; saveSettings(); });
+    auto.addEventListener('change', () => { s.legacyAuto = auto.checked; saveSettings(); renderActiveStrip(); });
     $id('legacy_mode').addEventListener('change', () => { s.legacyMode = $id('legacy_mode').value; saveSettings(); });
     $id('legacy_lock').addEventListener('click', async () => {
         if (running) return;
@@ -7914,6 +8408,7 @@ function changeWord(sim) {
 }
 
 async function renderRescue() {
+    renderActiveStrip();
     const el = $id('rescue_view');
     if (!el) return;
     const char = getCurrentCharacter();
@@ -8466,7 +8961,15 @@ function bindNsfwUI() {
     };
 
     if (document.getElementById('extensionsMenu')) setup();
-    eventSource.on(event_types.APP_READY, () => setTimeout(async () => { await restoreInterruptedTestPrompt(); legacyOnChatChanged(); }, 1500));
+    eventSource.on(event_types.APP_READY, () => setTimeout(async () => {
+        await restoreInterruptedTestPrompt();
+        legacyOnChatChanged();
+        const st = getSettings();
+        if (st._migrated33) {
+            delete st._migrated33; saveSettings();
+            toastr.info('봇 테스터 v3.3: 더 안전한 기본값으로 바꿨어요. 고칠 문장은 카드와 같은 언어로 쓰고, 자동 예전 캐해는 꺼졌어요. 제안은 알맞은 자리에 고쳐 넣고, 적용한 뒤엔 테스트해서 좋아졌을 때만 남겨요. (설정 탭 → 제안 적용)', '봇 테스터', { timeOut: 15000 });
+        }
+    }, 1500));
     eventSource.on(event_types.APP_READY, setup);
     eventSource.on(event_types.CHAT_CHANGED, () => {
         renderAnchorNote();
