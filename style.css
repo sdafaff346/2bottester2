@@ -1671,3 +1671,95 @@
 .bt-apply-dialog .bt-apply-modes input[type="radio"],
 .bt-apply-dialog .bt-apply-verify input[type="checkbox"] { flex: none; width: 16px !important; height: 16px; min-width: 16px; margin: 0 !important; accent-color: #c9a56b; }
 .bt-apply-dialog .bt-apply-verify small { flex-basis: 100%; padding-left: 24px; }
+
+/* ==========================================================
+   v3.4 — first-time friendly layout
+   ========================================================== */
+
+/* start guide */
+#bt_panel .bt-guide {
+    border-color: color-mix(in srgb, var(--bt-accent) 45%, var(--bt-line));
+    background:
+        radial-gradient(120% 90px at 0% 0%, color-mix(in srgb, var(--bt-accent) 14%, transparent), transparent 70%),
+        var(--bt-surface);
+}
+#bt_panel .bt-guide-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
+#bt_panel .bt-guide-head h3 { margin: 2px 0 0; }
+#bt_panel .bt-guide-steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 0; counter-reset: none; }
+#bt_panel .bt-guide-steps li { position: relative; display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 12px; padding: 0 0 16px; }
+#bt_panel .bt-guide-steps li:not(:last-child)::after {
+    content: ''; position: absolute; left: 14px; top: 32px; bottom: 4px; width: 2px; border-radius: 2px;
+    background: var(--bt-line);
+}
+#bt_panel .bt-guide-steps li.done:not(:last-child)::after { background: color-mix(in srgb, var(--bt-good) 55%, var(--bt-line)); }
+#bt_panel .bt-guide-num {
+    width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center;
+    font-size: 13px; font-weight: 800; color: var(--bt-muted);
+    background: var(--bt-surface-2); box-shadow: inset 0 0 0 1px var(--bt-line-strong);
+}
+#bt_panel .bt-guide-steps li.now .bt-guide-num {
+    color: var(--bt-on-accent, #1b160e); background: var(--bt-accent);
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--bt-accent) 22%, transparent);
+}
+#bt_panel .bt-guide-steps li.done .bt-guide-num { color: #fff; background: var(--bt-good); box-shadow: none; }
+#bt_panel .bt-guide-steps li > div > b { display: block; margin-top: 4px; font-size: 14.5px; color: var(--bt-fg); }
+#bt_panel .bt-guide-steps p b { color: var(--bt-fg); }
+#bt_panel .bt-guide-steps li.done > div > b { color: var(--bt-muted); text-decoration: line-through; text-decoration-color: color-mix(in srgb, var(--bt-good) 60%, transparent); }
+#bt_panel .bt-guide-steps p { margin: 3px 0 0; font-size: 13px; line-height: 1.65; color: var(--bt-muted); word-break: keep-all; }
+#bt_panel .bt-guide-steps li.done p { display: none; }
+#bt_panel .bt-guide-btn { margin-top: 8px; }
+#bt_panel .bt-guide-steps li.done .bt-guide-btn { display: none; }
+#bt_panel .bt-guide-tabs { margin-top: 2px; }
+#bt_panel .bt-guide-tabs ul { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 7px; }
+#bt_panel .bt-guide-tabs li { display: grid; grid-template-columns: 18px 42px minmax(0, 1fr); gap: 6px; align-items: baseline; font-size: 12.5px; line-height: 1.55; color: var(--bt-muted); }
+#bt_panel .bt-guide-tabs li .fa-solid { color: var(--bt-accent); font-size: 12px; }
+#bt_panel .bt-guide-tabs li b { color: var(--bt-fg); font-weight: 700; }
+#bt_panel .bt-guide-foot { margin: 10px 0 0; font-size: 12px; color: var(--bt-faint); }
+
+/* foldable cards: header shows a one-line state when folded */
+#bt_panel .bt-foldable > .bt-card-head {
+    display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 10px; align-items: center; cursor: pointer;
+}
+#bt_panel .bt-foldable > .bt-card-head > :not(.bt-fold-btn) { grid-column: 1; }
+#bt_panel .bt-fold-btn {
+    grid-column: 2; grid-row: 1 / span 3; align-self: center;
+    display: inline-flex; align-items: center; gap: 8px; max-width: 100%;
+    padding: 4px 6px 4px 10px; border-radius: 999px; border: 0; cursor: pointer;
+    font: inherit; font-size: 11.5px; font-weight: 600; color: var(--bt-muted);
+    background: var(--bt-surface-2); box-shadow: inset 0 0 0 1px var(--bt-line);
+}
+#bt_panel .bt-fold-btn:hover { color: var(--bt-fg); box-shadow: inset 0 0 0 1px var(--bt-accent-line, var(--bt-accent)); }
+#bt_panel .bt-fold-btn .fa-solid { font-size: 10px; transition: transform .2s; }
+#bt_panel .bt-foldable:not(.bt-collapsed) .bt-fold-btn .fa-solid { transform: rotate(180deg); }
+#bt_panel .bt-fold-sum { max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#bt_panel .bt-fold-sum:empty { display: none; }
+#bt_panel .bt-fold-sum.ok { color: var(--bt-good); }
+#bt_panel .bt-fold-sum.warn { color: var(--bt-warn); }
+#bt_panel .bt-foldable:not(.bt-collapsed) .bt-fold-sum { display: none; }
+#bt_panel .bt-collapsed > :not(.bt-card-head) { display: none !important; }
+#bt_panel .bt-collapsed > .bt-card-head { margin-bottom: 0; }
+#bt_panel .bt-collapsed > .bt-card-head .bt-desc { display: none; }
+#bt_panel .bt-collapsed > .bt-card-head .bt-eyebrow { display: none; }
+#bt_panel .bt-collapsed { padding-top: 13px; padding-bottom: 13px; }
+#bt_panel .bt-collapsed > .bt-card-head h3 { font-size: 15px; }
+
+/* empty states lead somewhere */
+#bt_panel .bt-empty-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 4px; }
+
+/* two-column fields: hint goes under the label so nothing gets squeezed */
+#bt_panel .bt-grid2 { align-items: end; }
+#bt_panel .bt-grid2 .bt-field-label { flex-direction: column; align-items: flex-start; gap: 2px; }
+#bt_panel .bt-grid2 .bt-field-hint { text-align: left; font-weight: 500; }
+
+/* calmer, easier to read body text */
+#bt_panel .bt-card-head h3 { letter-spacing: -0.02em; }
+#bt_panel .bt-note { line-height: 1.7; }
+
+@media (max-width: 640px) {
+    #bt_panel .bt-fold-sum { max-width: 110px; }
+    #bt_panel .bt-guide-steps li { grid-template-columns: 28px minmax(0, 1fr); gap: 10px; }
+    #bt_panel .bt-guide-num { width: 28px; height: 28px; }
+    #bt_panel .bt-guide-steps li:not(:last-child)::after { left: 13px; top: 30px; }
+    #bt_panel .bt-grid2 { grid-template-columns: 1fr; }
+}
+@media (prefers-reduced-motion: reduce) { #bt_panel .bt-fold-btn .fa-solid { transition: none; } }

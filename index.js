@@ -1759,6 +1759,7 @@ function buildPanel() {
     <span id="bt_hstatus" class="bt-hstatus"></span>
     <div class="bt-header-btns">
       <button type="button" id="bt_reroll_h" class="bt-iconbtn bt-icon bt-reroll-h" style="display:none" title="다시 요청 (리롤)">${ico('rotate-right')}</button>
+      <button type="button" id="bt_help" class="bt-iconbtn bt-icon" title="시작 가이드 · 탭 안내">${ico('circle-question')}</button>
       <button type="button" id="bt_resetpos" class="bt-iconbtn bt-icon" title="위치 초기화">${ico('arrows-to-dot')}</button>
       <button type="button" id="bt_minimize" class="bt-iconbtn bt-icon" title="접기 / 펴기">${ico('minus')}</button>
       <button type="button" id="bt_close" class="bt-iconbtn bt-icon" title="닫기">${ico('xmark')}</button>
@@ -1778,6 +1779,7 @@ function buildPanel() {
   <div id="bt_body" class="bt-body">
 
     <div class="bt-page" data-page="source">
+${guideCardHtml()}
 ${botKindCardHtml()}
       <section class="bt-card">
         ${cardHead('Step 1', '위키 링크', '픽시브 백과사전, 나무위키, 팬덤 위키 링크를 한 줄에 하나씩 넣어주세요.<br>캐릭터마다 따로 저장돼요.')}
@@ -1792,16 +1794,17 @@ ${botKindCardHtml()}
         ${cardHead('Step 2', '원작 자료', '불러온 내용을 다듬어 주세요. 성우·굿즈처럼 관련 없는 부분을 지우면 평가가 더 정확해져요.')}
         <div class="bt-field-meta"><span id="bt_refcount"></span></div>
         <textarea id="bt_reftext" class="bt-input bt-reftext" rows="10" placeholder="불러온 위키 내용이 여기에 들어와요.&#10;수집이 막힌 사이트는 직접 복사해서 붙여넣어도 돼요."></textarea>
-      </section>
-
-      <section class="bt-card">
-        ${cardHead('Optional', '제작자 메모', '일부러 바꾼 설정(AU, 시점 등)을 적어두면 평가할 때 감점하지 않아요.')}
-        <textarea id="bt_authornote" class="bt-input" rows="3" placeholder="예) 현대 AU라서 마법은 안 씀&#10;원작 3부 이후 시점 / {{user}}와는 소꿉친구"></textarea>
         <div class="bt-actions bt-actions-end">
           <button type="button" id="bt_ref_undo" class="bt-btn" style="display:none">${ico('rotate-left')}<span>요약 되돌리기</span></button>
           <button type="button" id="bt_ref_diet" class="bt-btn" title="원작 자료를 성격·말투·관계 위주로 요약해서 평가 토큰을 줄여요">${ico('scissors')}<span>요약해서 줄이기</span></button>
           <button type="button" id="bt_savesrc" class="bt-btn">${ico('floppy-disk')}<span>저장</span></button>
         </div>
+      </section>
+
+      <section class="bt-card" id="bt_memo_card">
+        ${cardHead('Optional', '제작자 메모', '일부러 바꾼 설정(AU, 시점 등)을 적어두면 평가할 때 감점하지 않아요.')}
+        <textarea id="bt_authornote" class="bt-input" rows="3" placeholder="예) 현대 AU라서 마법은 안 씀&#10;원작 3부 이후 시점 / {{user}}와는 소꿉친구"></textarea>
+        <p class="bt-note">입력칸에서 나가면 자동으로 저장돼요.</p>
       </section>
 
       <section class="bt-card bt-card-accent" id="bt_caeh_card">
@@ -1859,7 +1862,7 @@ ${continuityCardHtml()}
 
     <div class="bt-page" data-page="result" style="display:none">
       <div id="bt_ab_compare" class="bt-result"></div>
-      <div id="bt_result" class="bt-result">${emptyState('chart-simple', '아직 평가 결과가 없어요.')}</div>
+      <div id="bt_result" class="bt-result">${resultEmptyHtml()}</div>
       <section class="bt-card bt-card-flat">
         ${cardHead('', '이전 기록')}
         <div id="bt_history" class="bt-history"></div>
@@ -1912,8 +1915,8 @@ ${doctorPageHtml()}
         </div>
         <div class="bt-grid2">
           ${field('검증 기준', `<select id="bt_verifyrule" class="bt-input">
-              <option value="strict">확실히 좋아졌을 때만 남기기 (+3점 이상)</option>
-              <option value="lenient">확실히 나빠졌을 때만 되돌리기 (−3점 이하)</option>
+              <option value="strict">좋아졌을 때만 남기기 (+3점)</option>
+              <option value="lenient">나빠졌을 때만 되돌리기 (−3점)</option>
             </select>`)}
           ${field('검증 테스트 횟수', '<input id="bt_verifyruns" class="bt-input bt-num" type="number" min="1" max="4" step="1">', '고친 카드로 돌릴 횟수. 많을수록 정확하지만 오래 걸려요')}
         </div>
@@ -2029,6 +2032,7 @@ function bindPanel() {
     $id('close').addEventListener('click', () => togglePanel(false));
     $id('minimize').addEventListener('click', () => setMinimized(!$id('panel').classList.contains('bt-min')));
     $id('resetpos').addEventListener('click', resetPanel);
+    $id('help').addEventListener('click', toggleGuide);
     makeDraggable();
 
     document.querySelectorAll('#bt_panel .bt-tab').forEach(tab => {
@@ -2090,17 +2094,18 @@ function bindPanel() {
     const ts = $id('textsize');
     ts.value = s.textSize || 'md';
     ts.addEventListener('change', () => { s.textSize = ts.value; $id('panel').dataset.textsize = ts.value; saveSettings(); });
-    const jumpBtns = [...document.querySelectorAll('#bt_panel .bt-jump-btn')];
-    jumpBtns.forEach(b => b.addEventListener('click', () => scrollPanelTo(document.getElementById(b.dataset.to))));
-    // highlight the section currently under the jump bar
+    document.querySelectorAll('#bt_panel .bt-jump-btn').forEach(b => b.addEventListener('click', () => scrollPanelTo(document.getElementById(b.dataset.to))));
+    // highlight the section currently under the jump bar of the visible page
     const spy = () => {
         const body = $id('body');
+        const page = [...document.querySelectorAll('#bt_panel .bt-page')].find(p => p.style.display !== 'none');
+        const jumpBtns = page ? [...page.querySelectorAll('.bt-jump-btn')] : [];
         if (!body || !jumpBtns.length) return;
         const line = body.getBoundingClientRect().top + 64;
         let cur = jumpBtns[0];
         for (const b of jumpBtns) {
             const el = document.getElementById(b.dataset.to);
-            if (el && el.getBoundingClientRect().top <= line) cur = b;
+            if (el && el.offsetParent && el.getBoundingClientRect().top <= line) cur = b;
         }
         jumpBtns.forEach(b => b.classList.toggle('active', b === cur));
     };
@@ -2166,6 +2171,7 @@ function bindPanel() {
 
     // Source page
     $id('reftext').addEventListener('input', updateRefCount);
+    for (const id of ['urls', 'reftext', 'authornote']) $id(id).addEventListener('change', () => saveSourceFromUI(false));
     $id('savesrc').addEventListener('click', () => saveSourceFromUI(true));
     bindCaehUI();
     bindLegacyUI();
@@ -2173,6 +2179,9 @@ function bindPanel() {
     bindVoiceMember();
     bindKindDoctor();
     $id('fetch').addEventListener('click', onFetchClick);
+    $id('guide_hide').addEventListener('click', hideGuide);
+    initCollapsibles();
+    bindPanelGo();
 
     // Test page
     $id('run').addEventListener('click', async () => {
@@ -2330,6 +2339,7 @@ function setMinimized(min) {
 function scrollPanelTo(el) {
     const body = $id('body');
     if (!body || !el) return;
+    openFoldedAncestors(el);
     const top = el.getBoundingClientRect().top - body.getBoundingClientRect().top + body.scrollTop - 6;
     body.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
     resetPageScroll();
@@ -2556,8 +2566,9 @@ async function refreshPanelForChar() {
     const dp = document.querySelector('#bt_panel .bt-page[data-page="doctor"]');
     if (dp && dp.style.display !== 'none') refreshDietList();
     if (data.history?.length) renderResult(data.history[0], data.history[1]);
-    else $id('result').innerHTML = emptyState('chart-simple', '아직 평가 결과가 없어요.<br>테스트 탭에서 테스트하거나 바로 평가해 보세요.');
+    else $id('result').innerHTML = resultEmptyHtml();
     setStatus(char ? '' : '캐릭터와 1:1 채팅을 열면 사용할 수 있어요.');
+    renderActiveStrip();
 }
 
 async function saveSourceFromUI(notify) {
@@ -2575,6 +2586,7 @@ async function saveSourceFromUI(notify) {
     data.rosterText = $id('roster').value;
     if (data.anchorText !== $id('anchor').value) { data.anchorText = $id('anchor').value; data.anchorTime = data.anchorText ? Date.now() : 0; }
     await saveCharData(char, data);
+    renderActiveStrip();
     if (notify) toastr.success(`${char.name}의 원작 자료를 저장했어요`);
 }
 
@@ -4328,8 +4340,9 @@ async function runChatDoctor() {
 function doctorPageHtml() {
     return `
     <div class="bt-page" data-page="doctor" style="display:none">
+      <nav class="bt-jump" aria-label="진단 바로가기">${[['doc_main', '진단하기'], ['restyle_card', '기준 스타일'], ['dedup_card', '중복 정리'], ['diet_card', '토큰 다이어트'], ['applylog_card', '적용 기록']].map(([id, l]) => `<button type="button" class="bt-jump-btn" data-to="bt_${id}">${l}</button>`).join('')}</nav>
 ${rescueCardHtml()}
-      <section class="bt-card">
+      <section class="bt-card" id="bt_doc_main">
         ${cardHead('Card doctor', '카드 진단', '토큰이 과하지 않은지, GPT·Claude·Gemini가 캐릭터를 잘 연기할 수 있는 카드인지, 실제 롤플에서 아쉬운 점이 뭔지 찾아줘요.')}
         <div class="bt-vset-btns">
           <button type="button" class="bt-vset-btn" id="bt_docbtn_fun">
@@ -4364,7 +4377,7 @@ ${restyleCardHtml()}
       <div id="bt_doc_chat" class="bt-result"></div>
 ${dedupCardHtml()}
 ${dietCardHtml()}
-      <section class="bt-card">
+      <section class="bt-card" id="bt_applylog_card">
         ${cardHead('History', '적용 기록', '봇 테스터로 카드에 넣은 내용이에요. 되돌리면 적용 전 내용으로 돌아가요.')}
         <div id="bt_apply_log" class="bt-stack"></div>
       </section>
@@ -4704,6 +4717,197 @@ async function logApply(char, item) {
         } catch (e) { if (e.message !== 'skip') console.warn(LOG, 'version record failed', e); }
     }
     return id;
+}
+
+// ---------------------------------------------------------------------------
+// v3.4 first-time friendly UI (layout only — no feature changes)
+//  - 시작 가이드: 3-step checklist with jump buttons, reopened with the ? button
+//  - advanced cards fold to one line that says what state they are in
+//  - [data-bt-go] buttons anywhere in the panel: "tab:test", "el:bt_urls", "click:bt_evalcard"
+// ---------------------------------------------------------------------------
+
+const TAB_GUIDE = [
+    ['book-open', '원작', '위키 링크·원작 자료를 넣는 곳. 원하는 캐해도 여기서 적어요.'],
+    ['flask', '테스트', 'AI가 유저 역할로 대신 대화하고 끝나면 평가해요.'],
+    ['chart-simple', '결과', '원작 일치도·재미 점수와 고칠 점. 📥로 카드에 바로 넣어요.'],
+    ['comment-dots', '말투', '일본어·한국어·영어 버전별 말투와 성격을 따로 검사해요.'],
+    ['stethoscope', '진단', '토큰·로어북·재미 분석, 토큰 줄이기, 적용 기록, 캐붕 응급처치.'],
+    ['sliders', '설정', '평가에 쓸 모델, 검증 방식, 화면·알림.'],
+];
+
+function guideCardHtml() {
+    return `
+      <section class="bt-card bt-guide" id="bt_guide" style="display:none">
+        <header class="bt-guide-head">
+          <div><span class="bt-eyebrow">Start here</span><h3>처음이라면 이 순서대로</h3></div>
+          <button type="button" class="bt-btn bt-btn-sm bt-btn-ghost" id="bt_guide_hide">${ico('eye-slash')}<span>숨기기</span></button>
+        </header>
+        <ol class="bt-guide-steps" id="bt_guide_steps"></ol>
+        <details class="bt-disclosure bt-disclosure-sm bt-guide-tabs">
+          <summary><span>탭마다 하는 일</span>${ico('chevron-down')}</summary>
+          <ul>${TAB_GUIDE.map(([i, t, d]) => `<li>${ico(i)}<b>${t}</b><span>${d}</span></li>`).join('')}</ul>
+        </details>
+        <p class="bt-guide-foot">위쪽 <b>${ico('circle-question')}</b> 버튼으로 언제든 다시 열 수 있어요.</p>
+      </section>`;
+}
+
+async function renderGuide() {
+    const box = $id('guide');
+    if (!box) return;
+    const s = getSettings();
+    if (s.onboardDone && !guideForced) { box.style.display = 'none'; return; }
+    box.style.display = '';
+    const char = getCurrentCharacter();
+    const cd = char ? await loadCharData(char) : null;
+    const hasRef = !!(cd && (String(cd.refText || '').trim() || (cd.urls || []).length));
+    const hasRun = !!(cd && ((cd.runs || []).length || (cd.history || []).length));
+    const hasResult = !!(cd && (cd.history || []).length);
+    const steps = [
+        [hasRef, '원작 자료 넣기', '위키 링크를 넣고 <b>링크 불러오기</b>. 자료가 없어도 테스트는 되지만, 있어야 원작과 비교해요.', hasRef ? '' : `<button type="button" class="bt-btn bt-btn-sm" data-bt-go="el:bt_urls">${ico('arrow-down')}<span>링크 넣는 곳으로</span></button>`],
+        [hasRun, '테스트 돌리기', 'AI가 유저 역할로 몇 턴 대화하고, 끝나면 자동으로 평가해요. 기존 채팅은 건드리지 않아요.', `<button type="button" class="bt-btn bt-btn-sm ${hasRef && !hasRun ? 'bt-btn-primary' : ''}" data-bt-go="tab:test">${ico('flask')}<span>테스트 탭으로</span></button>`],
+        [false, '결과 보고 하나씩 고치기', '고칠 점 옆 📥를 누르면 카드의 알맞은 자리에 넣고, 다시 테스트해서 <b>좋아졌을 때만</b> 남겨요.', `<button type="button" class="bt-btn bt-btn-sm ${hasResult ? 'bt-btn-primary' : ''}" data-bt-go="tab:result">${ico('chart-simple')}<span>결과 탭으로</span></button>`],
+    ];
+    const next = steps.findIndex(([done]) => !done);
+    $id('guide_steps').innerHTML = steps.map(([done, title, desc, btn], i) => `
+        <li class="${done ? 'done' : i === next ? 'now' : ''}">
+          <span class="bt-guide-num">${done ? ico('check') : i + 1}</span>
+          <div><b>${title}</b><p>${desc}</p>${btn ? `<div class="bt-guide-btn">${btn}</div>` : ''}</div>
+        </li>`).join('');
+}
+
+let guideForced = false;
+
+function hideGuide() {
+    const s = getSettings();
+    guideForced = false;
+    if (!s.onboardDone) { s.onboardDone = true; saveSettings(); }
+    renderGuide();
+}
+
+/** The ? button: shows the guide (on the 원작 tab) or hides it when it is already showing. */
+function toggleGuide() {
+    const s = getSettings();
+    const visible = $id('guide')?.style.display !== 'none' && (!s.onboardDone || guideForced);
+    if (visible) { hideGuide(); return; }
+    guideForced = true;
+    switchTab('source');
+    renderGuide().then(() => scrollPanelTo($id('guide')));
+}
+
+// --- collapsible advanced cards ---
+
+const COLLAPSIBLES = [
+    // [section id, storage key, summary(cd, s) → { text, tone: ''|'ok'|'warn', open?: true to force open }]
+    ['bt_kind_card', 'kind', (cd) => ({ text: BOT_KINDS[botKind(cd)]?.label || '1인 캐릭터봇', open: botKind(cd) !== 'single' && !(cd.rosterText || '').trim() })],
+    ['bt_memo_card', 'memo', (cd) => (String(cd.authorNote || '').trim() ? { text: '적어 둠', tone: 'ok' } : { text: '비어 있음 · 선택' })],
+    ['bt_caeh_card', 'caeh', (cd) => {
+        const parts = [String(cd.caehBase || '').trim() && '원하는 캐해', String(cd.caehCaution || '').trim() && '주의사항', String(cd.anchorText || '').trim() && '이어가는 채팅'].filter(Boolean);
+        return parts.length ? { text: `${parts.join(' · ')} 적어 둠`, tone: 'ok' } : { text: '비어 있음 · 선택' };
+    }],
+    ['bt_legacy_card', 'legacy', () => (legacyMeta()?.on ? { text: '이 채팅: 예전 캐해 들어감', tone: 'warn' } : { text: '이 채팅은 지금 카드로' })],
+    ['bt_ab_card', 'ab', (cd) => ((cd.runs || []).some(r => r.id === cd.abBaselineId) ? { text: '기준(A) 있음', tone: 'ok' } : { text: '테스트하면 자동으로 A가 돼요' })],
+    ['bt_cont_card', 'cont', (cd) => ((cd.applyLog || []).some(x => !x.undone && x.kind === 'field') ? { text: '비교할 수정 있음' } : { text: '적용한 수정이 생기면 써요' })],
+    ['bt_rescue_card', 'rescue', (cd) => {
+        const n = (legacyMeta()?.on ? 1 : 0) + (chatNoteBlockRe().test(currentChatNote() || '') ? 1 : 0) + (getSettings().testRestore ? 1 : 0);
+        return n ? { text: `확인할 것 ${n}개`, tone: 'warn', open: true } : { text: '이 채팅은 문제 없음', tone: 'ok' };
+    }],
+    ['bt_restyle_card', 'restyle', (cd, s) => (String(s.funReference || '').trim() ? { text: '기준 스타일 있음', tone: 'ok' } : { text: '기준 스타일을 먼저 저장해요' })],
+    ['bt_dedup_card', 'dedup', () => ({ text: '겹치는 문장 지우기' })],
+    ['bt_diet_card', 'diet', () => ({ text: '매번 들어가는 토큰 줄이기' })],
+    ['bt_applylog_card', 'applylog', (cd) => {
+        const act = (cd.applyLog || []).filter(x => !x.undone);
+        const un = act.filter(x => x.verify && ['unverified', 'aborted'].includes(x.verify.state)).length;
+        return un ? { text: `검증 안 한 수정 ${un}개`, tone: 'warn', open: true } : act.length ? { text: `적용한 수정 ${act.length}개` } : { text: '아직 없음' };
+    }],
+];
+
+function collapseStore(key, val) {
+    const k = `bot_tester_fold::${key}`;
+    try {
+        if (val === undefined) return localStorage.getItem(k);
+        localStorage.setItem(k, val);
+    } catch { /* private mode etc. */ }
+    return null;
+}
+
+function setCollapsed(sec, collapsed, remember = true) {
+    sec.classList.toggle('bt-collapsed', collapsed);
+    sec.querySelector('.bt-fold-btn')?.setAttribute('aria-expanded', String(!collapsed));
+    if (remember && sec.dataset.fold) collapseStore(sec.dataset.fold, collapsed ? '1' : '0');
+}
+
+function initCollapsibles() {
+    for (const [id, key] of COLLAPSIBLES) {
+        const sec = document.getElementById(id);
+        const head = sec?.querySelector(':scope > .bt-card-head');
+        if (!sec || !head || sec.classList.contains('bt-foldable')) continue;
+        sec.classList.add('bt-foldable');
+        sec.dataset.fold = key;
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'bt-fold-btn';
+        btn.innerHTML = `<span class="bt-fold-sum"></span>${ico('chevron-down')}`;
+        btn.setAttribute('aria-expanded', 'true');
+        btn.title = '펼치기 / 접기';
+        head.appendChild(btn);
+        head.addEventListener('click', (e) => {
+            if (e.target.closest('a, input, select, textarea') || (e.target.closest('button') && !e.target.closest('.bt-fold-btn'))) return;
+            setCollapsed(sec, !sec.classList.contains('bt-collapsed'));
+        });
+        const saved = collapseStore(key);
+        setCollapsed(sec, saved === null ? true : saved === '1', false);
+    }
+}
+
+/** Updates each folded card's one-line state; cards that need attention open themselves. */
+async function refreshCollapsibles() {
+    const char = getCurrentCharacter();
+    const cd = char ? await loadCharData(char) : emptyCharData();
+    const s = getSettings();
+    for (const [id, key, sum] of COLLAPSIBLES) {
+        const sec = document.getElementById(id);
+        if (!sec?.classList.contains('bt-foldable')) continue;
+        let r = { text: '' };
+        try { r = sum(cd, s) || r; } catch { /* keep empty */ }
+        const el = sec.querySelector('.bt-fold-sum');
+        el.textContent = r.text || '';
+        el.className = `bt-fold-sum ${r.tone || ''}`;
+        if (r.open && sec.classList.contains('bt-collapsed') && sec.dataset.autoOpened !== r.text) {
+            sec.dataset.autoOpened = r.text;
+            setCollapsed(sec, false, false);
+        }
+        void key;
+    }
+}
+
+function openFoldedAncestors(el) {
+    for (let n = el; n && n.id !== 'bt_panel'; n = n.parentElement) {
+        if (n.classList?.contains('bt-collapsed')) setCollapsed(n, false);
+    }
+}
+
+function bindPanelGo() {
+    $id('panel')?.addEventListener('click', (e) => {
+        const b = e.target.closest('[data-bt-go]');
+        if (!b) return;
+        const [kind, val] = String(b.dataset.btGo).split(':');
+        if (kind === 'tab') { switchTab(val); return; }
+        const el = document.getElementById(val);
+        if (!el) return;
+        const page = el.closest('.bt-page');
+        if (page && page.style.display === 'none') switchTab(page.dataset.page);
+        if (kind === 'click') { el.click(); return; }
+        scrollPanelTo(el.closest('.bt-card') || el);
+        if (/^(TEXTAREA|INPUT)$/.test(el.tagName)) setTimeout(() => el.focus({ preventScroll: true }), 350);
+    });
+}
+
+function resultEmptyHtml() {
+    return `<div class="bt-empty">${ico('chart-simple')}<p>아직 평가 결과가 없어요.<br>테스트를 돌리면 끝나고 바로 여기에 나와요.</p>
+        <div class="bt-empty-actions">
+          <button type="button" class="bt-btn bt-btn-primary" data-bt-go="tab:test">${ico('flask')}<span>테스트하러 가기</span></button>
+          <button type="button" class="bt-btn" data-bt-go="click:bt_evalcard">${ico('id-card')}<span>대화 없이 카드만 평가</span></button>
+        </div></div>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -5098,6 +5302,8 @@ async function reapplyItem(char, itemId) {
 async function renderActiveStrip() {
     const el = $id('active');
     if (!el) return;
+    refreshCollapsibles().catch(() => {});
+    renderGuide().catch(() => {});
     const char = getCurrentCharacter();
     const s = getSettings();
     const chips = [];
@@ -5206,7 +5412,7 @@ function renderApplyLog(data) {
 
 function abPanelHtml() {
     return `
-      <section class="bt-card">
+      <section class="bt-card" id="bt_ab_card">
         ${cardHead('A / B', '수정 전·후 비교', '카드를 고치기 전 테스트(A)와 똑같은 메시지로 고친 뒤 다시 테스트(B)해서 점수와 답장을 나란히 비교해요.')}
         <div id="bt_ab_status" class="bt-ab-status"></div>
         <div class="bt-actions bt-actions-split">
