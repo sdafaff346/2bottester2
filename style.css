@@ -1763,3 +1763,22 @@
     #bt_panel .bt-grid2 { grid-template-columns: 1fr; }
 }
 @media (prefers-reduced-motion: reduce) { #bt_panel .bt-fold-btn .fa-solid { transition: none; } }
+
+/* ==========================================================
+   v3.5 — 봇 만들기 (Description 쓰기)
+   ========================================================== */
+#bt_panel .bt-build-filter { margin-bottom: 6px; }
+#bt_panel .bt-build-refinfo { display: grid; gap: 8px; margin-top: 8px; }
+#bt_panel .bt-build-refinfo:empty { display: none; }
+#bt_panel .bt-build-reftags { display: flex; flex-wrap: wrap; gap: 5px; }
+#bt_panel .bt-build-sources { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+#bt_panel .bt-build-sources label.disabled { opacity: 0.45; }
+#bt_panel .bt-build-sources small { color: var(--bt-faint); font-weight: 500; }
+#bt_panel .bt-build-flag {
+    display: grid; gap: 4px; margin: 10px 0; padding: 10px 12px; border-radius: 10px;
+    font-size: 12.5px; line-height: 1.6; background: var(--bt-surface-2); box-shadow: inset 3px 0 0 var(--bt-line-strong);
+}
+#bt_panel .bt-build-flag.warn { box-shadow: inset 3px 0 0 var(--bt-warn); background: color-mix(in srgb, var(--bt-warn) 8%, var(--bt-surface-2)); }
+#bt_panel .bt-build-flag b { color: var(--bt-fg); }
+#bt_panel .bt-build-flag small { color: var(--bt-muted); }
+#bt_panel .bt-build-out .bt-diet-out { max-height: 420px; overflow: auto; }

@@ -1823,6 +1823,7 @@ ${botKindCardHtml()}
         </div>
         <p class="bt-note"><b>작가 노트에 넣기</b>: 지금 열린 채팅의 Author's Note(채팅마다 따로 저장)에만 들어가요. 카드를 새 성격으로 고쳐도 이 채팅은 예전 말투·거리감으로 이어지고, 새 채팅은 고친 카드대로 시작해요.</p>
       </section>
+${buildCardHtml()}
 ${legacyCardHtml()}
     </div>
 
@@ -2174,6 +2175,7 @@ function bindPanel() {
     for (const id of ['urls', 'reftext', 'authornote']) $id(id).addEventListener('change', () => saveSourceFromUI(false));
     $id('savesrc').addEventListener('click', () => saveSourceFromUI(true));
     bindCaehUI();
+    bindBuildUI();
     bindLegacyUI();
     bindBotKindUI();
     bindVoiceMember();
@@ -2207,6 +2209,7 @@ function switchTab(name) {
         fillPresetSelect($id('testpreset'), s.testPreset);
     }
     if (name === 'test') renderTestPromptNote();
+    if (name === 'source') fillBuildRefOptions();
 }
 
 // ---------------------------------------------------------------------------
@@ -2568,6 +2571,7 @@ async function refreshPanelForChar() {
     if (data.history?.length) renderResult(data.history[0], data.history[1]);
     else $id('result').innerHTML = resultEmptyHtml();
     setStatus(char ? '' : '캐릭터와 1:1 채팅을 열면 사용할 수 있어요.');
+    fillBuildUI();
     renderActiveStrip();
 }
 
@@ -4720,6 +4724,267 @@ async function logApply(char, item) {
 }
 
 // ---------------------------------------------------------------------------
+// 봇 만들기 (v3.5): write the Description from the collected material, in the FORMAT of a bot
+// the creator already likes (picked from their character list). Content never comes from that bot.
+// ---------------------------------------------------------------------------
+
+const BUILD_LANGS = { ref: '참고 봇과 같은 언어', ko: '한국어', en: '영어 (토큰 절약)' };
+const BUILD_LENS = { ref: '참고 봇과 비슷하게', short: '더 짧게 (약 0.6배)', long: '더 길게 (약 1.5배)' };
+const BUILD_SOURCES = [
+    ['ref', '원작 자료'], ['memo', '제작자 메모'], ['caeh', '캐해 방향'], ['voice', '말투 프로필'], ['cur', '지금 Description 살리기'],
+];
+let buildResult = null;
+
+function buildCardHtml() {
+    return `
+      <section class="bt-card" id="bt_build_card">
+        ${cardHead('Build', '봇 만들기 · Description 쓰기', '모아 둔 자료로 Description을 써 줘요. 참고할 봇을 고르면 그 봇의 Description <b>형식</b>(순서·제목·표기법·문장 길이)만 따라 하고, 내용은 전부 이 캐릭터 자료에서 가져와요.')}
+        ${field('참고할 봇', `<input id="bt_build_filter" class="bt-input bt-build-filter" type="search" placeholder="이름으로 찾기">
+            <select id="bt_build_ref" class="bt-input"></select>`, '형식만 따라 해요')}
+        <div id="bt_build_refinfo" class="bt-build-refinfo"></div>
+        <div class="bt-field"><span class="bt-field-label">넣을 자료</span>
+          <div class="bt-build-sources" id="bt_build_sources">${BUILD_SOURCES.map(([k, l]) => `<label class="bt-fixcheck"><input type="checkbox" value="${k}"><span class="bt-checkmark" aria-hidden="true">${ico('check')}</span><span>${l} <small class="bt-build-src-n" data-k="${k}"></small></span></label>`).join('')}</div>
+        </div>
+        <div class="bt-grid2">
+          ${field('언어', `<select id="bt_build_lang" class="bt-input">${Object.entries(BUILD_LANGS).map(([k, v]) => `<option value="${k}">${v}</option>`).join('')}</select>`)}
+          ${field('길이', `<select id="bt_build_len" class="bt-input">${Object.entries(BUILD_LENS).map(([k, v]) => `<option value="${k}">${v}</option>`).join('')}</select>`)}
+        </div>
+        ${field('추가 요청', '<textarea id="bt_build_req" class="bt-input" rows="2" placeholder="예) 말투 부분을 자세히 / 현대 AU 기준으로 / 외모는 짧게"></textarea>', '선택')}
+        <div class="bt-actions">
+          <button type="button" id="bt_build_run" class="bt-btn bt-btn-primary bt-btn-wide">${ico('pen-nib')}<span>Description 만들기</span></button>
+        </div>
+        <p class="bt-note">만든 결과는 바로 넣지 않고 먼저 보여줘요. 넣을 때 원래 Description은 백업돼서 <b>진단 → 적용 기록</b>에서 되돌릴 수 있어요.</p>
+      </section>
+      <div id="bt_build_result" class="bt-result"></div>`;
+}
+
+/** Full character object (SillyTavern may only hold a shallow copy until the character is opened). */
+async function fullCharacter(avatar) {
+    const local = (ctx().characters || []).find(x => x?.avatar === avatar);
+    if (local && !local.shallow && (local.description ?? local.data?.description) !== undefined) return local;
+    try {
+        const res = await fetch('/api/characters/get', { method: 'POST', headers: ctx().getRequestHeaders(), body: JSON.stringify({ avatar_url: avatar }) });
+        if (res.ok) return await res.json();
+    } catch (e) { console.warn(LOG, 'reference character fetch failed', e); }
+    return local || null;
+}
+
+function describeFormat(text) {
+    const t = String(text || '');
+    const lines = t.split('\n').filter(l => l.trim());
+    const tags = [];
+    if (/^\s*#{1,4}\s/m.test(t)) tags.push('# 제목');
+    if (/^\s*\[[^\]\n]{2,40}\]\s*$/m.test(t) || /^\s*\[[^\]\n]{2,40}:/m.test(t)) tags.push('[대괄호] 구역');
+    if (/\+\s*"[^"]+"/.test(t) || /\w+\("[^"]+"/.test(t)) tags.push('W++ 표기');
+    if (/^\s*<[a-z_]+>/mi.test(t)) tags.push('<태그>');
+    if (/^\s*[-*•]\s/m.test(t)) tags.push('목록');
+    if (/^\s*[\w가-힣 ]{1,20}:\s/m.test(t)) tags.push('항목: 값');
+    const longParas = lines.filter(l => l.length > 140).length;
+    if (longParas >= 2) tags.push('문단');
+    const lang = hangulRatio(t) > 0.5 ? '한국어' : /[ぁ-ゟ゠-ヿ]/.test(t) ? '일본어' : '영어';
+    return { tags, lang, lines: lines.length };
+}
+
+async function renderBuildRef() {
+    const sel = $id('build_ref');
+    const info = $id('build_refinfo');
+    if (!sel || !info) return;
+    const av = sel.value;
+    if (!av) { info.innerHTML = '<p class="bt-note">참고 봇 없이 기본 형식(성격·말투·관계·행동 위주의 깔끔한 구역 나누기)으로 써요.</p>'; return; }
+    info.innerHTML = `<p class="bt-note">${ico('spinner')} 불러오는 중…</p>`;
+    const ref = await fullCharacter(av);
+    if (sel.value !== av) return;
+    const desc = String(ref?.description ?? ref?.data?.description ?? '');
+    if (!desc.trim()) { info.innerHTML = `<p class="bt-apply-warn">${ico('triangle-exclamation')} 이 봇은 Description이 비어 있어요. 다른 봇을 골라 주세요.</p>`; return; }
+    const tok = await countTokens(desc).catch(() => 0);
+    const f = describeFormat(desc);
+    info.innerHTML = `
+        <div class="bt-build-reftags"><span class="bt-tag">${tok ? `${tok.toLocaleString()} 토큰` : `${desc.length.toLocaleString()}자`}</span><span class="bt-tag">${f.lang}</span>${f.tags.map(x => `<span class="bt-tag">${escapeHtml(x)}</span>`).join('')}</div>
+        <details class="bt-disclosure bt-disclosure-sm"><summary><span>참고 봇 Description 보기</span>${ico('chevron-down')}</summary><pre class="bt-paste">${escapeHtml(truncate(desc, 4000))}</pre></details>`;
+}
+
+function fillBuildRefOptions() {
+    const sel = $id('build_ref');
+    if (!sel) return;
+    const s = getSettings();
+    const char = getCurrentCharacter();
+    const q = ($id('build_filter')?.value || '').trim().toLowerCase();
+    const list = (ctx().characters || []).filter(x => x && x.avatar && x.avatar !== char?.avatar)
+        .filter(x => !q || String(x.name || '').toLowerCase().includes(q))
+        .sort((a, b) => String(a.name).localeCompare(String(b.name), 'ko'));
+    const keep = sel.value || s.buildRef || '';
+    sel.innerHTML = `<option value="">(참고 봇 없이 기본 형식)</option>${list.map(x => `<option value="${escapeHtml(x.avatar)}">${escapeHtml(x.name)}</option>`).join('')}`;
+    if (list.some(x => x.avatar === keep)) sel.value = keep;
+    else if (q && list.length) sel.value = list[0].avatar;
+}
+
+async function fillBuildUI() {
+    if (!$id('build_ref')) return;
+    const s = getSettings();
+    const char = getCurrentCharacter();
+    fillBuildRefOptions();
+    $id('build_lang').value = BUILD_LANGS[s.buildLang] ? s.buildLang : 'ref';
+    $id('build_len').value = BUILD_LENS[s.buildLen] ? s.buildLen : 'ref';
+    // which material exists for this character
+    const cd = char ? await loadCharData(char) : emptyCharData();
+    const cur = char ? (cardFieldsNow(char)?.description || '') : '';
+    const has = {
+        ref: String(cd.refText || '').trim().length,
+        memo: String(cd.authorNote || '').trim().length,
+        caeh: [cd.caehBase, cd.caehCaution, cd.anchorText].map(x => String(x || '').trim()).join('').length,
+        voice: cd.voiceProfile ? 1 : 0,
+        cur: cur.trim().length,
+    };
+    document.querySelectorAll('#bt_build_sources input').forEach(cb => {
+        const n = has[cb.value] || 0;
+        cb.disabled = !n;
+        cb.checked = !!n;
+        cb.closest('label').classList.toggle('disabled', !n);
+        const small = document.querySelector(`#bt_build_sources .bt-build-src-n[data-k="${cb.value}"]`);
+        if (small) small.textContent = !n ? '· 없음' : cb.value === 'voice' ? '' : `· ${n.toLocaleString()}자`;
+    });
+    renderBuildRef();
+    if (buildResult && buildResult.avatar !== char?.avatar) { buildResult = null; }
+    renderBuildResult();
+}
+
+function renderBuildResult() {
+    const el = $id('build_result');
+    if (!el) return;
+    const r = buildResult;
+    if (!r) { el.innerHTML = ''; return; }
+    el.innerHTML = `
+      <section class="bt-card bt-build-out">
+        <div class="bt-diet-head"><h4>${ico('pen-nib')} 새 Description</h4><span class="bt-diet-tok">${r.before ? `${r.before.toLocaleString()} → ` : ''}<b>${r.after.toLocaleString()}</b> 토큰${r.refTok ? ` <small>(참고 봇 ${r.refTok.toLocaleString()})</small>` : ''}</span></div>
+        <p class="bt-note">${r.refName ? `<b>${escapeHtml(r.refName)}</b> 형식으로 썼어요.` : '기본 형식으로 썼어요.'}</p>
+        ${r.format.length ? `<div class="bt-restyle-changes"><span>따라 한 형식</span>${renderList(r.format)}</div>` : ''}
+        ${r.guessed.length ? `<div class="bt-build-flag warn"><b>${ico('circle-exclamation')} 자료에 없어서 AI가 아는 대로 채운 것</b>${renderList(r.guessed)}<small>원작과 맞는지 꼭 확인해 주세요.</small></div>` : ''}
+        ${r.missing.length ? `<div class="bt-build-flag"><b>${ico('circle-info')} 자료가 부족해서 비워 둔 것</b>${renderList(r.missing)}</div>` : ''}
+        <pre class="bt-paste bt-diet-out">${escapeHtml(r.text)}</pre>
+        <div class="bt-actions bt-actions-end">
+          <button type="button" class="bt-btn bt-btn-sm" id="bt_build_copy">${ico('copy')}<span>복사</span></button>
+          <button type="button" class="bt-btn bt-btn-sm" id="bt_build_again">${ico('rotate-right')}<span>다시 만들기</span></button>
+          <button type="button" class="bt-btn bt-btn-sm bt-btn-primary" id="bt_build_apply">${ico('file-import')}<span>Description에 넣기</span></button>
+        </div>
+        <p class="bt-note">넣은 뒤 <b>테스트</b>를 한 번 돌려서 말투·성격이 원하는 대로 나오는지 확인해 보세요.</p>
+      </section>`;
+    $id('build_copy').addEventListener('click', () => copyText(r.text));
+    $id('build_again').addEventListener('click', runBuild);
+    $id('build_apply').addEventListener('click', async () => {
+        const ok = await applyReplace({ kind: 'field', field: 'description', label: 'Description' }, r.text, { tag: '새로 쓴', noun: '새 Description', note: r.refName ? `참고 봇: ${r.refName} (형식만)` : '' });
+        if (ok) {
+            const b = $id('build_apply');
+            if (b) { b.classList.add('disabled'); b.querySelector('span').textContent = '넣었어요'; }
+            fillBuildUI();
+            runDoctorLocal(true);
+        }
+    });
+}
+
+async function runBuild() {
+    if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
+    const char = getCurrentCharacter();
+    if (!char) { toastr.error('1:1 캐릭터 채팅을 열어주세요'); return; }
+    await saveSourceFromUI(false);
+    const s = getSettings();
+    const cd = await loadCharData(char);
+    const picked = [...document.querySelectorAll('#bt_build_sources input:checked')].map(x => x.value);
+    const blocks = [];
+    if (picked.includes('ref') && String(cd.refText || '').trim()) blocks.push(`[Reference material about ${char.name} — main content source]\n${truncate(cd.refText, Number(s.refMaxChars) || 15000)}`);
+    if (picked.includes('memo') && String(cd.authorNote || '').trim()) blocks.push(`[Creator's note — deliberate AU / setting changes; these override canon]\n${cd.authorNote}`);
+    if (picked.includes('voice') && cd.voiceProfile) blocks.push(`[Speech & personality profile made earlier]\n${truncate(JSON.stringify(cd.voiceProfile), 5000)}`);
+    const cur = cardFieldsNow(char)?.description || '';
+    if (picked.includes('cur') && cur.trim()) blocks.push(`[Current Description of this card — keep any good, specific details from it]\n${truncate(cur, 6000)}`);
+    if (!blocks.length && !(picked.includes('caeh') && caehGuide(cd))) { toastr.warning('넣을 자료가 없어요. 원작 탭에서 위키 링크를 불러오거나 원작 자료를 붙여넣어 주세요.'); return; }
+    const refAv = $id('build_ref').value;
+    const lang = $id('build_lang').value;
+    const len = $id('build_len').value;
+    const req = $id('build_req').value.trim();
+    s.buildRef = refAv; s.buildLang = lang; s.buildLen = len;
+    saveSettings();
+
+    running = true;
+    stopRequested = false;
+    updateRunState();
+    try {
+        let refDesc = ''; let refName = ''; let refTok = 0;
+        if (refAv) {
+            const ref = await fullCharacter(refAv);
+            refDesc = String(ref?.description ?? ref?.data?.description ?? '');
+            refName = String(ref?.name || '');
+            if (!refDesc.trim()) throw new Error('참고 봇의 Description이 비어 있어요');
+            refTok = await countTokens(refDesc).catch(() => 0);
+        }
+        const fmt = refDesc ? describeFormat(refDesc) : null;
+        const refLang = fmt ? { 한국어: 'Korean', 일본어: 'Japanese', 영어: 'English' }[fmt.lang] : 'Korean';
+        const outLang = lang === 'ko' ? 'Korean' : lang === 'en' ? 'English' : refLang;
+        const origin = sourceOrigin(cd);
+        const nounRule = {
+            ja: 'Proper nouns (people, places, schools, teams, techniques) are written in Korean; at the FIRST mention add the Japanese original in parentheses, e.g. 무라사키바라 아츠시(紫原敦).',
+            en: 'Proper nouns are written in Korean; at the FIRST mention add the English original in parentheses, e.g. 해리 포터(Harry Potter).',
+            ko: 'Proper nouns in Korean.',
+        }[origin] || 'Proper nouns in Korean; for a Japanese or English-language work add the original in parentheses at the first mention.';
+        const lenRule = refTok
+            ? { ref: `Aim for about ${refTok} tokens, like the reference.`, short: `Aim for about ${Math.round(refTok * 0.6)} tokens.`, long: `Aim for about ${Math.round(refTok * 1.5)} tokens.` }[len]
+            : { ref: 'Aim for 700-1200 tokens.', short: 'Aim for 400-700 tokens.', long: 'Aim for 1200-2000 tokens.' }[len];
+        const system = withCustom([
+            'You write the Description field of a SillyTavern character card for a fan-made roleplay bot (2차 창작) about an existing character.',
+            refDesc
+                ? 'FORMAT: copy the FORMAT of the reference description exactly — section order and headings, markup style (brackets, W++, markdown, tags, bullets vs prose), how traits, speech, relationships and behavior are written, sentence length and density, and how {{char}}/{{user}} are used. NEVER copy its content: no names, traits, lines, settings or relationships from the reference character. If a section does not apply to this character, drop it; if the material has something important the format has no place for, put it in the closest section in the same style.'
+                : 'FORMAT: clean sections for identity/appearance, personality (as behavior), speech style (first person, how they address others, endings, verbal tics, with short example phrases), relationships, habits and scene cues. Prose or short bullets, no decoration.',
+            'CONTENT: only from the material provided. Priority: the creator\'s intended characterization > creator\'s note (AU) > reference material (canon) > current description > your own knowledge of the canon. Use your own knowledge only when you are confident, and list everything you added that way in <guessed>.',
+            'Write things the model can PLAY: how each trait shows up in a scene (a gesture, a line, a trigger), how the character talks with a few short example phrases, how they treat {{user}} by default. Prefer specific behavior over adjectives. Never decide {{user}}\'s actions, words or feelings.',
+            FUN_PRINCIPLES,
+            caehGuide(cd),
+            botTypeGuide(cd),
+            NO_SHIP_RULE,
+            `LANGUAGE: write the description in ${outLang}. ${nounRule}${s.pasteKeepLines !== false ? ' Example phrases inside quotes stay in the language the character speaks in the chat, so the voice and dialect survive.' : ''} Keep macros exactly: {{char}}, {{user}}.`,
+            `LENGTH: ${lenRule}`,
+            'Output format (no markdown fences, Korean in the notes):',
+            '<format>', '- 3-6 lines: which format elements you copied from the reference (in Korean)', '</format>',
+            '<guessed>', '- one line per fact you added from your own knowledge, not from the material (in Korean); leave empty if none', '</guessed>',
+            '<missing>', '- one line per section of the format you could not fill because the material lacked it (in Korean); leave empty if none', '</missing>',
+            '<description>', 'the full Description text', '</description>',
+        ].filter(Boolean).join('\n'), 'diet');
+        const prompt = [
+            refDesc ? `[Reference bot description — FORMAT ONLY, do not use its content]\n${truncate(refDesc, 9000)}` : '',
+            `[Character to write: ${char.name}]`,
+            ...blocks,
+            req ? `[Creator's extra request — follow it]\n${req}` : '',
+            'Now write the output.',
+        ].filter(Boolean).join('\n\n');
+        const maxTokens = Math.max(6000, Math.round((refTok || 1200) * (len === 'long' ? 3.5 : 2.5)) + 2500);
+        const raw = await requestTagged({ system, prompt, maxTokens, lastTag: 'description', label: '✍️ Description 쓰는 중…' });
+        const text = pickTag(raw, 'description');
+        if (!text) throw new Error('Description 결과가 비어 있어요');
+        buildResult = {
+            avatar: char.avatar, text, refName, refTok,
+            format: tagLines(raw, 'format'), guessed: tagLines(raw, 'guessed'), missing: tagLines(raw, 'missing'),
+            before: cur.trim() ? await countTokens(cur).catch(() => 0) : 0, after: await countTokens(text).catch(() => 0),
+        };
+        renderBuildResult();
+        setStatus('✅ Description을 만들었어요 — 확인 후 넣어 주세요');
+        toastr.success('Description을 만들었어요. 확인한 뒤 넣어 주세요.');
+        setMinimized(false);
+        scrollPanelTo($id('build_result'));
+    } catch (e) {
+        console.error(LOG, e);
+        setStatus(`❌ 봇 만들기 실패: ${e.message}`);
+        toastr.error(`봇 만들기 실패: ${e.message}`);
+    } finally {
+        running = false;
+        updateRunState();
+    }
+}
+
+function bindBuildUI() {
+    $id('build_run')?.addEventListener('click', runBuild);
+    $id('build_ref')?.addEventListener('change', () => { getSettings().buildRef = $id('build_ref').value; saveSettings(); renderBuildRef(); });
+    $id('build_filter')?.addEventListener('input', () => { const before = $id('build_ref').value; fillBuildRefOptions(); if ($id('build_ref').value !== before) renderBuildRef(); });
+    for (const id of ['build_lang', 'build_len']) $id(id)?.addEventListener('change', () => { const s = getSettings(); s.buildLang = $id('build_lang').value; s.buildLen = $id('build_len').value; saveSettings(); });
+}
+
+// ---------------------------------------------------------------------------
 // v3.4 first-time friendly UI (layout only — no feature changes)
 //  - 시작 가이드: 3-step checklist with jump buttons, reopened with the ? button
 //  - advanced cards fold to one line that says what state they are in
@@ -4762,8 +5027,14 @@ async function renderGuide() {
     const hasRef = !!(cd && (String(cd.refText || '').trim() || (cd.urls || []).length));
     const hasRun = !!(cd && ((cd.runs || []).length || (cd.history || []).length));
     const hasResult = !!(cd && (cd.history || []).length);
+    const emptyDesc = !!char && !String(cardFieldsNow(char)?.description || '').trim();
     const steps = [
-        [hasRef, '원작 자료 넣기', '위키 링크를 넣고 <b>링크 불러오기</b>. 자료가 없어도 테스트는 되지만, 있어야 원작과 비교해요.', hasRef ? '' : `<button type="button" class="bt-btn bt-btn-sm" data-bt-go="el:bt_urls">${ico('arrow-down')}<span>링크 넣는 곳으로</span></button>`],
+        [hasRef && !emptyDesc, hasRef && emptyDesc ? 'Description 만들기' : '원작 자료 넣기',
+            hasRef && emptyDesc
+                ? '자료는 있는데 카드의 Description이 비어 있어요. <b>봇 만들기</b>에서 마음에 드는 봇을 골라 그 형식으로 써 넣을 수 있어요.'
+                : '위키 링크를 넣고 <b>링크 불러오기</b>. 자료가 없어도 테스트는 되지만, 있어야 원작과 비교해요. 새 봇이면 자료를 넣은 뒤 <b>봇 만들기</b>로 Description부터 써요.',
+            hasRef && emptyDesc ? `<button type="button" class="bt-btn bt-btn-sm bt-btn-primary" data-bt-go="el:bt_build_run">${ico('pen-nib')}<span>봇 만들기로</span></button>`
+                : hasRef ? '' : `<button type="button" class="bt-btn bt-btn-sm" data-bt-go="el:bt_urls">${ico('arrow-down')}<span>링크 넣는 곳으로</span></button>`],
         [hasRun, '테스트 돌리기', 'AI가 유저 역할로 몇 턴 대화하고, 끝나면 자동으로 평가해요. 기존 채팅은 건드리지 않아요.', `<button type="button" class="bt-btn bt-btn-sm ${hasRef && !hasRun ? 'bt-btn-primary' : ''}" data-bt-go="tab:test">${ico('flask')}<span>테스트 탭으로</span></button>`],
         [false, '결과 보고 하나씩 고치기', '고칠 점 옆 📥를 누르면 카드의 알맞은 자리에 넣고, 다시 테스트해서 <b>좋아졌을 때만</b> 남겨요.', `<button type="button" class="bt-btn bt-btn-sm ${hasResult ? 'bt-btn-primary' : ''}" data-bt-go="tab:result">${ico('chart-simple')}<span>결과 탭으로</span></button>`],
     ];
@@ -4803,6 +5074,11 @@ const COLLAPSIBLES = [
     ['bt_caeh_card', 'caeh', (cd) => {
         const parts = [String(cd.caehBase || '').trim() && '원하는 캐해', String(cd.caehCaution || '').trim() && '주의사항', String(cd.anchorText || '').trim() && '이어가는 채팅'].filter(Boolean);
         return parts.length ? { text: `${parts.join(' · ')} 적어 둠`, tone: 'ok' } : { text: '비어 있음 · 선택' };
+    }],
+    ['bt_build_card', 'build', () => {
+        const ch = getCurrentCharacter();
+        const d = ch ? (cardFieldsNow(ch)?.description || '') : '';
+        return d.trim() ? { text: '자료로 Description 다시 쓰기' } : { text: 'Description이 비어 있어요', tone: 'warn', open: true };
     }],
     ['bt_legacy_card', 'legacy', () => (legacyMeta()?.on ? { text: '이 채팅: 예전 캐해 들어감', tone: 'warn' } : { text: '이 채팅은 지금 카드로' })],
     ['bt_ab_card', 'ab', (cd) => ((cd.runs || []).some(r => r.id === cd.abBaselineId) ? { text: '기준(A) 있음', tone: 'ok' } : { text: '테스트하면 자동으로 A가 돼요' })],
@@ -5769,7 +6045,8 @@ async function splitToLore({ text, label, level, keepExamples, protectFun = true
 
 // --- replace-apply with backup ---
 
-async function applyReplace(item, newText, { tag = '요약', note = '' } = {}) {
+async function applyReplace(item, newText, { tag = '요약', note = '', noun = '' } = {}) {
+    const nounText = noun || `${tag}본`;
     const char = getCurrentCharacter();
     if (!char) return;
     const c = ctx();
@@ -5780,7 +6057,7 @@ async function applyReplace(item, newText, { tag = '요약', note = '' } = {}) {
         wrap.className = 'bt-apply-dialog';
         wrap.innerHTML = `
             <h3>${escapeHtml(item.label)} 바꾸기</h3>
-            <p class="bt-apply-note">지금 내용을 아래 <b>${escapeHtml(tag)}본</b>으로 <b>바꿔요</b>. 필요하면 직접 고친 뒤 <b>적용</b>을 누르세요. 원래 내용은 백업돼서 <b>진단 → 적용 기록</b>에서 되돌릴 수 있어요.</p>
+            <p class="bt-apply-note">지금 내용을 아래 <b>${escapeHtml(nounText)}</b>(으)로 <b>바꿔요</b>. 필요하면 직접 고친 뒤 <b>적용</b>을 누르세요. 원래 내용은 백업돼서 <b>진단 → 적용 기록</b>에서 되돌릴 수 있어요.</p>
             ${note ? `<p class="bt-apply-reason">${escapeHtml(note)}</p>` : ''}
             <label>새 내용 <textarea class="bt-apply-text" rows="16"></textarea></label>`;
         wrap.querySelector('textarea').value = newText;
@@ -5803,8 +6080,9 @@ async function applyReplace(item, newText, { tag = '요약', note = '' } = {}) {
             if (before === null) throw new Error(editorProblem());
             writeField(item.field, text);
             await logApply(char, { kind: 'field', field: item.field, label: `${item.label} (${tag})`, before, after: text });
+            await flushCardSaves();
         }
-        toastr.success(`${item.label}을(를) ${tag}본으로 바꿨어요 (원본 백업됨)`);
+        toastr.success(`${item.label}을(를) ${nounText}(으)로 바꿨어요 (원본 백업됨)`);
         return true;
     } catch (e) {
         toastr.error(`적용 실패: ${e.message}`);
