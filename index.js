@@ -77,6 +77,7 @@ const defaultSettings = Object.freeze({
     verifyRuns: 2,           // B tests per verification
     verifyRule: 'strict',    // strict = keep only clear improvements | lenient = revert only clear regressions
     settingsRev: 0,
+    evalMode: 'criteria',    // criteria = grade against the per-character checklist | classic = felt 0-100 scores
 });
 
 /** One-time changes to saved settings when a version changes a default for safety. */
@@ -1355,7 +1356,7 @@ async function runTest(turnsOverride, opts = {}) {
             if (entry) {
                 const cd2 = await loadCharData(char);
                 const r = (cd2.runs || []).find(x => x.id === run.id);
-                run.eval = { overall: entry.result.overall, fun: entry.result.fun, categories: entry.result.categories || [], summary: entry.result.summary || '' };
+                run.eval = { overall: entry.result.overall, fun: entry.result.fun, categories: entry.result.categories || [], summary: entry.result.summary || '', ...(entry.result.criteria ? { crit: critVerdictMap(entry.result), sheet: entry.result.sheet } : {}) };
                 if (r) {
                     r.eval = run.eval;
                     await saveCharData(char, cd2);
@@ -1608,7 +1609,18 @@ async function runEvaluation({ useChat = true, messages = 0 } = {}) {
     try {
         let result;
         try {
-            result = await requestJsonComplete({ system: withCustom(system, 'eval'), prompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: '🔎 원작과 비교 평가 중…' });
+            if (s.evalMode !== 'classic') {
+                if (!critItems(charData).some(x => x.src === 'canon' || x.src === 'custom')) {
+                    await generateCriteria(char, charData, { silent: true }); // fills charData.criteria
+                    toastr.info('평가 기준표를 처음 만들었어요. 원작 탭 → 평가 기준표에서 확인하고 고칠 수 있어요.', '봇 테스터', { timeOut: 9000 });
+                }
+                const items = critItems(charData);
+                const sheetPrompt = prompt.replace('Now output the JSON evaluation.', `[CRITERIA SHEET — grade every item, nothing else]\n${criteriaPromptBlock(items)}\n\nNow output the JSON.`);
+                const raw = await requestJsonComplete({ system: withCustom(criteriaEvalSystem(charData, { useChat, loreRef }), 'eval'), prompt: sheetPrompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: '📋 기준표로 채점 중…' });
+                result = criteriaToResult(items, raw);
+            } else {
+                result = await requestJsonComplete({ system: withCustom(system, 'eval'), prompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: '🔎 원작과 비교 평가 중…' });
+            }
         } catch (e) {
             if (!e.raw) throw e;
             renderRawResult(e.raw);
@@ -1633,8 +1645,14 @@ async function runEvaluation({ useChat = true, messages = 0 } = {}) {
         renderHistory(charData.history);
         switchTab('result');
         setMinimized(false);
-        setStatus(`✅ 평가 완료: 원작 일치도 ${result.overall}%`);
-        toastr.success(`원작 일치도 ${result.overall}%`);
+        if (result.criteria) {
+            const n = (v) => result.criteria.filter(x => x.verdict === v).length;
+            setStatus(`✅ 평가 완료: 기준 점수 ${result.overall}% · 통과 ${n('pass')} · 부분 ${n('partial')} · 실패 ${n('fail')}`);
+            toastr.success(`기준 점수 ${result.overall}% · 실패 ${n('fail')}개`);
+        } else {
+            setStatus(`✅ 평가 완료: 원작 일치도 ${result.overall}%`);
+            toastr.success(`원작 일치도 ${result.overall}%`);
+        }
         return entry;
     } catch (e) {
         console.error(LOG, e);
@@ -1672,8 +1690,15 @@ function toggle(id, title, desc = '') {
         <span class="bt-switch-text"><span>${title}</span>${desc ? `<small>${desc}</small>` : ''}</span></label>`;
 }
 
+/**
+ * Small label above a card title. Only labels that add information are shown (steps, optional);
+ * English labels that merely repeated the title are dropped so each card reads title-first.
+ */
+const EYEBROW_KO = { 'Step 1': '1단계', 'Step 2': '2단계', 'Optional': '선택', 'Fix first': '먼저 고칠 것', 'Format error': '형식 오류' };
+
 function cardHead(eyebrow, title, desc = '') {
-    return `<header class="bt-card-head">${eyebrow ? `<span class="bt-eyebrow">${eyebrow}</span>` : ''}<h3>${title}</h3>${desc ? `<p class="bt-desc">${desc}</p>` : ''}</header>`;
+    const eb = EYEBROW_KO[eyebrow] ?? (/[가-힣]/.test(String(eyebrow || '')) ? eyebrow : '');
+    return `<header class="bt-card-head">${eb ? `<span class="bt-eyebrow">${eb}</span>` : ''}<h3>${title}</h3>${desc ? `<p class="bt-desc">${desc}</p>` : ''}</header>`;
 }
 
 /** Escapes and splits long AI text into readable paragraphs (2 sentences each). */
@@ -1823,6 +1848,7 @@ ${botKindCardHtml()}
         </div>
         <p class="bt-note"><b>작가 노트에 넣기</b>: 지금 열린 채팅의 Author's Note(채팅마다 따로 저장)에만 들어가요. 카드를 새 성격으로 고쳐도 이 채팅은 예전 말투·거리감으로 이어지고, 새 채팅은 고친 카드대로 시작해요.</p>
       </section>
+${criteriaCardHtml()}
 ${buildCardHtml()}
 ${legacyCardHtml()}
     </div>
@@ -1930,6 +1956,10 @@ ${doctorPageHtml()}
           ${field('응답 언어', '<input id="bt_language" class="bt-input" type="text">')}
           ${field('최근 메시지 수', '<input id="bt_evalmsgs" class="bt-input bt-num" type="number" min="2" max="200">', '평가에 넣을 분량')}
         </div>
+        ${field('평가 방식', `<select id="bt_evalmode" class="bt-input">
+            <option value="criteria">평가 기준표로 채점 (추천 · 통과/부분/실패)</option>
+            <option value="classic">예전 방식 (0~100점 느낌으로)</option>
+          </select>`, '기준표는 원작 탭에서 고쳐요')}
         ${field('고칠 문장 언어', `<select id="bt_pastelang" class="bt-input">
             <option value="card">카드와 같은 언어 (추천)</option>
             <option value="ko">한국어</option>
@@ -2145,6 +2175,9 @@ function bindPanel() {
     const vn = $id('verifyruns');
     vn.value = s.verifyRuns;
     vn.addEventListener('change', () => { s.verifyRuns = Math.max(1, Math.min(4, Number(vn.value) || 2)); vn.value = s.verifyRuns; saveSettings(); });
+    const em = $id('evalmode');
+    em.value = s.evalMode === 'classic' ? 'classic' : 'criteria';
+    em.addEventListener('change', () => { s.evalMode = em.value; saveSettings(); refreshCollapsibles(); });
     const pl = $id('pastelang');
     pl.value = ['en', 'card', 'ko'].includes(s.pasteLang) ? s.pasteLang : 'card';
     pl.addEventListener('change', () => { s.pasteLang = pl.value; saveSettings(); });
@@ -2176,6 +2209,7 @@ function bindPanel() {
     $id('savesrc').addEventListener('click', () => saveSourceFromUI(true));
     bindCaehUI();
     bindBuildUI();
+    bindCriteriaUI();
     bindLegacyUI();
     bindBotKindUI();
     bindVoiceMember();
@@ -2572,6 +2606,7 @@ async function refreshPanelForChar() {
     else $id('result').innerHTML = resultEmptyHtml();
     setStatus(char ? '' : '캐릭터와 1:1 채팅을 열면 사용할 수 있어요.');
     fillBuildUI();
+    renderCriteriaCard(data);
     renderActiveStrip();
 }
 
@@ -2686,25 +2721,28 @@ function renderResult(entry, prevEntry) {
             </dl>
         </article>`).join('');
 
-    const sugg = (r.card_suggestions || []).map((sg, i) => suggestionHtml(sg, i, 'bt-copy', 'bt-res-apply')).join('');
+    const crit = Array.isArray(r.criteria) && r.criteria.length;
+    const sugg = crit ? '' : (r.card_suggestions || []).map((sg, i) => suggestionHtml(sg, i, 'bt-copy', 'bt-res-apply')).join('');
     const when = new Date(entry.time).toLocaleString();
+    const capA = crit ? '기준 점수' : '원작 일치도';
+    const capB = crit ? '재미 기준' : '재미·몰입';
 
     $id('result').innerHTML = `
         ${hasFun ? `<section class="bt-card bt-hero bt-hero-dual">
             <div class="bt-hero-pair">
-                <div class="bt-hero-cell">${ringHtml(overall, 'md')}<span class="bt-hero-caption">원작 일치도 ${deltaHtml(overall, prevOverall)}</span></div>
-                <div class="bt-hero-cell">${ringHtml(fun, 'md')}<span class="bt-hero-caption">재미·몰입 ${deltaHtml(fun, prevEntry?.result?.fun)}</span></div>
+                <div class="bt-hero-cell">${ringHtml(overall, 'md')}<span class="bt-hero-caption">${capA} ${deltaHtml(overall, prevOverall)}</span></div>
+                <div class="bt-hero-cell">${ringHtml(fun, 'md')}<span class="bt-hero-caption">${capB} ${deltaHtml(fun, prevEntry?.result?.fun)}</span></div>
             </div>
             <div class="bt-hero-meta bt-hero-meta-center">
-                <span class="bt-eyebrow">${entry.mode === 'card' ? 'Card review' : 'Chat review'}</span>
+                <span class="bt-eyebrow">${entry.mode === 'card' ? '카드만 평가' : '대화 평가'}</span>
                 <h3>평가 결과</h3>
                 <div class="bt-hero-sub"><span>${escapeHtml(when)}</span></div>
             </div>
         </section>` : `<section class="bt-card bt-hero">
             ${ringHtml(overall)}
             <div class="bt-hero-meta">
-                <span class="bt-eyebrow">${entry.mode === 'card' ? 'Card review' : 'Chat review'}</span>
-                <h3>원작 일치도</h3>
+                <span class="bt-eyebrow">${entry.mode === 'card' ? '카드만 평가' : '대화 평가'}</span>
+                <h3>${capA}</h3>
                 <div class="bt-hero-sub">${deltaHtml(overall, prevOverall)}<span>${escapeHtml(when)}</span></div>
             </div>
         </section>`}
@@ -2714,15 +2752,17 @@ function renderResult(entry, prevEntry) {
             ${entry.nsfwConfidence ? `<div class="bt-nsfw-conf bt-conf-row-${escapeHtml(entry.nsfwConfidence)}">${ico('gauge-high')}<span class="bt-nsfw-conf-label">신뢰도</span>${confTag(entry.nsfwConfidence)}${entry.nsfwConfidenceNote ? `<small>${escapeHtml(entry.nsfwConfidenceNote)}</small>` : ''}</div>` : ''}
             ${entry.nsfwRequest ? `<div class="bt-nsfw-eval-req">${ico('quote-left')}<div><span class="bt-sub-label">NSFW 요청사항</span><p>${escapeHtml(truncate(entry.nsfwRequest, 300))}</p></div></div>` : ''}
         </section>` : ''}
-        ${cats ? `<section class="bt-card">${cardHead('', '항목별 점수')}<div class="bt-meters">${cats}</div></section>` : ''}
+        ${crit ? criteriaResultHtml(entry, prevEntry) : ''}
+        ${cats ? `<section class="bt-card">${cardHead('', crit ? '묶음별 점수' : '항목별 점수')}<div class="bt-meters">${cats}</div></section>` : ''}
         ${r.per_character?.length ? `<section class="bt-card">${cardHead('', '캐릭터별')}<div class="bt-meters">${r.per_character.map(c => meterHtml(escapeHtml(c.name || ''), c.score ?? null, { sub: c.comment })).join('')}</div></section>` : ''}
         ${r.strengths?.length ? `<section class="bt-card">${cardHead('', '잘 된 점')}${renderList(r.strengths, 'bt-list-check')}</section>` : ''}
-        ${issues ? `<section class="bt-card">${cardHead('', '수정이 필요한 점')}<div class="bt-stack">${issues}</div></section>` : ''}
+        ${issues && !crit ? `<section class="bt-card">${cardHead('', '수정이 필요한 점')}<div class="bt-stack">${issues}</div></section>` : ''}
         ${sugg ? `<section class="bt-card">${cardHead('', '카드 수정 제안', '복사해서 캐릭터 카드에 붙여넣으세요.')}<div class="bt-stack">${sugg}</div></section>` : ''}
         ${r.missing_info?.length ? `<section class="bt-card">${cardHead('', '카드에 빠진 원작 정보')}${renderList(r.missing_info)}</section>` : ''}
         <div class="bt-actions bt-actions-end"><button type="button" id="bt_copyall" class="bt-btn">${ico('clipboard')}<span>결과 전체 복사</span></button></div>`;
 
     const el = $id('result');
+    if (crit) bindCriteriaResult(el, r);
     el.querySelectorAll('.bt-copy').forEach(btn => btn.addEventListener('click', () => {
         copyText((r.card_suggestions || [])[Number(btn.dataset.idx)]?.text || '');
     }));
@@ -2755,6 +2795,11 @@ function resultToMarkdown(entry) {
         lines.push('## NSFW 프로필 반영');
         if (entry.nsfwConfidence) lines.push(`- 신뢰도: ${CONF_LABEL[entry.nsfwConfidence] || entry.nsfwConfidence}${entry.nsfwConfidenceNote ? ` · ${entry.nsfwConfidenceNote}` : ''}`);
         if (entry.nsfwRequest) lines.push(`- 요청사항: ${entry.nsfwRequest}`);
+        lines.push('');
+    }
+    if (r.criteria?.length) {
+        lines.push('## 기준표 결과');
+        r.criteria.forEach(c => lines.push(`- [${CRIT_VERDICT[c.verdict]?.label || c.verdict}] ${c.text}${c.evidence ? `\n  - 근거: ${c.evidence}` : ''}${c.cause ? `\n  - 원인: ${c.cause}` : ''}${c.fix_paste ? `\n  - 고칠 문장 (${c.fix_where}): ${c.fix_paste}` : ''}`));
         lines.push('');
     }
     if (r.categories?.length) {
@@ -4458,7 +4503,7 @@ function renderDoctorCard(entry) {
         <section class="bt-card bt-hero">
             ${ringHtml(overall)}${dFun === null ? '' : ringHtml(dFun, 'md')}
             <div class="bt-hero-meta">
-                <span class="bt-eyebrow">AI diagnosis</span>
+                <span class="bt-eyebrow">AI 진단</span>
                 <h3>롤플 적합도${dFun === null ? '' : ' · 재미'}</h3>
                 <div class="bt-hero-sub"><span>${escapeHtml(new Date(entry.time).toLocaleString())}</span></div>
             </div>
@@ -4502,7 +4547,7 @@ function renderDoctorChat(entry) {
         <section class="bt-card bt-hero">
             ${ringHtml(overall)}${cFun === null ? '' : ringHtml(cFun, 'md')}
             <div class="bt-hero-meta">
-                <span class="bt-eyebrow">Roleplay review</span>
+                <span class="bt-eyebrow">롤플 점검</span>
                 <h3>롤플 품질${cFun === null ? '' : ' · 재미'}</h3>
                 <div class="bt-hero-sub"><span>${escapeHtml(new Date(entry.time).toLocaleString())}</span></div>
             </div>
@@ -4721,6 +4766,341 @@ async function logApply(char, item) {
         } catch (e) { if (e.message !== 'skip') console.warn(LOG, 'version record failed', e); }
     }
     return id;
+}
+
+// ---------------------------------------------------------------------------
+// v4.0 평가 기준표: every evaluation is scored against the SAME per-character checklist.
+// Each criterion gets pass / partial / fail with the bot's own line as evidence, and every
+// failure must name its cause in the card and a ready-to-paste fix. Scores are computed from
+// the verdicts (not a felt 0-100), so the same bot gets the same score far more reliably.
+// ---------------------------------------------------------------------------
+
+const CRIT_VERDICT = {
+    pass: { label: '통과', icon: 'circle-check', v: 1 },
+    partial: { label: '부분', icon: 'circle-half-stroke', v: 0.5 },
+    fail: { label: '실패', icon: 'circle-xmark', v: 0 },
+    na: { label: '확인 못 함', icon: 'circle-minus', v: null },
+};
+const CRIT_GROUPS_CANON = ['말투·어휘', '성격·가치관', '원작 설정·세계관', '인간관계'];
+const CRIT_FUN_GROUP = '재미·몰입';
+
+/** Rules every roleplay bot should meet, whatever the character. */
+function universalCriteria(kind) {
+    const base = [
+        ['u_user', '행동·반응 패턴', 3, '{{user}}의 말·행동·감정을 대신 쓰지 않음', 'Never writes {{user}}\'s words, actions, thoughts or feelings, and never decides for {{user}}.'],
+        ['u_inchar', '행동·반응 패턴', 3, '캐릭터에서 벗어난 설명·AI 같은 말투가 없음', 'Stays in character: no out-of-character commentary, no assistant-like politeness, no summaries of the scene for the reader.'],
+        ['u_react', '행동·반응 패턴', 2, '유저가 한 말·행동에 실제로 반응함', 'Each reply reacts to what {{user}} just said or did, instead of ignoring it or answering something else.'],
+        ['u_memory', '행동·반응 패턴', 2, '앞에서 나온 사실과 어긋나지 않음', 'Stays consistent with facts established earlier in the chat (places, names, what already happened).'],
+        ['u_show', CRIT_FUN_GROUP, 2, '감정을 설명하지 않고 행동·대사로 보여줌', 'Shows emotion through action, body language and dialogue instead of naming it ("he felt embarrassed").'],
+        ['u_hook', CRIT_FUN_GROUP, 2, '답장 끝에 유저가 반응할 거리를 남김', 'Ends replies with something {{user}} can react to (a line, an action, a question in character, a change in the scene), not a closed summary.'],
+        ['u_repeat', CRIT_FUN_GROUP, 2, '같은 표현·같은 문장 시작을 반복하지 않음', 'Does not repeat the same phrases, openers or sentence patterns across replies.'],
+        ['u_signature', CRIT_FUN_GROUP, 1, '이 캐릭터만의 버릇·개그·명대사가 나옴', 'The character\'s own habits, running gags or signature lines show up naturally.'],
+    ];
+    const extra = {
+        multi: [['k_distinct', '캐릭터 구분', 3, '등장인물마다 말투가 확실히 다르고 섞이지 않음', 'Every character keeps a distinct voice; the bot never blends them or mixes up who said what.']],
+        sim: [['k_state', '상태 추적', 3, '상태창 형식이 매번 같고 수치가 이유 없이 바뀌지 않음', 'The status window keeps the same format every reply and values only change for a reason shown in the story.']],
+        rpg: [['k_numbers', '수치 일관성', 3, 'HP·골드·아이템 수치가 맞고, 실패도 일어남', 'Numbers (HP, gold, items) are tracked correctly and actions can fail; not everything succeeds.']],
+    }[kind] || [];
+    return [...base, ...extra].map(([id, group, weight, text, check]) => ({ id, group, weight, text, check, src: 'play', on: true }));
+}
+
+function critItems(cd) {
+    return (cd?.criteria?.items || []).filter(x => x && x.on !== false && String(x.text || '').trim());
+}
+
+function critHash(items) {
+    return hashText(items.map(x => `${x.id}|${x.weight}|${x.text}|${x.check || ''}`).join('\n'));
+}
+
+/** Score 0-100 from verdicts; na is left out. Returns null when nothing was checkable. */
+function critScore(items, verdicts, filter = () => true) {
+    let w = 0; let got = 0;
+    for (const it of items.filter(filter)) {
+        const v = CRIT_VERDICT[verdicts[it.id]]?.v;
+        if (v === null || v === undefined) continue;
+        w += it.weight || 1; got += (it.weight || 1) * v;
+    }
+    return w ? Math.round(got / w * 100) : null;
+}
+
+async function generateCriteria(char, cd, { silent = false } = {}) {
+    const s = getSettings();
+    const loreRef = s.loreAsReference ? await loreReferenceText(char, 5000).catch(() => '') : '';
+    const kind = botKind(cd);
+    const system = withCustom([
+        'You write the EVALUATION CRITERIA for a fan-made roleplay bot of an existing character. A reviewer will later read a chat transcript and mark each criterion pass / partial / fail.',
+        'Write 6-12 criteria that are SPECIFIC to this character: each one must be something a generic bot would get wrong. Cover, in this order of importance: how they speak (first-person pronoun, how they address specific people, speech level toward seniors/juniors/{{user}}, sentence endings, dialect, verbal tics), personality as visible behavior (what they do when praised, angry, embarrassed, challenged), values and lines they would never cross, key relationships, and canon facts that come up in play.',
+        'Each criterion must be checkable from dialogue and actions in a transcript. No vague words like "in character", "natural", "faithful". Name the concrete behavior.',
+        'Priority of sources: the creator\'s intended characterization and cautions > creator\'s note (AU changes) > reference material (canon) > the current card. A criterion must never contradict the creator\'s direction.',
+        'Weight: 3 = breaks the character if wrong, 2 = clearly noticeable, 1 = nice detail.',
+        `Groups: one of ${JSON.stringify(CRIT_GROUPS_CANON)}.`,
+        NO_SHIP_RULE,
+        caehGuide(cd),
+        botTypeGuide(cd),
+        'Human-readable fields ("text", "pass_example", "fail_example") in natural Korean; example lines stay in the language the character speaks in the chat. "check" is one precise English sentence for the reviewer model.',
+        'JSON only: {"criteria": [{"group": "", "weight": 1|2|3, "text": "<짧은 한국어 기준>", "check": "<English>", "pass_example": "<짧은 예>", "fail_example": "<짧은 예>"}]}',
+    ].filter(Boolean).join('\n'), 'eval');
+    const prompt = [
+        String(cd.refText || '').trim() ? `[Reference material]\n${truncate(cd.refText, 12000)}` : '',
+        loreRef ? `[Linked lorebooks]\n${loreRef}` : '',
+        String(cd.authorNote || '').trim() ? `[Creator's note — intentional AU changes]\n${cd.authorNote}` : '',
+        `[Character card]\n${truncate(collectCard(char), 8000)}`,
+        'Now output the JSON.',
+    ].filter(Boolean).join('\n\n');
+    const data = await requestJson({ system, prompt, profileId: s.evalProfile, maxTokens: 6000, label: '📋 평가 기준표 만드는 중…' });
+    const made = (Array.isArray(data?.criteria) ? data.criteria : []).filter(c => c && String(c.text || '').trim()).slice(0, 14)
+        .map((c, i) => ({
+            id: `c${Date.now().toString(36)}${i}`, src: 'canon', on: true,
+            group: CRIT_GROUPS_CANON.includes(c.group) ? c.group : '성격·가치관',
+            weight: [1, 2, 3].includes(Number(c.weight)) ? Number(c.weight) : 2,
+            text: String(c.text).trim(), check: String(c.check || '').trim(),
+            pass_example: String(c.pass_example || '').trim(), fail_example: String(c.fail_example || '').trim(),
+        }));
+    if (!made.length) throw new Error('기준을 만들지 못했어요');
+    const keep = (cd.criteria?.items || []).filter(x => x.src === 'custom');
+    const uni = universalCriteria(kind).map(u => ({ ...u, ...(cd.criteria?.items || []).find(x => x.id === u.id && x.src === 'play') }));
+    cd.criteria = { items: [...made, ...uni, ...keep], time: Date.now(), kind };
+    await saveCharData(char, cd);
+    if (!silent) toastr.success(`평가 기준표를 만들었어요 (캐릭터 기준 ${made.length}개 + 공통 ${uni.length}개)`);
+    renderCriteriaCard(cd);
+    return cd;
+}
+
+// --- 원작 tab card ---
+
+function criteriaCardHtml() {
+    return `
+      <section class="bt-card" id="bt_crit_card">
+        ${cardHead('Criteria', '평가 기준표', '평가는 이 표로만 채점해요. 기준마다 <b>통과 · 부분 · 실패</b>를 매기고, 실패하면 원인과 고칠 문장을 꼭 줘요. 같은 표로 채점해서 점수가 덜 흔들려요.')}
+        <div id="bt_crit_list" class="bt-crit-list"></div>
+        <div class="bt-crit-add">
+          <select id="bt_crit_add_group" class="bt-input">${[...CRIT_GROUPS_CANON, '행동·반응 패턴', CRIT_FUN_GROUP].map(g => `<option>${g}</option>`).join('')}</select>
+          <input id="bt_crit_add_text" class="bt-input" type="text" placeholder="기준 직접 추가: 예) 화나면 말수가 줄고 존댓말이 더 딱딱해짐">
+          <button type="button" id="bt_crit_add" class="bt-btn">${ico('plus')}<span>추가</span></button>
+        </div>
+        <div class="bt-actions">
+          <button type="button" id="bt_crit_make" class="bt-btn bt-btn-primary bt-btn-wide">${ico('list-check')}<span>자료로 기준표 만들기</span></button>
+        </div>
+        <p class="bt-note">기준표가 없으면 처음 평가할 때 자동으로 만들어요. 기준을 바꾸면 그 뒤 평가부터 새 기준으로 채점해요(이전 결과와 점수 비교는 같은 기준끼리만 정확해요).</p>
+      </section>`;
+}
+
+async function renderCriteriaCard(cdIn) {
+    const el = $id('crit_list');
+    if (!el) return;
+    const char = getCurrentCharacter();
+    const cd = cdIn || (char ? await loadCharData(char) : emptyCharData());
+    const items = cd.criteria?.items || [];
+    $id('crit_make').querySelector('span').textContent = items.some(x => x.src === 'canon') ? '자료로 기준표 다시 만들기' : '자료로 기준표 만들기';
+    if (!items.length) { el.innerHTML = '<p class="bt-note">아직 기준표가 없어요. 원작 자료를 넣고 <b>자료로 기준표 만들기</b>를 누르거나, 그냥 평가하면 자동으로 만들어요.</p>'; return; }
+    const groups = [...new Set(items.map(x => x.group))];
+    el.innerHTML = groups.map(g => `
+        <div class="bt-crit-group"><h5>${escapeHtml(g)}</h5>
+        ${items.filter(x => x.group === g).map(x => `
+          <div class="bt-crit-item ${x.on === false ? 'off' : ''}" data-id="${escapeHtml(x.id)}">
+            <label class="bt-crit-on" title="이 기준으로 채점하기"><input type="checkbox" ${x.on === false ? '' : 'checked'}></label>
+            <div class="bt-crit-main">
+              <input class="bt-crit-text" type="text" value="${escapeHtml(x.text)}">
+              ${x.pass_example || x.fail_example ? `<small>${x.pass_example ? `${ico('check')} ${escapeHtml(x.pass_example)}` : ''}${x.fail_example ? ` &nbsp;${ico('xmark')} ${escapeHtml(x.fail_example)}` : ''}</small>` : ''}
+            </div>
+            <select class="bt-crit-weight" title="중요도">${[3, 2, 1].map(w => `<option value="${w}" ${Number(x.weight) === w ? 'selected' : ''}>${'★'.repeat(w)}</option>`).join('')}</select>
+            ${x.src === 'play' ? '<span class="bt-tag bt-crit-src">공통</span>' : `<button type="button" class="bt-iconbtn bt-crit-del" title="지우기">${ico('trash-can')}</button>`}
+          </div>`).join('')}
+        </div>`).join('');
+    const save = async (mut) => {
+        const ch = getCurrentCharacter();
+        if (!ch) return;
+        const d = await loadCharData(ch);
+        mut(d.criteria.items);
+        await saveCharData(ch, d);
+        refreshCollapsibles();
+    };
+    el.querySelectorAll('.bt-crit-item').forEach(row => {
+        const id = row.dataset.id;
+        row.querySelector('.bt-crit-on input').addEventListener('change', (e) => { row.classList.toggle('off', !e.target.checked); save(list => { const it = list.find(x => x.id === id); if (it) it.on = e.target.checked; }); });
+        row.querySelector('.bt-crit-text').addEventListener('change', (e) => save(list => {
+            const it = list.find(x => x.id === id);
+            if (it && it.text !== e.target.value.trim()) { it.text = e.target.value.trim(); it.check = ''; }
+        }));
+        row.querySelector('.bt-crit-weight').addEventListener('change', (e) => save(list => { const it = list.find(x => x.id === id); if (it) it.weight = Number(e.target.value); }));
+        row.querySelector('.bt-crit-del')?.addEventListener('click', () => save(list => { const i = list.findIndex(x => x.id === id); if (i >= 0) list.splice(i, 1); }).then(() => renderCriteriaCard()));
+    });
+}
+
+function bindCriteriaUI() {
+    $id('crit_make')?.addEventListener('click', async () => {
+        if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
+        const char = getCurrentCharacter();
+        if (!char) { toastr.error('캐릭터 채팅을 먼저 열어주세요'); return; }
+        await saveSourceFromUI(false);
+        const cd = await loadCharData(char);
+        if (cd.criteria?.items?.some(x => x.src === 'canon') && ctx().callGenericPopup) {
+            const c = ctx();
+            const r = await c.callGenericPopup('지금 캐릭터 기준을 지우고 자료로 새로 만들까요? 직접 추가한 기준과 공통 기준 설정은 그대로 둬요.', c.POPUP_TYPE.CONFIRM);
+            if (r !== c.POPUP_RESULT.AFFIRMATIVE && r !== true && r !== 1) return;
+        }
+        running = true; updateRunState();
+        try { await generateCriteria(char, cd); setStatus('✅ 평가 기준표를 만들었어요'); }
+        catch (e) { console.error(LOG, e); setStatus(`❌ 기준표 만들기 실패: ${e.message}`); toastr.error(`기준표 만들기 실패: ${e.message}`); }
+        finally { running = false; updateRunState(); }
+    });
+    $id('crit_add')?.addEventListener('click', async () => {
+        const text = $id('crit_add_text').value.trim();
+        const char = getCurrentCharacter();
+        if (!text || !char) return;
+        const cd = await loadCharData(char);
+        if (!cd.criteria) cd.criteria = { items: universalCriteria(botKind(cd)), time: Date.now() };
+        cd.criteria.items.push({ id: `x${Date.now().toString(36)}`, src: 'custom', on: true, group: $id('crit_add_group').value, weight: 2, text, check: '' });
+        await saveCharData(char, cd);
+        $id('crit_add_text').value = '';
+        renderCriteriaCard(cd);
+        refreshCollapsibles();
+    });
+    $id('crit_add_text')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $id('crit_add').click(); } });
+}
+
+// --- evaluation with the sheet ---
+
+function criteriaPromptBlock(items) {
+    return items.map(x => `- [${x.id}] (${x.group}, weight ${x.weight}) ${x.check || x.text}${x.check ? ` — 한국어: ${x.text}` : ''}${x.pass_example ? `\n    pass e.g.: ${x.pass_example}` : ''}${x.fail_example ? `\n    fail e.g.: ${x.fail_example}` : ''}`).join('\n');
+}
+
+/** Builds the system prompt for checklist grading. */
+function criteriaEvalSystem(charData, { useChat, loreRef }) {
+    return [
+        'You are a strict, decisive reviewer of a fan-made roleplay bot. You grade it against a fixed CRITERIA SHEET and tell the creator exactly what to change.',
+        useChat
+            ? 'Judge the BOT replies in the test chat (actual behavior). Use the card only to explain WHY something fails.'
+            : 'There is no chat: judge whether the CARD as written will make the bot meet each criterion. Quote the card.',
+        'For EVERY criterion give one verdict:',
+        '- "pass": met consistently.',
+        '- "partial": met only sometimes, or only weakly.',
+        '- "fail": at least one reply clearly breaks it, or the card contradicts it / gives the bot nothing to do it.',
+        '- "na": the chat never gave a chance to show it (use sparingly; never for speech criteria if the character spoke).',
+        'Evidence: quote the exact bot line (or card line) that decided the verdict, short. No evidence → you may not mark pass.',
+        'For every "fail" and "partial": "cause" = which part of the card causes it or what the card is missing (name the field), and a fix that removes that cause: "fix_where" (field) and "fix_paste" (ready-to-paste text that directly fixes it; follow PASTE TEXT LANGUAGE) and "fix_note" (one Korean line: what the fix does).',
+        'Be decisive. No hedging words (might, could, consider, 것 같다, 고려해 보세요). State the problem and the fix as facts and instructions.',
+        'Do not grade anything outside the sheet. Do not invent canon beyond the reference.',
+        'Deliberate AU changes in the creator\'s note and the creator\'s direction are correct by definition.',
+        loreRef ? 'The linked lorebook is part of the reference for this bot\'s world.' : '',
+        'top_fixes: the ids of the 1-3 failed/partial criteria whose fix would improve the bot most, most important first (weight and how often it breaks).',
+        funGuard(charData),
+        pasteLangRule(charData),
+        NO_SHIP_RULE,
+        'Human-readable strings in natural Korean. JSON rules: straight double quotes, escape " inside strings, no trailing commas. Output ONE JSON object:',
+        '{"summary": "<2-3 Korean sentences: the verdict in plain words>", "criteria": [{"id": "", "verdict": "pass"|"partial"|"fail"|"na", "evidence": "", "cause": "", "fix_where": "description|personality|scenario|first_mes|mes_example|system_prompt|post_history|char_note|lorebook", "fix_paste": "", "fix_note": ""}], "top_fixes": ["<id>"], "strengths": ["<what works, short>"], "missing_info": ["<important canon facts the card lacks>"]}',
+    ].filter(Boolean).join('\n');
+}
+
+/** Turns the checklist verdicts into the result shape the rest of the extension uses. */
+function criteriaToResult(items, data) {
+    const byId = Object.fromEntries((Array.isArray(data?.criteria) ? data.criteria : []).map(c => [String(c?.id || ''), c]));
+    const rows = items.map(it => {
+        const c = byId[it.id] || {};
+        const verdict = CRIT_VERDICT[c.verdict] ? c.verdict : 'na';
+        return { id: it.id, group: it.group, weight: it.weight || 1, text: it.text, verdict, evidence: String(c.evidence || ''), cause: String(c.cause || ''), fix_where: String(c.fix_where || ''), fix_paste: String(c.fix_paste || ''), fix_note: String(c.fix_note || '') };
+    });
+    const verdicts = Object.fromEntries(rows.map(r => [r.id, r.verdict]));
+    const groups = [...new Set(items.map(x => x.group))];
+    const categories = groups.map(g => {
+        const gr = rows.filter(r => r.group === g);
+        const n = (v) => gr.filter(r => r.verdict === v).length;
+        return { name: g, score: critScore(items, verdicts, x => x.group === g) ?? 0, comment: `통과 ${n('pass')} · 부분 ${n('partial')} · 실패 ${n('fail')}${n('na') ? ` · 확인 못 함 ${n('na')}` : ''}` };
+    }).filter(c => rows.some(r => r.group === c.name && r.verdict !== 'na'));
+    const overall = critScore(items, verdicts, x => x.group !== CRIT_FUN_GROUP) ?? 0;
+    const fun = critScore(items, verdicts, x => x.group === CRIT_FUN_GROUP);
+    const bad = rows.filter(r => r.verdict === 'fail' || r.verdict === 'partial');
+    const rank = (r) => (r.verdict === 'fail' ? 10 : 0) + r.weight * 2;
+    let top = (Array.isArray(data?.top_fixes) ? data.top_fixes : []).map(String).filter(id => bad.some(r => r.id === id));
+    for (const r of [...bad].sort((a, b) => rank(b) - rank(a))) if (top.length < 3 && !top.includes(r.id)) top.push(r.id);
+    top = top.slice(0, 3);
+    return {
+        overall, fun: fun ?? undefined, summary: String(data?.summary || ''),
+        categories, criteria: rows, top_fixes: top,
+        strengths: Array.isArray(data?.strengths) ? data.strengths.map(String) : [],
+        missing_info: Array.isArray(data?.missing_info) ? data.missing_info.map(String) : [],
+        issues: bad.map(r => ({ severity: r.verdict === 'fail' ? (r.weight >= 3 ? 'high' : 'medium') : 'low', category: r.group, problem: `${r.text}${r.cause ? ` — ${r.cause}` : ''}`, evidence: r.evidence, canon: '', fix: r.fix_note })),
+        card_suggestions: bad.filter(r => r.fix_paste).map(r => ({ field: r.fix_where || 'description', action: 'edit', text: r.fix_paste, reason: `${r.text}${r.fix_note ? ` — ${r.fix_note}` : ''}`, fun_impact: r.group === CRIT_FUN_GROUP ? '+' : '0', fun_note: '', continuity: 'safe', crit: r.id })),
+        sheet: critHash(items),
+    };
+}
+
+function critVerdictMap(result) {
+    return Object.fromEntries((result?.criteria || []).map(r => [r.id, r.verdict]));
+}
+
+/** Criteria whose verdict got better / worse between two results (same sheet only). */
+function critChanges(prevResult, result) {
+    if (!prevResult?.criteria || !result?.criteria || prevResult.sheet !== result.sheet) return null;
+    const before = critVerdictMap(prevResult);
+    const val = (v) => CRIT_VERDICT[v]?.v;
+    const up = []; const down = [];
+    for (const r of result.criteria) {
+        const a = val(before[r.id]); const b = val(r.verdict);
+        if (a === null || a === undefined || b === null || b === undefined || a === b) continue;
+        (b > a ? up : down).push({ text: r.text, from: before[r.id], to: r.verdict });
+    }
+    return { up, down };
+}
+
+function verdictTag(v) {
+    const d = CRIT_VERDICT[v] || CRIT_VERDICT.na;
+    return `<span class="bt-crit-verdict ${v}">${ico(d.icon)}${d.label}</span>`;
+}
+
+function criteriaResultHtml(entry, prevEntry) {
+    const r = entry.result;
+    const rows = r.criteria || [];
+    const byId = Object.fromEntries(rows.map(x => [x.id, x]));
+    const ch = critChanges(prevEntry?.result, r);
+    const fixCard = (x, i) => `
+        <article class="bt-crit-fix">
+          <div class="bt-crit-fix-head"><span class="bt-crit-rank">${i + 1}</span><b>${escapeHtml(x.text)}</b>${verdictTag(x.verdict)}</div>
+          ${x.evidence ? `<blockquote class="bt-quote">${escapeHtml(x.evidence)}</blockquote>` : ''}
+          ${x.cause ? `<p class="bt-crit-cause"><span>원인</span>${escapeHtml(x.cause)}</p>` : ''}
+          ${x.fix_note ? `<p class="bt-crit-cause"><span>고치기</span>${escapeHtml(x.fix_note)}</p>` : ''}
+          ${x.fix_paste ? `<div class="bt-paste-wrap"><pre class="bt-paste">${escapeHtml(x.fix_paste)}</pre><span class="bt-paste-actions">${copyBtn('bt-critcopy', x.id)}${applyBtn('bt-critapply', x.id)}</span></div>` : ''}
+        </article>`;
+    const groups = [...new Set(rows.map(x => x.group))];
+    const list = groups.map(g => `
+        <div class="bt-crit-group"><h5>${escapeHtml(g)}</h5>
+        ${rows.filter(x => x.group === g).map(x => `
+          <details class="bt-crit-row ${x.verdict}">
+            <summary>${verdictTag(x.verdict)}<span class="bt-crit-row-text">${escapeHtml(x.text)}</span><span class="bt-crit-w">${'★'.repeat(x.weight)}</span></summary>
+            <div class="bt-crit-row-body">
+              ${x.evidence ? `<blockquote class="bt-quote">${escapeHtml(x.evidence)}</blockquote>` : '<p class="bt-note">근거 없음</p>'}
+              ${x.cause ? `<p class="bt-crit-cause"><span>원인</span>${escapeHtml(x.cause)}</p>` : ''}
+              ${x.fix_note ? `<p class="bt-crit-cause"><span>고치기</span>${escapeHtml(x.fix_note)}</p>` : ''}
+              ${x.fix_paste ? `<div class="bt-paste-wrap"><pre class="bt-paste">${escapeHtml(x.fix_paste)}</pre><span class="bt-paste-actions">${copyBtn('bt-critcopy', x.id)}${applyBtn('bt-critapply', x.id)}</span></div>` : ''}
+            </div>
+          </details>`).join('')}
+        </div>`).join('');
+    const count = (v) => rows.filter(x => x.verdict === v).length;
+    return `
+        <section class="bt-card bt-crit-tally">
+          <div><b class="ok">${count('pass')}</b><span>통과</span></div>
+          <div><b class="warn">${count('partial')}</b><span>부분</span></div>
+          <div><b class="bad">${count('fail')}</b><span>실패</span></div>
+          ${count('na') ? `<div><b>${count('na')}</b><span>확인 못 함</span></div>` : ''}
+        </section>
+        ${ch && (ch.up.length || ch.down.length) ? `<section class="bt-card bt-crit-changes">${cardHead('', '지난 평가와 달라진 기준')}
+          ${ch.up.map(x => `<p class="up">${ico('arrow-up')} ${escapeHtml(x.text)} <small>${CRIT_VERDICT[x.from].label} → ${CRIT_VERDICT[x.to].label}</small></p>`).join('')}
+          ${ch.down.map(x => `<p class="down">${ico('arrow-down')} ${escapeHtml(x.text)} <small>${CRIT_VERDICT[x.from].label} → ${CRIT_VERDICT[x.to].label}</small></p>`).join('')}
+        </section>` : ''}
+        ${r.top_fixes?.length ? `<section class="bt-card bt-card-accent">${cardHead('Fix first', '먼저 고칠 것', '실패한 기준 중에서 고치면 가장 크게 좋아지는 순서예요. 하나씩 적용하고 검증해 보세요.')}
+          <div class="bt-stack">${r.top_fixes.map((id, i) => byId[id] ? fixCard(byId[id], i) : '').join('')}</div></section>`
+            : `<section class="bt-card bt-summary">${ico('circle-check')}<div class="bt-prose"><p>실패하거나 부분 통과한 기준이 없어요.</p></div></section>`}
+        <section class="bt-card">${cardHead('Checklist', '기준표 결과', '눌러서 근거 대사와 원인을 볼 수 있어요.')}${list}</section>`;
+}
+
+function bindCriteriaResult(el, r) {
+    const byId = Object.fromEntries((r.criteria || []).map(x => [x.id, x]));
+    el.querySelectorAll('.bt-critcopy').forEach(b => b.addEventListener('click', (e) => { e.preventDefault(); copyText(byId[b.dataset.idx]?.fix_paste || ''); }));
+    el.querySelectorAll('.bt-critapply').forEach(b => b.addEventListener('click', (e) => {
+        e.preventDefault();
+        const x = byId[b.dataset.idx];
+        if (x) openApplyDialog({ field: x.fix_where || 'description', text: x.fix_paste, reason: `기준: ${x.text}${x.cause ? ` — 원인: ${x.cause}` : ''}` });
+    }));
 }
 
 // ---------------------------------------------------------------------------
@@ -5004,7 +5384,7 @@ function guideCardHtml() {
     return `
       <section class="bt-card bt-guide" id="bt_guide" style="display:none">
         <header class="bt-guide-head">
-          <div><span class="bt-eyebrow">Start here</span><h3>처음이라면 이 순서대로</h3></div>
+          <div><span class="bt-eyebrow">시작 가이드</span><h3>처음이라면 이 순서대로</h3></div>
           <button type="button" class="bt-btn bt-btn-sm bt-btn-ghost" id="bt_guide_hide">${ico('eye-slash')}<span>숨기기</span></button>
         </header>
         <ol class="bt-guide-steps" id="bt_guide_steps"></ol>
@@ -5074,6 +5454,12 @@ const COLLAPSIBLES = [
     ['bt_caeh_card', 'caeh', (cd) => {
         const parts = [String(cd.caehBase || '').trim() && '원하는 캐해', String(cd.caehCaution || '').trim() && '주의사항', String(cd.anchorText || '').trim() && '이어가는 채팅'].filter(Boolean);
         return parts.length ? { text: `${parts.join(' · ')} 적어 둠`, tone: 'ok' } : { text: '비어 있음 · 선택' };
+    }],
+    ['bt_crit_card', 'crit', (cd, s) => {
+        const it = critItems(cd);
+        const own = it.filter(x => x.src !== 'play').length;
+        if (s.evalMode === 'classic') return { text: '설정에서 예전 방식 사용 중' };
+        return own ? { text: `캐릭터 기준 ${own}개 · 공통 ${it.length - own}개`, tone: 'ok' } : { text: '첫 평가 때 자동으로 만들어요' };
     }],
     ['bt_build_card', 'build', () => {
         const ch = getCurrentCharacter();
@@ -5285,9 +5671,30 @@ async function setVerifyState(char, itemId, patch) {
 
 /** Evaluated test runs made on exactly the card this change started from. */
 function baselineRunsFor(cd, item) {
+    const sheet = getSettings().evalMode === 'classic' ? null : critHash(critItems(cd));
     return (cd.runs || []).filter(r => r.eval && r.time < item.time
         && (r.epoch ?? -1) === item.epochBefore
-        && (!item.beforeHash || !r.cardHash || r.cardHash === item.beforeHash));
+        && (!item.beforeHash || !r.cardHash || r.cardHash === item.beforeHash)
+        && (!sheet || !r.eval.sheet || r.eval.sheet === sheet));
+}
+
+/** Criteria that got better in every B run / worse in any B run, compared with the A run. */
+function critRunDiff(aEval, bEvals, cd) {
+    if (!aEval?.crit || !bEvals.every(b => b?.crit && b.sheet === aEval.sheet)) return null;
+    const val = (v) => CRIT_VERDICT[v]?.v;
+    const items = cd?.criteria?.items || [];
+    const name = (id) => items.find(x => x.id === id)?.text || id;
+    const weight = (id) => items.find(x => x.id === id)?.weight || 1;
+    const up = []; const down = [];
+    for (const [id, av] of Object.entries(aEval.crit)) {
+        const a = val(av);
+        if (a === null || a === undefined) continue;
+        const bs = bEvals.map(b => val(b.crit[id])).filter(x => x !== null && x !== undefined);
+        if (!bs.length) continue;
+        if (bs.some(b => b < a)) down.push({ id, text: name(id), weight: weight(id) });
+        else if (bs.every(b => b > a)) up.push({ id, text: name(id), weight: weight(id) });
+    }
+    return { up, down };
 }
 
 /** Opens an editable preview; the user confirms before anything is written. */
@@ -5497,10 +5904,13 @@ async function verifyApply(itemId) {
         const funA = hasFun(aRuns) ? avg(aRuns, r => r.eval.fun) : null; const funB = hasFun(bRuns) ? avg(bRuns, r => r.eval.fun) : null;
         const delta = Math.round((scoreB - scoreA) * 10) / 10;
         const funDelta = funA !== null && funB !== null ? Math.round((funB - funA) * 10) / 10 : null;
-        const verdict = delta <= -3 || (funDelta !== null && funDelta <= -5) ? 'worse'
-            : delta >= 3 && (funDelta === null || funDelta > -3) ? 'better' : 'same';
+        const cdNow = await loadCharData(char);
+        const cdiff = critRunDiff(aRuns[0].eval, bRuns.map(r => r.eval), cdNow);
+        const keyBroke = !!cdiff?.down.some(x => x.weight >= 3); // a ★★★ rule that passed before now fails
+        const verdict = delta <= -3 || keyBroke || (funDelta !== null && funDelta <= -5) ? 'worse'
+            : (delta >= 3 || (cdiff && cdiff.up.length && !cdiff.down.length)) && (funDelta === null || funDelta > -3) ? 'better' : 'same';
         const keep = verdict === 'better' || (verdict === 'same' && s.verifyRule === 'lenient');
-        const record = { a: Math.round(scoreA), b: bRuns.map(r => Math.round(Number(r.eval.overall) || 0)), funA: funA === null ? null : Math.round(funA), funB: funB === null ? null : Math.round(funB), delta, funDelta, verdict, aRunId: aRuns[0].id, bRunIds: bRuns.map(r => r.id) };
+        const record = { a: Math.round(scoreA), b: bRuns.map(r => Math.round(Number(r.eval.overall) || 0)), funA: funA === null ? null : Math.round(funA), funB: funB === null ? null : Math.round(funB), delta, funDelta, verdict, aRunId: aRuns[0].id, bRunIds: bRuns.map(r => r.id), critUp: cdiff?.up.map(x => x.text) || [], critDown: cdiff?.down.map(x => x.text) || [], keyBroke };
         if (!keep) { await undoApply(itemId, { quiet: true }); await flushCardSaves(); }
         cd = await loadCharData(char);
         cd.abLast = { a: aRuns[0].id, b: bRuns[bRuns.length - 1].id };
@@ -5537,17 +5947,18 @@ async function showVerifyResult(char, item) {
     if (!v) return;
     const c = ctx();
     const sum = verifySummaryText(v);
+    const critLines = `${(v.critUp || []).length ? `<p class="bt-verify-crit up">통과로 바뀐 기준: ${(v.critUp || []).map(escapeHtml).join(', ')}</p>` : ''}${(v.critDown || []).length ? `<p class="bt-verify-crit down">나빠진 기준: ${(v.critDown || []).map(escapeHtml).join(', ')}</p>` : ''}`;
     if (v.state === 'kept') {
-        toastr.success(`효과가 있어서 남겼어요. ${sum}`, '봇 테스터', { timeOut: 9000 });
+        toastr.success(`효과가 있어서 남겼어요. ${sum}${(v.critUp || []).length ? ` · 통과로 바뀐 기준: ${v.critUp.join(', ')}` : ''}`, '봇 테스터', { timeOut: 10000 });
         setStatus(`✅ 검증 완료: 유지 · ${sum}`);
         return;
     }
     const why = v.verdict === 'worse'
-        ? (v.funDelta !== null && v.funDelta <= -5 ? '재미 점수가 떨어졌어요.' : '점수가 떨어졌어요.')
-        : '점수 차이가 평가 오차(±2~3점) 안이라 좋아졌다고 보기 어려워요.';
+        ? (v.keyBroke ? '꼭 지켜야 하는 기준(★★★)이 깨졌어요.' : v.funDelta !== null && v.funDelta <= -5 ? '재미 점수가 떨어졌어요.' : '점수가 떨어졌어요.')
+        : '통과로 바뀐 기준이 없고, 점수 차이도 평가 오차(±2~3점) 안이에요.';
     setStatus(`↩️ 검증 완료: 되돌림 · ${sum}`);
     if (!c.callGenericPopup) { toastr.info(`되돌렸어요. ${why} ${sum}`); return; }
-    const r = await c.callGenericPopup(`<h3>수정을 되돌렸어요</h3><p>${escapeHtml(why)}</p><p><b>${escapeHtml(sum)}</b></p><p class="bt-note">결과 탭에서 A·B 답장을 나란히 볼 수 있어요. 답장을 직접 보고 B가 낫다면 다시 적용해도 돼요.</p>`,
+    const r = await c.callGenericPopup(`<h3>수정을 되돌렸어요</h3><p>${escapeHtml(why)}</p><p><b>${escapeHtml(sum)}</b></p>${critLines}<p class="bt-note">결과 탭에서 A·B 답장을 나란히 볼 수 있어요. 답장을 직접 보고 B가 낫다면 다시 적용해도 돼요.</p>`,
         c.POPUP_TYPE.CONFIRM, '', { okButton: '그래도 다시 적용', cancelButton: '닫기' });
     if (r === c.POPUP_RESULT.AFFIRMATIVE || r === true || r === 1) await reapplyItem(char, item.id);
 }
@@ -5762,6 +6173,11 @@ function renderAbCompare(data) {
                 <div><span class="bt-ab-badge bt-ab-badge-b">B</span><div class="bt-ab-reply">${escapeHtml(b.replies[i] || '(답장 없음)')}</div></div>
             </div>
         </details>`).join('');
+    const cdiff = critRunDiff(a.eval, [b.eval], data);
+    const critAB = cdiff && (cdiff.up.length || cdiff.down.length) ? `<section class="bt-card bt-crit-changes">${cardHead('', '기준별로 달라진 것')}
+        ${cdiff.up.map(x => `<p class="up">${ico('arrow-up')} ${escapeHtml(x.text)} <small>A보다 B가 나아짐</small></p>`).join('')}
+        ${cdiff.down.map(x => `<p class="down">${ico('arrow-down')} ${escapeHtml(x.text)} <small>B에서 나빠짐${x.weight >= 3 ? ' · ★★★' : ''}</small></p>`).join('')}</section>`
+        : cdiff ? `<section class="bt-card bt-summary">${ico('equals')}<div class="bt-prose"><p>기준별 판정은 A와 B가 같아요.</p></div></section>` : '';
     const verdict = sa === null || sb === null ? '한쪽이 평가 전이라 점수 비교는 못 했어요.'
         : sb - sa >= 3 ? `수정 후(B)가 ${sb - sa}점 더 높아요. 고친 게 효과가 있었어요.`
         : sa - sb >= 3 ? `수정 후(B)가 ${sa - sb}점 낮아요. 되돌리거나 다른 방향으로 고쳐 보세요.`
@@ -5779,6 +6195,7 @@ function renderAbCompare(data) {
             </div>
         </section>
         <section class="bt-card bt-summary">${ico('scale-balanced')}<div class="bt-prose"><p>${escapeHtml(verdict)}</p></div></section>
+        ${critAB}
         ${rows ? `<section class="bt-card">${cardHead('', '항목별 비교')}<div class="bt-ab-cats"><div class="bt-ab-cat bt-ab-head"><span>항목</span><b>A</b><b>B</b><span>차이</span></div>${rows}</div></section>` : ''}
         ${a.eval?.summary || b.eval?.summary ? `<section class="bt-card">${cardHead('', '총평 비교')}
             <div class="bt-ab-pair"><div><span class="bt-ab-badge">A</span><div class="bt-prose">${prose(a.eval?.summary || '')}</div></div><div><span class="bt-ab-badge bt-ab-badge-b">B</span><div class="bt-prose">${prose(b.eval?.summary || '')}</div></div></div></section>` : ''}
@@ -6226,7 +6643,7 @@ function renderDietResults() {
     const pct = totalBefore ? Math.round((1 - totalAfter / totalBefore) * 100) : 0;
     el.innerHTML = `
         <section class="bt-card bt-diet-hero">
-            <div><span class="bt-eyebrow">Result</span><h3>${totalBefore.toLocaleString()} → ${totalAfter.toLocaleString()} 토큰</h3></div>
+            <div><span class="bt-eyebrow">결과</span><h3>${totalBefore.toLocaleString()} → ${totalAfter.toLocaleString()} 토큰</h3></div>
             <span class="bt-diet-pct">−${pct}%</span>
         </section>
         ${items.map(t => {
@@ -6634,7 +7051,7 @@ function renderFunAnalysis(data) {
         <section class="bt-card bt-hero">
             ${ringHtml(fun)}
             <div class="bt-hero-meta">
-                <span class="bt-eyebrow">Fun analysis</span>
+                <span class="bt-eyebrow">재미 분석</span>
                 <h3>재미 분석</h3>
                 <div class="bt-hero-sub"><span>${escapeHtml(new Date(fp.time).toLocaleString())}</span></div>
             </div>
@@ -7467,7 +7884,7 @@ function renderLoreCheck() {
         <div id="bt_lore_ai_view" class="bt-result">${ai ? `
             <section class="bt-card bt-hero">
                 ${ringHtml(Math.max(0, Math.min(100, Number(ai.score) || 0)))}
-                <div class="bt-hero-meta"><span class="bt-eyebrow">Lorebook review</span><h3>로어북 내용 점검</h3><div class="bt-hero-sub"><span>${escapeHtml(new Date(d.ai.time).toLocaleString())}</span></div></div>
+                <div class="bt-hero-meta"><span class="bt-eyebrow">로어북 점검</span><h3>로어북 내용 점검</h3><div class="bt-hero-sub"><span>${escapeHtml(new Date(d.ai.time).toLocaleString())}</span></div></div>
             </section>
             ${ai.summary ? `<section class="bt-card bt-summary">${ico('book')}<div class="bt-prose">${prose(ai.summary)}</div></section>` : ''}
             ${aiIssues ? `<section class="bt-card">${cardHead('Issues', '고칠 곳', '키워드 추가와 내용 바꾸기는 원본이 백업돼서 적용 기록에서 되돌릴 수 있어요.')}<div class="bt-stack">${aiIssues}</div></section>` : ''}
@@ -7722,7 +8139,7 @@ function loreChatHtml(ai) {
     return `
         <section class="bt-card bt-hero">
             ${ringHtml(Math.max(0, Math.min(100, Number(r.score) || 0)))}
-            <div class="bt-hero-meta"><span class="bt-eyebrow">Lore × chat</span><h3>로어북 기준 채팅 검사</h3><div class="bt-hero-sub"><span>${escapeHtml(new Date(ai.time).toLocaleString())}</span></div></div>
+            <div class="bt-hero-meta"><span class="bt-eyebrow">로어북 × 대화</span><h3>로어북 기준 채팅 검사</h3><div class="bt-hero-sub"><span>${escapeHtml(new Date(ai.time).toLocaleString())}</span></div></div>
         </section>
         <section class="bt-card"><div class="bt-meters">${meter('설정 일치', sc.facts)}${meter('지시 따름', sc.rules)}${meter('로어 활용', sc.use)}</div>
             ${r.summary ? `<div class="bt-prose" style="margin-top:12px">${prose(r.summary)}</div>` : ''}
@@ -7754,7 +8171,7 @@ function loreCardHtml(ai) {
     return `
         <section class="bt-card bt-hero">
             ${ringHtml(Math.max(0, Math.min(100, Number(r.score) || 0)))}
-            <div class="bt-hero-meta"><span class="bt-eyebrow">Lore × card</span><h3>로어북 지시 기준 카드 검사</h3><div class="bt-hero-sub"><span>${escapeHtml(new Date(ai.time).toLocaleString())}</span></div></div>
+            <div class="bt-hero-meta"><span class="bt-eyebrow">로어북 × 카드</span><h3>로어북 지시 기준 카드 검사</h3><div class="bt-hero-sub"><span>${escapeHtml(new Date(ai.time).toLocaleString())}</span></div></div>
         </section>
         ${r.summary ? `<section class="bt-card bt-summary">${ico('book')}<div class="bt-prose">${prose(r.summary)}</div></section>` : ''}
         ${rules ? `<section class="bt-card"><details class="bt-disclosure bt-disclosure-sm"><summary><span>로어북에서 찾은 지시사항 ${r.rules.length}개</span>${ico('chevron-down')}</summary><ul class="bt-list">${rules}</ul></details></section>` : ''}
@@ -8155,7 +8572,7 @@ function kindResultHtml(mode, data) {
     return `
         <section class="bt-card bt-hero">
             ${ringHtml(Math.max(0, Math.min(100, Number(r.score) || 0)))}
-            <div class="bt-hero-meta"><span class="bt-eyebrow">${BOT_KINDS[data.kind]?.short || ''} · ${mode === 'card' ? 'Card' : 'Chat'}</span><h3>${mode === 'card' ? '카드 검사' : '채팅 검사'}</h3><div class="bt-hero-sub"><span>${escapeHtml(new Date(data.time).toLocaleString())}</span></div></div>
+            <div class="bt-hero-meta"><span class="bt-eyebrow">${BOT_KINDS[data.kind]?.short || ''} · ${mode === 'card' ? '카드' : '대화'}</span><h3>${mode === 'card' ? '카드 검사' : '채팅 검사'}</h3><div class="bt-hero-sub"><span>${escapeHtml(new Date(data.time).toLocaleString())}</span></div></div>
         </section>
         ${r.summary ? `<section class="bt-card bt-summary">${ico('puzzle-piece')}<div class="bt-prose">${prose(r.summary)}</div></section>` : ''}
         ${checks ? `<section class="bt-card">${cardHead('', '항목별 점수')}<div class="bt-meters">${checks}</div></section>` : ''}
