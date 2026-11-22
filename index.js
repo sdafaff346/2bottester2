@@ -830,18 +830,33 @@ async function fillPresetSelect(sel, value) {
  * Calls the LLM. Big output budgets prevent cut-off results, but some APIs reject budgets above
  * their model limit — in that case retry with the next smaller budget automatically.
  */
+const EMPTY_ANSWER_MSG = 'AI가 빈 답을 보냈어요. 안전 필터에 걸렸거나 생각(Reasoning)에 토큰을 다 썼을 수 있어요. 설정 탭에서 평가용 연결을 다른 모델로 바꾸거나 최대 토큰을 늘린 뒤 다시 해 주세요.';
+
 async function callLLM({ system, prompt, profileId = '', maxTokens = 600 }) {
     let budget = Math.min(maxTokens, tokenCeiling);
     let lastErr = null;
+    let emptyRetried = false;
     for (let i = 0; i < 5; i++) {
         try {
             const out = await callLLMOnce({ system, prompt, profileId, maxTokens: budget });
-            if (budget > 4096 && !out) throw new Error('empty response');
+            const empty = !stripReasoning(String(out ?? '')).trim();
+            if (empty && budget > 4096) throw new Error('empty response');
+            if (empty) {
+                // once more as-is (often a one-off), then stop instead of passing "" along
+                if (!emptyRetried) { emptyRetried = true; console.warn(LOG, 'empty answer, asking once more'); continue; }
+                throw new Error(EMPTY_ANSWER_MSG);
+            }
             return out;
         } catch (e) {
             lastErr = e;
-            // only a budget problem is worth retrying smaller (network / auth errors fail fast)
             const msg = `${e?.message || e} ${e?.status || ''}`;
+            // SillyTavern itself reports an empty answer as "No message generated": ask once more, then explain it
+            if (/no message generated/i.test(msg)) {
+                if (!emptyRetried) { emptyRetried = true; console.warn(LOG, 'empty answer (SillyTavern), asking once more'); continue; }
+                lastErr = new Error(EMPTY_ANSWER_MSG);
+                break;
+            }
+            // only a budget problem is worth retrying smaller (network / auth errors fail fast)
             if (!/empty response|max.?(?:output.?)?tokens|max_completion|too (?:large|long|many)|exceed|limit|length|range|context|invalid|400|422/i.test(msg)) break;
             const next = TOKEN_STEPS.find(t => t < budget);
             if (!next || budget <= 4096) break;
@@ -1513,7 +1528,25 @@ function escapeStrayQuotes(t) {
  * Calls the LLM for JSON. If the reply still can't be parsed, asks the model once
  * to rewrite its own reply as valid JSON. Throws an Error with `.raw` on failure.
  */
-async function requestJson({ system, prompt, profileId = '', maxTokens = 4000, label = '🤖 AI 응답 대기 중…', quietTruncation = false }) {
+/** True when a parsed answer has none of the keys the caller needs (or nothing at all). */
+function jsonLacks(data, expect) {
+    if (!data || typeof data !== 'object') return true;
+    const keys = Object.keys(data);
+    if (!keys.length) return true;
+    if (!expect?.length) return false;
+    return !expect.some(k => data[k] !== undefined && data[k] !== null && data[k] !== '');
+}
+
+async function requestJson(opts) {
+    const data = await requestJsonOnce(opts);
+    if (!jsonLacks(data, opts.expect)) return data;
+    console.warn(LOG, 'answer had no usable content, asking once more:', opts.label, data);
+    const again = await requestJsonOnce({ ...opts, label: `${opts.label || '🤖 AI 응답 대기 중…'} (다시 요청)` });
+    if (!jsonLacks(again, opts.expect)) return again;
+    throw new Error('AI 답에 결과 내용이 없어요. 평가용 연결을 다른 모델로 바꾸거나 최대 토큰을 늘린 뒤 다시 해 주세요.');
+}
+
+async function requestJsonOnce({ system, prompt, profileId = '', maxTokens = 4000, label = '🤖 AI 응답 대기 중…', quietTruncation = false }) {
     let raw = await withTimer(label, callLLM({ system, prompt, profileId, maxTokens }));
     if (jsonCutOff(raw)) {
         console.warn(LOG, 'answer was cut off — asking the model to continue');
@@ -1715,6 +1748,13 @@ function prose(text, perPara = 2) {
 }
 
 function ringHtml(score, size = 'lg') {
+    if (score === null || score === undefined || score === '' || !Number.isFinite(Number(score))) {
+        return `<div class="bt-ring bt-ring-${size}">
+        <svg viewBox="0 0 100 100" aria-hidden="true"><circle cx="50" cy="50" r="42" class="bt-ring-bg"></circle></svg>
+        <div class="bt-ring-val bt-ring-none">—</div>
+    </div>`;
+    }
+    score = Math.max(0, Math.min(100, Number(score)));
     const r = 42;
     const c = 2 * Math.PI * r;
     const off = c * (1 - Math.max(0, Math.min(100, score)) / 100);
@@ -1728,6 +1768,7 @@ function ringHtml(score, size = 'lg') {
 }
 
 function deltaHtml(now, before) {
+    if (now === undefined || now === null || Number.isNaN(Number(now))) return '';
     if (before === undefined || before === null || Number.isNaN(Number(before))) return '';
     const d = Math.round(now - Number(before));
     if (d === 0) return '<span class="bt-delta">±0</span>';
@@ -3515,7 +3556,7 @@ async function runVoiceCheck(setKey = 'ja_ko') {
                 sampleOf(v),
                 'Now output the JSON.',
             ].filter(Boolean).join('\n\n');
-            const res = await requestJsonComplete({ system: withCustom(system, 'voice'), prompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: `🔎 ${VOICE_VERSIONS[v].label} 말투 검증 중…` });
+            const res = await requestJsonComplete({ system: withCustom(system, 'voice'), prompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: `🔎 ${VOICE_VERSIONS[v].label} 말투 검증 중…`, expect: ['score', 'status', 'style_ko', 'checks', 'flagged'] });
             res.version = v;
             return res;
         };
@@ -3554,7 +3595,7 @@ async function runVoiceCheck(setKey = 'ja_ko') {
             ...versions.map(sampleOf),
             'Now output the JSON.',
         ].filter(Boolean).join('\n\n');
-        const overview = await requestJsonComplete({ system: withCustom(overviewSystem, 'voice'), prompt: overviewPrompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: `🎭 ${set.label} 성격·비교 정리 중…` });
+        const overview = await requestJsonComplete({ system: withCustom(overviewSystem, 'voice'), prompt: overviewPrompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: `🎭 ${set.label} 성격·비교 정리 중…`, expect: ['personality', 'summary', 'compare_ko'] });
 
         const result = sanitizeVoiceResult({
             summary: overview.summary,
@@ -3824,8 +3865,11 @@ function renderVoiceResult(entry, prev) {
     const r = sanitizeVoiceResult(structuredClone(entry.result));
     const set = VOICE_SETS[entry.set] || {};
     const p = r.personality || {};
-    const pc = Math.max(0, Math.min(100, Number(p.canon_score) || 0));
-    const pf = Math.max(0, Math.min(100, Number(p.fanon_score) || 0));
+    const scoreOrNull = (v) => (v === null || v === undefined || v === '' || !Number.isFinite(Number(v)) ? null : Math.max(0, Math.min(100, Number(v))));
+    const pc = scoreOrNull(p.canon_score);
+    const pf = scoreOrNull(p.fanon_score);
+    // results saved before v4.1.1 could be completely empty (an empty AI answer was stored as {})
+    const hollow = pc === null && pf === null && !r.summary && !(r.speech || []).some(sp => sp && (sp.score != null || sp.style_ko || sp.comment || (sp.flagged || []).length));
     const pp = prev?.result?.personality;
     const checkLabel = { first_person: '1인칭', address: '호칭', register: '격식', dialect: '사투리', tics: '말버릇' };
     const leanLabel = { canon: '원작 캐해에 가까워요', fanon: '2차 캐해에 가까워요', balanced: '원작과 2차 캐해 사이 균형', neither: '둘 다와 거리가 있어요' };
@@ -3870,7 +3914,7 @@ function renderVoiceResult(entry, prev) {
             </div>`).join('');
         return `<article class="bt-vcard">
             <div class="bt-vcard-head"><h4>${versionTitle(sp.version)}</h4>
-                ${sc === null ? '<span class="bt-tag bt-tag-ghost">샘플 없음</span>' : `<span class="bt-vcard-score" style="color:${scoreColor(sc)}">${sc}<small>%</small></span>`}</div>
+                ${sc === null ? `<span class="bt-tag bt-tag-ghost">${sp.status === 'no_sample' ? '샘플 없음' : '결과 없음'}</span>` : `<span class="bt-vcard-score" style="color:${scoreColor(sc)}">${sc}<small>%</small></span>`}</div>
             ${sc === null ? '' : `<div class="bt-bar"><i style="width:${sc}%;background:${scoreColor(sc)}"></i></div>`}
             ${checks ? `<div class="bt-checks">${checks}</div>` : ''}
             ${sp.style_ko ? `<div class="bt-explain"><span class="bt-explain-label">원래 말투</span><div class="bt-prose">${prose(sp.style_ko)}</div></div>` : ''}
@@ -3895,6 +3939,7 @@ function renderVoiceResult(entry, prev) {
         `<dt>${codeTag(v)}</dt><dd><pre class="bt-paste">${escapeHtml(t)}</pre></dd>`).join('');
 
     el.innerHTML = `
+        ${hollow ? `<section class="bt-card bt-card-warn"><div class="bt-prose"><p><b>${ico('triangle-exclamation')} 이 결과는 비어 있어요.</b> AI가 빈 답을 보냈는데 예전 버전이 그걸 0점 결과로 저장한 거예요. 실제 점수가 아니니 위 버튼으로 <b>다시 검증</b>해 주세요. 또 비어 있으면 설정 탭에서 평가용 연결을 다른 모델로 바꿔 보세요.</p></div></section>` : ''}
         <section class="bt-card bt-hero bt-hero-dual">
             <div class="bt-hero-pair">
                 <div class="bt-hero-cell">${ringHtml(pc, 'md')}<span class="bt-hero-caption">원작 캐해 ${deltaHtml(pc, pp?.canon_score)}</span></div>
