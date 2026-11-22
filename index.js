@@ -89,6 +89,7 @@ const defaultSettings = Object.freeze({
     settingsRev: 0,
     evalMode: 'criteria',
     benchScript: true,
+    failRecheck: true,       // re-check every fail/partial once and undo deductions that ignore the chat's situation
     evalTwice: false,        // grade every result twice and merge (steadier scores; verification always does)       // reuse one test script per character so scores can be compared    // criteria = grade against the per-character checklist | classic = felt 0-100 scores
 });
 
@@ -1160,6 +1161,27 @@ function collectChatLog(limit) {
         .join('\n\n');
 }
 
+/**
+ * Chat log for grading. When the last `limit` messages do not reach the start of the chat,
+ * the opening (first bot message + the first few {{user}} messages) is added on top, because
+ * that is where {{user}} usually sets up the situation ("we are already close", time skips…).
+ */
+function collectEvalChatLog(limit) {
+    const { chat } = ctx();
+    const list = chat.filter(m => m && !m.is_system && typeof m.mes === 'string');
+    const tail = collectChatLog(limit);
+    if (list.length <= limit) return tail;
+    const head = list.slice(0, list.length - limit);
+    const opening = [];
+    const firstBot = head.find(m => !m.is_user);
+    if (firstBot && head.indexOf(firstBot) < 2) opening.push(firstBot);
+    opening.push(...head.filter(m => m.is_user).slice(0, 3));
+    opening.sort((a, b) => head.indexOf(a) - head.indexOf(b));
+    if (!opening.length) return tail;
+    const openText = opening.map(m => `${m.is_user ? '[USER] ' : '[BOT] '}${m.name}: ${truncate(m.mes, 800)}`).join('\n\n');
+    return `[Chat opening — sets up the situation; earlier than the graded part]\n${openText}\n\n[… messages skipped …]\n\n[Recent messages — grade these]\n${tail}`;
+}
+
 // ---------------------------------------------------------------------------
 // Auto tester
 // ---------------------------------------------------------------------------
@@ -1725,7 +1747,7 @@ async function runEvaluation({ useChat = true, messages = 0, twice = false } = {
         return;
     }
 
-    const chatLog = useChat ? collectChatLog(Math.max(Number(messages) || 0, Number(s.evalMessages) || 20)) : '';
+    const chatLog = useChat ? collectEvalChatLog(Math.max(Number(messages) || 0, Number(s.evalMessages) || 20)) : '';
     if (useChat && !chatLog.trim()) {
         toastr.warning('평가할 대화가 없어요. 먼저 테스트를 돌리거나 “카드만 평가”를 눌러주세요.');
         return;
@@ -1762,7 +1784,8 @@ async function runEvaluation({ useChat = true, messages = 0, twice = false } = {
         useChat
             ? 'Weigh the BOT messages in the test chat most heavily (actual behavior), and use the card to explain WHY problems happen.'
             : 'There is no chat log: evaluate the character card itself (how well it would reproduce the original).',
-    ].join('\n');
+        useChat ? CHAT_CONTEXT_RULE : '',
+    ].filter(Boolean).join('\n');
 
     const prompt = [
         charData.refText?.trim() ? `[Reference material: ${char.name}]\n${truncate(charData.refText, Number(s.refMaxChars) || 15000)}` : '[No reference material — use the lorebook below as the reference]',
@@ -1784,15 +1807,19 @@ async function runEvaluation({ useChat = true, messages = 0, twice = false } = {
                 }
                 const items = critItems(charData);
                 const sheetPrompt = prompt.replace('Now output the JSON evaluation.', `[CRITERIA SHEET — grade every item, nothing else]\n${criteriaPromptBlock(items)}\n\nNow output the JSON.`);
-                const raw = await requestJsonComplete({ system: withCustom(criteriaEvalSystem(charData, { useChat, loreRef }), 'eval'), prompt: sheetPrompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: '📋 기준표로 채점 중…' });
-                result = criteriaToResult(items, raw);
+                let raw = await requestJsonComplete({ system: withCustom(criteriaEvalSystem(charData, { useChat, loreRef }), 'eval'), prompt: sheetPrompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: '📋 기준표로 채점 중…' });
                 if (twice || s.evalTwice) {
                     // the same transcript graded twice can differ: merge both so one harsh pass doesn't decide
                     try {
                         const raw2 = await requestJsonComplete({ system: withCustom(criteriaEvalSystem(charData, { useChat, loreRef }), 'eval'), prompt: sheetPrompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: '📋 한 번 더 채점 중 (점수 흔들림 줄이기)…' });
-                        result = criteriaToResult(items, mergeCritAnswers(raw, raw2));
+                        raw = mergeCritAnswers(raw, raw2);
                     } catch (e2) { if (e2.message === '중단됨') throw e2; console.warn(LOG, 'second grading failed, keeping the first', e2); }
                 }
+                if (useChat && s.failRecheck) {
+                    try { raw = await recheckFails(items, raw, { char, charData, chatLog, profileId: s.evalProfile }); }
+                    catch (e3) { if (e3.message === '중단됨') throw e3; console.warn(LOG, 'fail re-check failed, keeping the grading as is', e3); }
+                }
+                result = criteriaToResult(items, raw);
                 // nothing graded = the AI ignored the sheet; a 0% result here would only mislead
                 if (!result.criteria.some(r => r.verdict !== 'na')) throw new Error('AI가 기준표 항목을 하나도 채점하지 않았어요. 다시 평가하거나, 설정 탭에서 평가용 연결을 다른 모델로 바꿔 주세요.');
             } else {
@@ -2175,7 +2202,7 @@ ${doctorPageHtml()}
             <option value="criteria">평가 기준표로 채점 (추천 · 통과/부분/실패)</option>
             <option value="classic">예전 방식 (0~100점 느낌으로)</option>
           </select>`, '기준표는 원작 탭에서 고쳐요')}
-        <div class="bt-switches">${toggle('evaltwice', '두 번 채점해서 합치기', '같은 대화라도 채점이 흔들려요. 두 번 채점하면 더 믿을 만하지만 평가 시간·비용이 두 배예요. 수정 검증은 항상 두 번 채점해요.')}</div>
+        <div class="bt-switches">${toggle('failrecheck', '감점 다시 확인하기 (추천)', '실패·부분 항목만 한 번 더 살펴서, 대화에서 정한 상황(예: “이미 친한 사이”)을 무시한 감점이면 취소해요. 감점을 더하지는 않아요. 실패가 있을 때만 요청이 한 번 늘어요.')}${toggle('evaltwice', '두 번 채점해서 합치기', '같은 대화라도 채점이 흔들려요. 두 번 채점하면 더 믿을 만하지만 평가 시간·비용이 두 배예요. 수정 검증은 항상 두 번 채점해요.')}</div>
         ${field('고칠 문장 언어', `<select id="bt_pastelang" class="bt-input">
             <option value="card">카드와 같은 언어 (추천)</option>
             <option value="ko">한국어</option>
@@ -2391,6 +2418,7 @@ function bindPanel() {
     bindCheck('newchat', 'newChat');
     bindCheck('autoeval', 'autoEvalAfterTest');
     bindCheck('benchscript', 'benchScript');
+    bindCheck('failrecheck', 'failRecheck');
     bindCheck('evaltwice', 'evalTwice');
     $id('benchscript')?.addEventListener('change', async () => { const ch = getCurrentCharacter(); renderBenchNote(ch ? await loadCharData(ch) : null); });
     bindCheck('lorebook', 'includeLorebook');
@@ -3756,7 +3784,20 @@ function sanitizeVoiceResult(r) {
     return r;
 }
 
-const NO_SHIP_RULE = 'STRICT RULE: never mention couplings / ships / pairings (CP, カップリング, 受け・攻め, 夢, 커플링, 공수, "A x B", OTP, x Reader) or romantic fan pairings in any field. Fan interpretation (fanon) means personality, habits, attitude and memes about the character ONLY.';
+/**
+ * The situation the chat itself set up (by {{user}}, the opening message or the scenario) is the
+ * ground truth for grading. Without this rule, graders fail conditional criteria such as
+ * "formal speech at first meeting" even after {{user}} wrote "we are already close friends".
+ */
+const CHAT_CONTEXT_RULE = [
+    'CHAT SITUATION RULE (overrides criteria wording):',
+    '- First read the whole chat and note the situation it established: relationship and closeness to {{user}}, how long they have known each other, time skips, place, AU premises, OOC notes or narration from {{user}} such as "we are already close", "(3 years later)", "we are dating", "this is not our first meeting". Things {{user}} states about the shared past are TRUE for this chat unless the creator\'s cautions forbid them.',
+    '- Many criteria are conditional even when not worded that way (first meeting, strangers, seniors, when angry, in public). A criterion applies ONLY when its condition actually holds in this chat. If the chat set up a different situation (e.g. already close instead of a first meeting), the conditional rule does not apply: grade instead whether the bot adapted the way THIS character would in the established situation (e.g. how they canonically talk to close friends). If nothing in the chat lets you judge that, use "na".',
+    '- A bot that follows the established situation is CORRECT, never a fail. Only fail when the bot breaks the character inside the situation that actually exists in the chat, or ignores/contradicts that situation.',
+    '- Never fail a criterion only because the chat is a new chat file or because the card\'s first_mes describes a first meeting, when {{user}} has redefined the situation.',
+].join('\n');
+
+const NO_SHIP_RULE ='STRICT RULE: never mention couplings / ships / pairings (CP, カップリング, 受け・攻め, 夢, 커플링, 공수, "A x B", OTP, x Reader) or romantic fan pairings in any field. Fan interpretation (fanon) means personality, habits, attitude and memes about the character ONLY.';
 
 // ---------- JSON with truncation retry ----------
 
@@ -5183,6 +5224,7 @@ async function generateCriteria(char, cd, { silent = false } = {}) {
         'You write the EVALUATION CRITERIA for a fan-made roleplay bot of an existing character. A reviewer will later read a chat transcript and mark each criterion pass / partial / fail.',
         'Write 6-12 criteria that are SPECIFIC to this character: each one must be something a generic bot would get wrong. Cover, in this order of importance: how they speak (first-person pronoun, how they address specific people, speech level toward seniors/juniors/{{user}}, sentence endings, dialect, verbal tics), personality as visible behavior (what they do when praised, angry, embarrassed, challenged), values and lines they would never cross, key relationships, and canon facts that come up in play.',
         'Each criterion must be checkable from dialogue and actions in a transcript. No vague words like "in character", "natural", "faithful". Name the concrete behavior.',
+        'If a behavior depends on the situation (first meeting vs. close friends, seniors vs. juniors, calm vs. angry, public vs. private), state the condition explicitly at the start of both "text" and "check" (e.g. "초면인 상대에게는…" / "When {{user}} is a stranger, …"), and where canon shows it, write what changes once the condition is different (e.g. how they talk to someone they are close to). Never write a situational habit as an always-on rule, because the creator may start chats where the relationship is already different.',
         'Priority of sources: the creator\'s intended characterization and cautions > creator\'s note (AU changes) > reference material (canon) > the current card. A criterion must never contradict the creator\'s direction.',
         'Weight: 3 = breaks the character if wrong, 2 = clearly noticeable, 1 = nice detail.',
         `Groups: one of ${JSON.stringify(CRIT_GROUPS_CANON)}.`,
@@ -5320,15 +5362,17 @@ function criteriaPromptBlock(items) {
 /** Builds the system prompt for checklist grading. */
 function criteriaEvalSystem(charData, { useChat, loreRef }) {
     return [
-        'You are a strict, decisive reviewer of a fan-made roleplay bot. You grade it against a fixed CRITERIA SHEET and tell the creator exactly what to change.',
+        'You are a fair, decisive reviewer of a fan-made roleplay bot. You grade it against a fixed CRITERIA SHEET and tell the creator exactly what to change.',
         useChat
             ? 'Judge the BOT replies in the test chat (actual behavior). Use the card only to explain WHY something fails.'
             : 'There is no chat: judge whether the CARD as written will make the bot meet each criterion. Quote the card.',
         'For EVERY criterion give one verdict:',
         '- "pass": met consistently.',
         '- "partial": met only sometimes, or only weakly.',
-        '- "fail": at least one reply clearly breaks it, or the card contradicts it / gives the bot nothing to do it.',
-        '- "na": the chat never gave a chance to show it (use sparingly; never for speech criteria if the character spoke).',
+        '- "fail": at least one reply clearly breaks it IN THE SITUATION THE CHAT ESTABLISHED, or the card contradicts it / gives the bot nothing to do it.',
+        '- "na": the chat never gave a chance to show it, or its condition (first meeting, strangers, anger…) never held in this chat. A speech criterion whose condition did hold is never "na" if the character spoke.',
+        useChat ? CHAT_CONTEXT_RULE : '',
+        useChat ? 'Before giving "fail" or "partial", write "applies": one short Korean line naming the moment in the chat where the criterion\'s condition really held (e.g. "유저가 처음 말을 건 장면, 둘은 초면"). If you cannot name such a moment, the verdict is "na", not "fail".' : '',
         'Evidence: quote the exact bot line (or card line) that decided the verdict, short. No evidence → you may not mark pass.',
         'For every "fail" and "partial": "cause" = which part of the card causes it or what the card is missing (name the field), and a fix that removes that cause: "fix_where" (field) and "fix_paste" (ready-to-paste text that directly fixes it; follow PASTE TEXT LANGUAGE) and "fix_note" (one Korean line: what the fix does).',
         'Be decisive. No hedging words (might, could, consider, 것 같다, 고려해 보세요). State the problem and the fix as facts and instructions.',
@@ -5340,7 +5384,7 @@ function criteriaEvalSystem(charData, { useChat, loreRef }) {
         pasteLangRule(charData),
         NO_SHIP_RULE,
         'Human-readable strings in natural Korean. JSON rules: straight double quotes, escape " inside strings, no trailing commas. Output ONE JSON object:',
-        '{"summary": "<2-3 Korean sentences: the verdict in plain words>", "criteria": [{"id": "", "verdict": "pass"|"partial"|"fail"|"na", "evidence": "", "cause": "", "fix_where": "description|personality|scenario|first_mes|mes_example|system_prompt|post_history|char_note|lorebook", "fix_paste": "", "fix_note": ""}], "top_fixes": ["<id>"], "strengths": ["<what works, short>"], "missing_info": ["<important canon facts the card lacks>"]}',
+        '{"summary": "<2-3 Korean sentences: the verdict in plain words>", "criteria": [{"id": "", "verdict": "pass"|"partial"|"fail"|"na", "applies": "", "evidence": "", "cause": "", "fix_where": "description|personality|scenario|first_mes|mes_example|system_prompt|post_history|char_note|lorebook", "fix_paste": "", "fix_note": ""}], "top_fixes": ["<id>"], "strengths": ["<what works, short>"], "missing_info": ["<important canon facts the card lacks>"]}',
     ].filter(Boolean).join('\n');
 }
 
@@ -5363,13 +5407,65 @@ function mergeCritAnswers(a, b) {
     return { ...a, criteria, top_fixes: arr(a?.top_fixes).length ? a.top_fixes : b?.top_fixes, strengths: arr(a?.strengths).length ? a.strengths : arr(b?.strengths) };
 }
 
+/**
+ * Second look at every fail / partial, by a reviewer whose only job is to catch wrong deductions:
+ * criteria applied to a situation that does not exist in the chat (e.g. "formal at first meeting"
+ * after {{user}} said they are already close), misread evidence, or rules the creator overrode.
+ * It may only soften a verdict (fail → partial/na/pass, partial → pass/na), never add failures,
+ * so it cannot become one more harsh pass.
+ */
+async function recheckFails(items, raw, { char, charData, chatLog, profileId }) {
+    const graded = arr(raw?.criteria).filter(c => c && (c.verdict === 'fail' || c.verdict === 'partial'));
+    const byId = Object.fromEntries(items.map(it => [it.id, it]));
+    const todo = graded.filter(c => byId[String(c.id)]);
+    if (!todo.length || !String(chatLog || '').trim()) return raw;
+    const system = withCustom([
+        'You are an appeals reviewer for a roleplay-bot grading. Another reviewer marked the criteria below as "fail" or "partial". Your only job is to catch WRONG deductions.',
+        CHAT_CONTEXT_RULE,
+        'Overturn a deduction when ANY of these is true:',
+        '- the criterion\'s condition never held in this chat (e.g. it is about first meetings / strangers, but {{user}} established that they already know each other or are close);',
+        '- the bot\'s behavior is what this character would plausibly do in the situation the chat established;',
+        '- the quoted evidence does not actually show the problem, is a line by {{user}}, or is misread;',
+        '- the creator\'s note, intended characterization or cautions allow the behavior.',
+        'Uphold it when the bot really broke the character in the situation that exists. Do not be lenient beyond that: a genuine slip stays.',
+        'When you overturn, give the corrected verdict: "pass" (the bot did it right for the real situation), "partial", or "na" (the chat never tested the criterion in a situation where it applies). Never make a verdict harsher.',
+        'Write "reason" as one short natural Korean sentence. JSON only, no fences:',
+        '{"rechecks": [{"id": "", "decision": "uphold"|"overturn", "verdict": "pass"|"partial"|"na"|"fail", "reason": ""}]}',
+    ].join('\n'), 'eval');
+    const block = todo.map(c => {
+        const it = byId[String(c.id)];
+        return `- [${it.id}] ${it.check || it.text}${it.check ? ` (한국어: ${it.text})` : ''}\n    first verdict: ${c.verdict}${c.applies ? `\n    reviewer said it applies at: ${c.applies}` : ''}${c.evidence ? `\n    evidence: ${truncate(String(c.evidence), 300)}` : ''}${c.cause ? `\n    cause: ${truncate(String(c.cause), 300)}` : ''}`;
+    }).join('\n');
+    const prompt = [
+        String(charData?.authorNote || '').trim() ? `[Creator's note — intentional AU / setting changes]\n${charData.authorNote}` : '',
+        caehGuide(charData),
+        `[Character card (for context)]\n${truncate(collectCard(char), 5000)}`,
+        `[Chat log]\n${chatLog}`,
+        `[Deductions to re-check]\n${block}`,
+        'Now output the JSON.',
+    ].filter(Boolean).join('\n\n');
+    const data = await requestJson({ system, prompt, profileId, maxTokens: Math.min(4000, 600 + todo.length * 250), label: '⚖️ 감점 다시 확인 중…', expect: ['rechecks'] });
+    const softer = { fail: ['partial', 'na', 'pass'], partial: ['na', 'pass'] };
+    const rulings = Object.fromEntries(arr(data?.rechecks).filter(r => r && r.id).map(r => [String(r.id), r]));
+    const criteria = arr(raw.criteria).map(c => {
+        const r = rulings[String(c?.id)];
+        if (!c || !r || r.decision !== 'overturn' || !softer[c.verdict]?.includes(r.verdict)) return c;
+        const next = { ...c, verdict: r.verdict, overturned: c.verdict, recheck_note: String(r.reason || '') };
+        if (r.verdict === 'pass' || r.verdict === 'na') Object.assign(next, { cause: '', fix_where: '', fix_paste: '', fix_note: '' });
+        return next;
+    });
+    const n = criteria.filter(c => c?.overturned).length;
+    if (n) console.info(LOG, `re-check softened ${n} deduction(s)`);
+    return { ...raw, criteria, top_fixes: arr(raw.top_fixes).filter(id => criteria.some(c => String(c?.id) === String(id) && (c.verdict === 'fail' || c.verdict === 'partial'))) };
+}
+
 /** Turns the checklist verdicts into the result shape the rest of the extension uses. */
 function criteriaToResult(items, data) {
     const byId = Object.fromEntries((Array.isArray(data?.criteria) ? data.criteria : []).map(c => [String(c?.id || ''), c]));
     const rows = items.map(it => {
         const c = byId[it.id] || {};
         const verdict = CRIT_VERDICT[c.verdict] ? c.verdict : 'na';
-        return { id: it.id, group: it.group, weight: it.weight || 1, text: it.text, verdict, evidence: String(c.evidence || ''), cause: String(c.cause || ''), fix_where: String(c.fix_where || ''), fix_paste: String(c.fix_paste || ''), fix_note: String(c.fix_note || '') };
+        return { id: it.id, group: it.group, weight: it.weight || 1, text: it.text, verdict, applies: String(c.applies || ''), overturned: CRIT_VERDICT[c.overturned] ? c.overturned : '', recheck_note: String(c.recheck_note || ''), evidence: String(c.evidence || ''), cause: String(c.cause || ''), fix_where: String(c.fix_where || ''), fix_paste: String(c.fix_paste || ''), fix_note: String(c.fix_note || '') };
     });
     const verdicts = Object.fromEntries(rows.map(r => [r.id, r.verdict]));
     const groups = [...new Set(items.map(x => x.group))];
@@ -5390,7 +5486,7 @@ function criteriaToResult(items, data) {
         categories, criteria: rows, top_fixes: top,
         strengths: Array.isArray(data?.strengths) ? data.strengths.map(String) : [],
         missing_info: Array.isArray(data?.missing_info) ? data.missing_info.map(String) : [],
-        issues: bad.map(r => ({ severity: r.verdict === 'fail' ? (r.weight >= 3 ? 'high' : 'medium') : 'low', category: r.group, problem: `${r.text}${r.cause ? ` — ${r.cause}` : ''}`, evidence: r.evidence, canon: '', fix: r.fix_note })),
+        issues: bad.map(r => ({ severity: r.verdict === 'fail' ? (r.weight >= 3 ? 'high' : 'medium') : 'low', category: r.group, problem: `${r.text}${r.cause ? ` — ${r.cause}` : ''}`, evidence: r.applies ? `${r.evidence}${r.evidence ? ' ' : ''}(상황: ${r.applies})` : r.evidence, canon: '', fix: r.fix_note })),
         card_suggestions: bad.filter(r => r.fix_paste).map(r => ({ field: r.fix_where || 'description', action: 'edit', text: r.fix_paste, reason: `${r.text}${r.fix_note ? ` — ${r.fix_note}` : ''}`, fun_impact: r.group === CRIT_FUN_GROUP ? '+' : '0', fun_note: '', continuity: 'safe', crit: r.id })),
         sheet: critHash(items),
     };
@@ -5427,6 +5523,7 @@ function criteriaResultHtml(entry, prevEntry) {
     const fixCard = (x, i) => `
         <article class="bt-crit-fix">
           <div class="bt-crit-fix-head"><span class="bt-crit-rank">${i + 1}</span><b>${escapeHtml(x.text)}</b>${verdictTag(x.verdict)}</div>
+          ${x.applies ? `<p class="bt-crit-cause"><span>상황</span>${escapeHtml(x.applies)}</p>` : ''}
           ${x.evidence ? `<blockquote class="bt-quote">${escapeHtml(x.evidence)}</blockquote>` : ''}
           ${x.cause ? `<p class="bt-crit-cause"><span>원인</span>${escapeHtml(x.cause)}</p>` : ''}
           ${x.fix_note ? `<p class="bt-crit-cause"><span>고치기</span>${escapeHtml(x.fix_note)}</p>` : ''}
@@ -5439,6 +5536,8 @@ function criteriaResultHtml(entry, prevEntry) {
           <details class="bt-crit-row ${x.verdict}">
             <summary>${verdictTag(x.verdict)}<span class="bt-crit-row-text">${escapeHtml(x.text)}</span><span class="bt-crit-w">${'★'.repeat(x.weight)}</span></summary>
             <div class="bt-crit-row-body">
+              ${x.overturned ? `<p class="bt-note">재검토에서 바뀜: ${escapeHtml(CRIT_VERDICT[x.overturned]?.label || x.overturned)} → ${escapeHtml(CRIT_VERDICT[x.verdict]?.label || x.verdict)}${x.recheck_note ? ` · ${escapeHtml(x.recheck_note)}` : ''}</p>` : ''}
+              ${x.applies ? `<p class="bt-crit-cause"><span>상황</span>${escapeHtml(x.applies)}</p>` : ''}
               ${x.evidence ? `<blockquote class="bt-quote">${escapeHtml(x.evidence)}</blockquote>` : '<p class="bt-note">근거 없음</p>'}
               ${x.cause ? `<p class="bt-crit-cause"><span>원인</span>${escapeHtml(x.cause)}</p>` : ''}
               ${x.fix_note ? `<p class="bt-crit-cause"><span>고치기</span>${escapeHtml(x.fix_note)}</p>` : ''}
