@@ -7942,14 +7942,25 @@ function lintLore({ books, entries }, char, g, chatText, chatIsKorean) {
     const rare = active.filter(e => e.useProbability !== false && Number(e.probability ?? 100) < 100);
     if (rare.length) add('low', '설정', `확률이 100%가 아닌 항목이 ${rare.length}개 있어요`, '키워드가 나와도 가끔만 들어가요. 의도한 게 아니면 확률을 100으로 바꾸세요.', rare.slice(0, 5).map(e => `${label(e)} (${e.probability}%)`));
 
-    // overlap with the card → paid twice
-    const card = normText(collectCard(char));
-    const overlap = active.map(e => {
-        const sents = e.content.split(/(?<=[.!?。！？\n])/).map(normText).filter(x => x.length >= 14);
-        const hit = sents.filter(x => card.includes(x)).length;
-        return { e, ratio: sents.length ? hit / sents.length : 0 };
-    }).filter(x => x.ratio >= 0.4);
-    if (overlap.length) add('medium', '중복', `카드 본문과 내용이 겹치는 항목이 ${overlap.length}개 있어요`, '같은 내용이 카드와 로어북에 둘 다 있으면 켜질 때 토큰을 두 번 써요. 한쪽에만 남기세요.', overlap.slice(0, 5).map(x => `${label(x.e)} (${Math.round(x.ratio * 100)}% 겹침)`));
+    // overlap with the card → paid twice (Description/Personality are sent every turn)
+    const cardText = [rawCardValue(char, 'description'), rawCardValue(char, 'personality')].filter(x => x.trim()).join('\n');
+    const loreDup = cardText ? active.map(e => ({ e, rows: findDuplicates(e.content, cardText, char?.name).filter(r => r.how !== 'contained') })).filter(x => x.rows.length) : [];
+    if (loreDup.length) {
+        const n = loreDup.reduce((a, x) => a + x.rows.length, 0);
+        add(loreDup.some(x => x.e.constant) ? 'medium' : 'low', '중복', `Description·Personality와 겹치는 문장이 로어북 ${loreDup.length}개 항목에 ${n}개 있어요`,
+            '카드 본문은 매 턴 들어가서, 같은 문장이 로어북에도 있으면 그 항목이 켜질 때마다 두 번 들어가요(상시 항목이면 매 턴). 진단 → 중복 정리에서 “로어북에서 지우기”를 고르면 체크해서 한 번에 뺄 수 있어요.',
+            loreDup.flatMap(x => x.rows.slice(0, 2).map(r => `[${label(x.e)}] ${truncate(r.text, 90)}`)).slice(0, 6));
+    }
+    const pairDup = [];
+    for (let j = 1; j < active.length; j++) {
+        for (let i = 0; i < j; i++) {
+            const rows = findDuplicates(active[j].content, active[i].content, char?.name).filter(r => r.how !== 'contained');
+            if (rows.length) pairDup.push({ a: active[i], b: active[j], rows });
+        }
+    }
+    if (pairDup.length) add('low', '중복', `로어북 항목끼리 겹치는 문장이 ${pairDup.reduce((a, x) => a + x.rows.length, 0)}개 있어요`,
+        '두 항목이 같이 켜지면 같은 내용이 두 번 들어가요. 진단 → 중복 정리에서 “로어북 항목끼리”로 정리할 수 있어요.',
+        pairDup.slice(0, 5).map(x => `${label(x.a)} ↔ ${label(x.b)}: ${truncate(x.rows[0].text, 70)}`));
 
     // recursion chains: an entry whose content contains other entries' keys pulls them in too
     if (g.recursive) {
@@ -7965,10 +7976,6 @@ function lintLore({ books, entries }, char, g, chatText, chatIsKorean) {
 
     const order = { high: 0, medium: 1, low: 2 };
     return findings.sort((a, b) => order[a.severity] - order[b.severity]);
-}
-
-function normText(t) {
-    return String(t || '').toLowerCase().replace(/\s+/g, ' ').replace(/[“”"'‘’]/g, '').trim();
 }
 
 function isReadonlyBook(name) {
@@ -8016,7 +8023,7 @@ async function runLoreAi() {
     try {
         const system = [
             'You are an expert SillyTavern lorebook (World Info) designer reviewing the lorebooks linked to a character roleplay bot.',
-            'Check each entry for: contradictions with the card, the reference material or the creator\'s direction; info-dumps that will be pasted into replies instead of played; vague prohibitions; facts that never matter in a scene; missing trigger keywords (nicknames, short forms, other languages/scripts the chat may use, word stems without particles); entries that should be constant vs keyword; entries to merge or split; and chances to make an entry play better (how to SHOW it in a scene).',
+            'Check each entry for: content that repeats the card\'s Description/Personality (paid twice whenever the entry fires — suggest a paste with the duplicate removed, category 중복), contradictions with the card, the reference material or the creator\'s direction; info-dumps that will be pasted into replies instead of played; vague prohibitions; facts that never matter in a scene; missing trigger keywords (nicknames, short forms, other languages/scripts the chat may use, word stems without particles); entries that should be constant vs keyword; entries to merge or split; and chances to make an entry play better (how to SHOW it in a scene).',
             'Keyword advice: keys should be words people actually type in chat. For Korean/Japanese chats include the forms used there. Never suggest the character\'s or user\'s name alone as a key.',
             funGuard(cd),
             NO_SHIP_RULE,
@@ -8025,7 +8032,7 @@ async function runLoreAi() {
             'Limits: issues ≤ 10, missing ≤ 4. "idx" is the #number of the entry. "paste" = full replacement content for that entry, or empty string if only keys change.',
             'JSON rules: straight double quotes, escape " inside strings, no trailing commas. Output ONE JSON object only:',
             `{"score": <0-100 how well the lorebooks support fun, accurate roleplay>, "summary": "<2-3 sentences>",`,
-            ` "issues": [{"idx": 0, "severity": "high"|"medium"|"low", "category": "키워드|내용|모순|구조|토큰|재미", "problem": "", "fix": "", "add_keys": ["..."], "paste": "", ${FUN_IMPACT_DOC}}],`,
+            ` "issues": [{"idx": 0, "severity": "high"|"medium"|"low", "category": "키워드|내용|중복|모순|구조|토큰|재미", "problem": "", "fix": "", "add_keys": ["..."], "paste": "", ${FUN_IMPACT_DOC}}],`,
             ' "missing": [{"name": "", "keys": ["..."], "content": "<new entry content>", "why": ""}]}',
         ].join('\n');
         const prompt = [
@@ -8874,29 +8881,44 @@ function bindKindDoctor() {
 
 
 // ---------------------------------------------------------------------------
-// Description ↔ Personality duplicates (중복 정리): both fields are sent every turn
+// Duplicates (중복 정리): Description ↔ Personality ↔ lorebook
 // ---------------------------------------------------------------------------
 
 const DEDUP_SIDES = {
     personality: { label: 'Personality에서 지우기 (Description에 남김)', target: 'personality', other: 'description' },
     description: { label: 'Description에서 지우기 (Personality에 남김)', target: 'description', other: 'personality' },
+    lore: { label: '로어북에서 지우기 (Description·Personality에 남김)', target: 'lore', other: 'card', lore: true },
+    desc_lore: { label: 'Description에서 지우기 (로어북에 남김)', target: 'description', other: 'lore', lore: true },
+    lore_lore: { label: '로어북 항목끼리 (뒤쪽 항목에서 지우기)', target: 'lore', other: 'lore', lore: true, noAi: true },
 };
 
-let dedupState = null; // { side, target, other, targetText, otherText, rows, ai }
+let dedupState = null; // { char, sideKey, side, rows, ai, targetText?, entries? }
 
 function dedupCardHtml() {
     return `
       <section class="bt-card" id="bt_dedup_card">
-        ${cardHead('Duplicates', 'Description ↔ Personality 중복 정리', '두 칸은 둘 다 매 턴 들어가서, 같은 내용이 양쪽에 있으면 토큰을 두 번 써요. 겹치는 내용을 찾아서 한쪽에서만 지워요. 지운 칸은 백업돼서 적용 기록에서 되돌릴 수 있어요.')}
-        ${field('지울 쪽', `<select id="bt_dedup_side" class="bt-input">${Object.entries(DEDUP_SIDES).map(([k, v]) => `<option value="${k}">${v.label}</option>`).join('')}</select>`)}
+        ${cardHead('Duplicates', '중복 정리 · Description · Personality · 로어북', '같은 내용이 여러 곳에 있으면 토큰을 두 번 쓰고, 모델이 그 부분만 과하게 강조해요. 겹치는 내용을 찾아서 한쪽에서만 지워요. 고친 칸·로어북 항목은 백업돼서 적용 기록에서 되돌릴 수 있어요.')}
+        ${field('어디끼리 · 어느 쪽에서 지울지', `<select id="bt_dedup_side" class="bt-input">
+            <optgroup label="카드 칸끼리">${['personality', 'description'].map(k => `<option value="${k}">${DEDUP_SIDES[k].label}</option>`).join('')}</optgroup>
+            <optgroup label="카드 ↔ 로어북">${['lore', 'desc_lore', 'lore_lore'].map(k => `<option value="${k}">${DEDUP_SIDES[k].label}</option>`).join('')}</optgroup>
+          </select>`)}
+        <p class="bt-note bt-dedup-sidenote" id="bt_dedup_sidenote"></p>
         <div class="bt-actions bt-actions-split">
           <button type="button" id="bt_dedup_find" class="bt-btn">${ico('clone')}<span>같은 문장 찾기</span></button>
           <button type="button" id="bt_dedup_ai" class="bt-btn bt-btn-primary">${ico('wand-magic-sparkles')}<span>AI로 의미 중복까지</span></button>
         </div>
-        <p class="bt-note"><b>같은 문장 찾기</b>는 AI 없이 바로 끝나요. 똑같거나 거의 같은 문장, 이미 다른 칸에 있는 특성 단어를 찾아요. <b>AI로 의미 중복까지</b>는 표현이 달라도 같은 뜻이면 찾아서, 지울 쪽에서만 빼고 나머지 문장은 그대로 둬요.</p>
+        <p class="bt-note"><b>같은 문장 찾기</b>는 AI 없이 바로 끝나요. 똑같거나 거의 같은 문장, 이미 다른 곳에 있는 특성 단어를 찾아요. <b>AI로 의미 중복까지</b>는 표현이 달라도 같은 뜻이면 찾아서, 지울 쪽에서만 빼고 나머지 문장은 그대로 둬요.</p>
       </section>
       <div id="bt_dedup_result" class="bt-result"></div>`;
 }
+
+const DEDUP_SIDE_NOTE = {
+    personality: 'Description과 Personality는 둘 다 매 턴 들어가요.',
+    description: 'Description과 Personality는 둘 다 매 턴 들어가요.',
+    lore: '🔵 상시 항목 · 🟢 키워드 항목. 추천: Description은 매 턴 들어가니까, 로어북에 같은 내용이 또 있으면 그 항목이 켜질 때마다 두 번 들어가요. 로어북 쪽에서 빼는 게 안전해요.',
+    desc_lore: '조심: 키워드 항목에만 남기면 그 키워드가 채팅에 나올 때만 들어가요. 그래서 키워드 항목과 겹치는 문장은 기본으로 체크하지 않아요. 상시(🔵) 항목과 겹치는 것만 체크돼요.',
+    lore_lore: '🔵 상시 항목 · 🟢 키워드 항목. 로어북 항목끼리 같은 내용이 있으면, 둘이 같이 켜질 때 두 번 들어가요. 뒤쪽(나중에 적힌) 항목에서 지워요. 키워드가 다른 항목이면 한쪽에만 남겨도 되는지 확인하고 지우세요.',
+};
 
 function dedupNorm(t, charName = '') {
     let x = String(t || '').toLowerCase().replace(/\{\{char\}\}|\{\{user\}\}/g, '');
@@ -9005,8 +9027,13 @@ function removeSpans(text, spans) {
         .trim();
 }
 
+function dedupSideKey() {
+    const k = $id('dedup_side')?.value;
+    return DEDUP_SIDES[k] ? k : 'personality';
+}
+
 function dedupSide() {
-    return DEDUP_SIDES[$id('dedup_side')?.value] || DEDUP_SIDES.personality;
+    return DEDUP_SIDES[dedupSideKey()];
 }
 
 function dedupTexts() {
@@ -9015,30 +9042,174 @@ function dedupTexts() {
     return { char, side, targetText: rawCardValue(char, side.target), otherText: rawCardValue(char, side.other) };
 }
 
+/** Lorebook entries that can take part in the duplicate check (enabled, with text). */
+async function dedupLoreEntries(char) {
+    const data = await collectLoreForCheck(char);
+    return data.entries
+        .filter(e => !e.disable && String(e.content || '').trim())
+        .map(e => ({
+            book: e.book, uid: e.uid, name: e.name, content: e.content, constant: !!e.constant, keys: e.key || [],
+            editable: e.bookKind !== 'embedded' && !isReadonlyBook(e.book),
+        }));
+}
+
+const loreLabel = (e) => `${e.constant ? '🔵 ' : '🟢 '}${e.name}`;
+
+/** Same-sentence matches for the three lorebook directions. Rows carry the entry they belong to. */
+function findLoreDuplicates(sideKey, char, entries) {
+    const desc = rawCardValue(char, 'description');
+    const pers = rawCardValue(char, 'personality');
+    const rows = [];
+    if (sideKey === 'lore') {
+        const card = [desc, pers].filter(x => x.trim()).join('\n');
+        for (const e of entries) {
+            for (const r of findDuplicates(e.content, card, char.name)) {
+                if (r.how === 'contained') continue; // single words inside a whole card are too loose here
+                rows.push({ ...r, entry: e, where: 'Description·Personality', checked: r.how !== 'similar' || r.score >= 0.85 });
+            }
+        }
+    } else if (sideKey === 'desc_lore') {
+        const best = new Map(); // one row per description sentence: prefer a constant entry, then the closest match
+        for (const e of entries) {
+            for (const r of findDuplicates(desc, e.content, char.name)) {
+                if (r.how === 'contained') continue;
+                const k = `${r.start}:${r.end}`;
+                const score = r.how === 'same' ? 1 : r.score;
+                const cur = best.get(k);
+                if (!cur || (e.constant && !cur.entry.constant) || (e.constant === cur.entry.constant && score > cur.s)) best.set(k, { ...r, s: score, entry: e });
+            }
+        }
+        for (const r of [...best.values()].sort((a, b) => a.start - b.start)) {
+            rows.push({ ...r, matchEntry: r.entry, entry: null, where: `로어북: ${r.entry.name}`, keywordOnly: !r.entry.constant, checked: r.entry.constant && (r.how !== 'similar' || r.score >= 0.85) });
+        }
+    } else if (sideKey === 'lore_lore') {
+        for (let j = 1; j < entries.length; j++) {
+            const taken = new Set();
+            for (let i = 0; i < j; i++) {
+                for (const r of findDuplicates(entries[j].content, entries[i].content, char.name)) {
+                    if (r.how === 'contained') continue;
+                    const k = `${r.start}:${r.end}`;
+                    if (taken.has(k)) continue;
+                    taken.add(k);
+                    rows.push({ ...r, entry: entries[j], where: `로어북: ${entries[i].name}`, matchEntry: entries[i], checked: r.how !== 'similar' || r.score >= 0.85 });
+                }
+            }
+        }
+    }
+    return rows;
+}
+
 async function runDedupFind() {
-    const { char, side, targetText, otherText } = dedupTexts();
+    const char = getCurrentCharacter();
     if (!char) { btError('1:1 캐릭터 채팅을 열어주세요'); return; }
-    if (!targetText.trim() || !otherText.trim()) { toastr.info(`${!targetText.trim() ? FIELD_LABEL[side.target] : FIELD_LABEL[side.other]} 칸이 비어 있어서 겹칠 내용이 없어요`); return; }
-    const rows = findDuplicates(targetText, otherText, char.name);
-    dedupState = { char: char.avatar, side, targetText, otherText, rows, ai: null, time: Date.now() };
+    const sideKey = dedupSideKey();
+    const side = DEDUP_SIDES[sideKey];
+    if (side.lore) {
+        let entries;
+        try { entries = await dedupLoreEntries(char); } catch (e) { btError(`로어북을 불러오지 못했어요: ${e.message}`); return; }
+        if (!entries.length) { toastr.info('켜져 있는 로어북 항목이 없어요. 캐릭터에 로어북이 연결돼 있는지 확인해 주세요.'); return; }
+        if (sideKey === 'lore_lore' && entries.length < 2) { toastr.info('로어북 항목이 하나뿐이라 서로 겹칠 게 없어요'); return; }
+        if (side.target === 'description' && !rawCardValue(char, 'description').trim()) { toastr.info('Description 칸이 비어 있어요'); return; }
+        const rows = findLoreDuplicates(sideKey, char, entries);
+        dedupState = { char: char.avatar, sideKey, side, rows, entries, targetText: side.target === 'description' ? rawCardValue(char, 'description') : '', ai: null, time: Date.now() };
+    } else {
+        const { targetText, otherText } = dedupTexts();
+        if (!targetText.trim() || !otherText.trim()) { toastr.info(`${!targetText.trim() ? FIELD_LABEL[side.target] : FIELD_LABEL[side.other]} 칸이 비어 있어서 겹칠 내용이 없어요`); return; }
+        const rows = findDuplicates(targetText, otherText, char.name).map(r => ({ ...r, checked: r.how !== 'similar' || r.score >= 0.85 }));
+        dedupState = { char: char.avatar, sideKey, side, targetText, otherText, rows, ai: null, time: Date.now() };
+    }
+    const n = dedupState.rows.length;
     renderDedup();
-    setStatus(rows.length ? `✅ 겹치는 내용 ${rows.length}개를 찾았어요` : '✅ 같은 문장은 없어요 — 뜻이 겹치는 건 AI로 찾아보세요');
+    setStatus(n ? `✅ 겹치는 내용 ${n}개를 찾았어요` : '✅ 같은 문장은 없어요 — 뜻이 겹치는 건 AI로 찾아보세요');
     scrollPanelTo($id('dedup_result'));
+}
+
+function loreRefBlock(entries, { maxEach = 900 } = {}) {
+    return entries.map(e => `<entry uid="${e.uid}" book="${e.book}" type="${e.constant ? 'constant (sent every turn)' : `keyword-triggered (sent only when these appear in chat: ${e.keys.slice(0, 6).join(', ') || 'none'})`}" name="${e.name.replace(/"/g, "'")}">\n${truncate(e.content, maxEach)}\n</entry>`).join('\n');
 }
 
 async function runDedupAi() {
     if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
-    const { char, side, targetText, otherText } = dedupTexts();
+    const char = getCurrentCharacter();
     if (!char) { btError('1:1 캐릭터 채팅을 열어주세요'); return; }
-    if (!targetText.trim() || !otherText.trim()) { toastr.info(`${!targetText.trim() ? FIELD_LABEL[side.target] : FIELD_LABEL[side.other]} 칸이 비어 있어서 겹칠 내용이 없어요`); return; }
+    const sideKey = dedupSideKey();
+    const side = DEDUP_SIDES[sideKey];
+    if (side.noAi) { toastr.info('로어북 항목끼리는 “같은 문장 찾기”로 정리해 주세요'); return runDedupFind(); }
     const cd = await loadCharData(char);
-    const T = FIELD_LABEL[side.target]; const O = FIELD_LABEL[side.other];
+    let entries = [];
+    if (side.lore) {
+        try { entries = await dedupLoreEntries(char); } catch (e) { btError(`로어북을 불러오지 못했어요: ${e.message}`); return; }
+        if (!entries.length) { toastr.info('켜져 있는 로어북 항목이 없어요'); return; }
+    }
+    const desc = rawCardValue(char, 'description');
+    const pers = rawCardValue(char, 'personality');
+    let T; let O; let targetText = ''; let otherText = '';
+    if (sideKey === 'lore') {
+        T = '로어북'; O = 'Description·Personality';
+        if (!desc.trim() && !pers.trim()) { toastr.info('Description·Personality 칸이 비어 있어요'); return; }
+    } else if (sideKey === 'desc_lore') {
+        T = 'Description'; O = '로어북'; targetText = desc;
+        if (!desc.trim()) { toastr.info('Description 칸이 비어 있어요'); return; }
+    } else {
+        ({ targetText, otherText } = dedupTexts());
+        T = FIELD_LABEL[side.target]; O = FIELD_LABEL[side.other];
+        if (!targetText.trim() || !otherText.trim()) { toastr.info(`${!targetText.trim() ? T : O} 칸이 비어 있어서 겹칠 내용이 없어요`); return; }
+    }
     running = true;
     updateRunState();
     try {
+        if (sideKey === 'lore') {
+            const editable = entries.filter(e => e.editable).slice(0, 40);
+            if (!editable.length) throw new Error('고칠 수 있는 로어북 항목이 없어요 (카드 내장 로어북은 가져온 뒤에 고칠 수 있어요)');
+            const system = [
+                'You remove duplicated content from SillyTavern lorebook (World Info) entries. The character card\'s Description and Personality are sent to the model EVERY turn, so anything a lorebook entry repeats from them is paid twice whenever the entry fires.',
+                'For each entry, delete every fact, trait, behaviour, rule or description that the Description/Personality already states with the same meaning, even if worded differently. The card stays as is.',
+                'Keep everything else in the entry exactly as written: same language, wording, order, formatting and macros. Do not rewrite, translate, summarize or add anything.',
+                'If an entry repeats a trait but adds something the card does not have (a concrete behaviour, a scene cue, a sample line, a trigger, a nuance, a detail about the entry\'s own topic), that addition is NOT a duplicate: keep it.',
+                'Keep the entry\'s subject named at the start so it still makes sense on its own when it fires. Never empty an entry completely unless it is 100% duplicated.',
+                botTypeGuide(cd),
+                caehGuide(cd),
+                'Output format (no markdown fences). Output ONLY entries you changed, each with its full new content:',
+                '<entry uid="..." book="...">',
+                'full new content of that entry',
+                '</entry>',
+                '<removed>',
+                '- one line per removed item: [entry name] the removed text in quotes — where it already is in the card (explanation in Korean)',
+                '</removed>',
+                'If nothing is duplicated, output just <removed></removed>.',
+            ].filter(Boolean).join('\n');
+            const prompt = `[Description — keep as is, reference only]\n${desc}\n\n[Personality — keep as is, reference only]\n${pers}\n\n[Lorebook entries — TARGETS to clean]\n${loreRefBlock(editable, { maxEach: 4000 })}`;
+            const inTok = await countTokens(editable.map(e => e.content).join('\n'));
+            const raw = await withTimer('🧹 로어북에서 카드와 겹치는 내용 찾는 중…', requestTagged({ system: withCustom(system, 'diet'), prompt, maxTokens: Math.round(inTok * 2) + 2500, lastTag: 'removed', label: '🧹 로어북 중복 정리' }));
+            const changed = [];
+            const re = /<entry\s+uid="([^"]*)"(?:\s+book="([^"]*)")?[^>]*>([\s\S]*?)<\/entry>/gi;
+            let m;
+            while ((m = re.exec(raw))) {
+                const e = editable.find(x => String(x.uid) === m[1] && (!m[2] || x.book === m[2])) || editable.find(x => String(x.uid) === m[1]);
+                const next = m[3].replace(/^\n+|\n+$/g, '');
+                if (!e || next.trim() === e.content.trim()) continue;
+                changed.push({ entry: e, cleaned: next, before: await countTokens(e.content), after: await countTokens(next) });
+            }
+            const removed = tagLines(raw, 'removed');
+            if (!changed.length && !/<removed>/i.test(raw)) throw new Error('결과가 비어 있어요');
+            dedupState = { char: char.avatar, sideKey, side, rows: [], entries, ai: { entries: changed, removed, before: changed.reduce((a, x) => a + x.before, 0), after: changed.reduce((a, x) => a + x.after, 0) }, time: Date.now() };
+            renderDedup();
+            setStatus(changed.length ? `✅ 로어북 중복 정리 완료 — 항목 ${changed.length}개 · ${dedupState.ai.before.toLocaleString()} → ${dedupState.ai.after.toLocaleString()} 토큰` : '✅ 로어북에 카드와 겹치는 내용이 없어요');
+            scrollPanelTo($id('dedup_ai_view'));
+            return;
+        }
+        let rules = [];
+        if (sideKey === 'desc_lore') {
+            otherText = loreRefBlock(entries);
+            rules = [
+                'The reference is a set of lorebook entries. CONSTANT entries are sent every turn; KEYWORD-TRIGGERED entries are only sent when their keywords appear in chat.',
+                'Delete from the Description ONLY what a CONSTANT entry already states. Information that exists only in keyword-triggered entries must STAY in the Description (removing it would make the bot forget it most of the time) — unless it is clearly situational detail that only matters when that topic comes up; list such cases in <removed> with the note "키워드 항목에만 남음".',
+            ];
+        }
         const system = [
-            `You remove duplicated content between two fields of a SillyTavern character card. ${T} and ${O} are both sent to the model every turn, so anything stated in both wastes tokens.`,
-            `Find every fact, trait, behaviour, rule or description that appears in BOTH fields with the same meaning, even if worded differently. Delete it from ${T} (the TARGET) only — it stays in ${O}.`,
+            `You remove duplicated content between two parts of a SillyTavern character. ${T} is sent to the model every turn, so anything stated in both wastes tokens.`,
+            ...rules,
+            `Find every fact, trait, behaviour, rule or description that appears in BOTH with the same meaning, even if worded differently. Delete it from ${T} (the TARGET) only — it stays in ${O}.`,
             `Keep everything else in ${T} exactly as written: same language, same wording, same order and formatting, same macros. Do not rewrite, translate, summarize or add anything.`,
             `If a ${T} sentence mixes duplicated and unique information, keep the unique part with the smallest possible edit.`,
             `If ${T} repeats a trait but adds something ${O} does not have (a concrete behaviour, a directorial cue, a sample line, a trigger, a nuance), that addition is NOT a duplicate: keep it.`,
@@ -9059,7 +9230,8 @@ async function runDedupAi() {
         const cleaned = pickTag(raw, 'cleaned');
         if (!cleaned) throw new Error('결과가 비어 있어요');
         dedupState = {
-            char: char.avatar, side, targetText, otherText, rows: dedupState?.char === char.avatar && dedupState.side.target === side.target ? dedupState.rows : [],
+            char: char.avatar, sideKey, side, targetText, otherText, entries,
+            rows: dedupState?.char === char.avatar && dedupState.sideKey === sideKey ? dedupState.rows : [],
             ai: { cleaned, removed: tagLines(raw, 'removed'), before: inTok, after: await countTokens(cleaned) }, time: Date.now(),
         };
         renderDedup();
@@ -9069,6 +9241,7 @@ async function runDedupAi() {
         console.error(LOG, e);
         setStatus(`❌ 중복 정리 실패: ${e.message}`);
         btError(`중복 정리 실패: ${e.message}`);
+        if (e.message !== '중단됨') offerRetry('중복 정리 다시', runDedupAi);
     } finally {
         running = false;
         updateRunState();
@@ -9077,29 +9250,96 @@ async function runDedupAi() {
 
 const DEDUP_HOW = { same: '같음', similar: '거의 같음', contained: '이미 있음' };
 
+/**
+ * Writes new content into several lorebook entries after one confirmation.
+ * Every entry is logged on its own, so 적용 기록 can undo them one by one.
+ */
+async function applyLoreContents(edits, { tag = '중복 정리', note = '' } = {}) {
+    const char = getCurrentCharacter();
+    const c = ctx();
+    if (!char || !edits.length) return false;
+    if (c.callGenericPopup) {
+        const wrap = document.createElement('div');
+        wrap.className = 'bt-apply-dialog';
+        wrap.innerHTML = `<h3>로어북 항목 ${edits.length}개 바꾸기</h3>
+            <p class="bt-apply-note">아래 항목의 내용을 고쳐요. 원래 내용은 백업돼서 <b>진단 → 적용 기록</b>에서 항목마다 되돌릴 수 있어요.</p>
+            ${note ? `<p class="bt-apply-reason">${escapeHtml(note)}</p>` : ''}
+            <ul class="bt-apply-list">${edits.map(x => `<li>${escapeHtml(loreLabel(x.entry))}${x.entry.book ? ` <small>· ${escapeHtml(x.entry.book)}</small>` : ''}${x.next.trim() ? '' : ' <b>(내용이 전부 지워져요)</b>'}</li>`).join('')}</ul>`;
+        const res = await c.callGenericPopup(wrap, c.POPUP_TYPE.CONFIRM, '', { okButton: '적용', cancelButton: '취소', allowVerticalScrolling: true });
+        if (res !== c.POPUP_RESULT.AFFIRMATIVE && res !== true && res !== 1) return false;
+    }
+    const byBook = new Map();
+    for (const x of edits) byBook.set(x.entry.book, [...(byBook.get(x.entry.book) || []), x]);
+    let done = 0; const skipped = [];
+    try {
+        for (const [book, list] of byBook) {
+            const data = await loadWorld(book);
+            const logs = [];
+            for (const x of list) {
+                const e = data?.entries?.[x.entry.uid];
+                if (!e) { skipped.push(x.entry.name); continue; }
+                const before = String(e.content || '');
+                if (before !== x.entry.content) { skipped.push(x.entry.name); continue; } // changed since the check
+                e.content = x.next;
+                logs.push({ kind: 'lore-edit', label: `로어북: ${x.entry.name} (${tag})`, world: book, uid: x.entry.uid, before, after: x.next });
+            }
+            if (!logs.length) continue;
+            await saveWorld(book, data);
+            try { c.reloadWorldInfoEditor?.(book, true); } catch { /* optional */ }
+            for (const l of logs) { await logApply(char, l); done++; }
+        }
+    } catch (e) {
+        btError(`적용 실패: ${e.message}`);
+        return done > 0;
+    }
+    if (skipped.length) toastr.warning(`그사이 내용이 바뀐 항목은 건너뛰었어요: ${skipped.slice(0, 4).join(', ')}${skipped.length > 4 ? ' 외' : ''}. 다시 찾아 주세요.`, '', { timeOut: 8000 });
+    if (done) toastr.success(`로어북 항목 ${done}개를 고쳤어요 (원본 백업됨)`);
+    return done > 0;
+}
+
 function renderDedup() {
     const el = $id('dedup_result');
+    const note = $id('dedup_sidenote');
+    if (note) note.textContent = DEDUP_SIDE_NOTE[dedupSideKey()] || '';
+    const aiBtn = $id('dedup_ai');
+    if (aiBtn) aiBtn.style.display = dedupSide().noAi ? 'none' : '';
     if (!el) return;
     const d = dedupState;
     if (!d || d.char !== getCurrentCharacter()?.avatar) { el.innerHTML = ''; return; }
-    const T = FIELD_LABEL[d.side.target]; const O = FIELD_LABEL[d.side.other];
-    const rows = d.rows.map((r, i) => `
-        <label class="bt-fixcheck bt-dedup-row">
-            <input type="checkbox" class="bt-dedup-check" value="${i}" ${r.how !== 'similar' || r.score >= 0.85 ? 'checked' : ''}>
+    const loreTarget = d.side.target === 'lore';
+    const T = loreTarget ? '로어북' : FIELD_LABEL[d.side.target];
+    const O = d.side.other === 'card' ? 'Description·Personality' : d.side.other === 'lore' ? '로어북' : FIELD_LABEL[d.side.other];
+    const rows = d.rows.map((r, i) => {
+        const locked = loreTarget && !r.entry?.editable;
+        return `
+        <label class="bt-fixcheck bt-dedup-row${locked ? ' bt-dedup-locked' : ''}">
+            <input type="checkbox" class="bt-dedup-check" value="${i}" ${r.checked && !locked ? 'checked' : ''} ${locked ? 'disabled' : ''}>
             <span class="bt-checkmark" aria-hidden="true">${ico('check')}</span>
             <span class="bt-dedup-body">
+                ${loreTarget ? `<span class="bt-dedup-entry">${ico('book')} ${escapeHtml(loreLabel(r.entry))}${locked ? ' · 카드 내장이라 여기서 못 고쳐요' : ''}</span>` : ''}
                 <span class="bt-dedup-head"><span class="bt-tag bt-dedup-${r.how}">${DEDUP_HOW[r.how]}</span><b>${escapeHtml(r.text)}</b></span>
-                ${r.match ? `<small>${escapeHtml(O)}: ${escapeHtml(truncate(r.match, 160))}</small>` : `<small>${escapeHtml(O)} 문장 안에 이미 있는 단어예요</small>`}
+                ${r.match ? `<small>${escapeHtml(r.matchEntry ? loreLabel(r.matchEntry) : (r.where || O))}: ${escapeHtml(truncate(r.match, 160))}</small>` : `<small>${escapeHtml(O)} 문장 안에 이미 있는 단어예요</small>`}
+                ${r.keywordOnly ? '<small class="bt-dedup-warn">키워드 항목에만 있어요 — 여기서 지우면 키워드가 나올 때만 들어가요</small>' : ''}
             </span>
-        </label>`).join('');
+        </label>`;
+    }).join('');
     const ai = d.ai;
-    el.innerHTML = `
-        ${d.rows.length || !ai ? `<section class="bt-card">
-            ${cardHead('Same text', `${escapeHtml(T)}에서 지울 문장`, d.rows.length ? `체크한 것만 ${escapeHtml(T)}에서 지워요. ${escapeHtml(O)}에는 그대로 남아요.` : '똑같거나 거의 같은 문장은 없어요. 표현만 다르게 겹치는 내용은 AI로 찾아보세요.')}
-            ${rows ? `<div class="bt-stack bt-dedup-list">${rows}</div>
-            <div class="bt-actions bt-actions-end"><button type="button" id="bt_dedup_apply" class="bt-btn bt-btn-primary">${ico('broom')}<span>체크한 것 지우기</span></button></div>` : ''}
-        </section>` : ''}
-        <div id="bt_dedup_ai_view">${ai ? `<section class="bt-card">
+    const aiLore = ai && Array.isArray(ai.entries);
+    const aiHtml = !ai ? '' : aiLore ? `<section class="bt-card">
+            <div class="bt-diet-head"><h4>${ico('wand-magic-sparkles')} AI 중복 정리 · 로어북</h4><span class="bt-diet-tok">${ai.before.toLocaleString()} → <b>${ai.after.toLocaleString()}</b> <span class="bt-delta ${ai.after < ai.before ? 'up' : ''}">−${Math.max(0, ai.before - ai.after)}</span></span></div>
+            ${ai.removed.length ? `<div class="bt-diet-removed"><span>지운 내용 (카드에 이미 있음)</span>${renderList(ai.removed)}</div>` : ''}
+            ${ai.entries.length ? ai.entries.map((x, i) => `
+                <label class="bt-fixcheck bt-dedup-row">
+                    <input type="checkbox" class="bt-dedup-ai-check" value="${i}" checked>
+                    <span class="bt-checkmark" aria-hidden="true">${ico('check')}</span>
+                    <span class="bt-dedup-body">
+                        <span class="bt-dedup-entry">${ico('book')} ${escapeHtml(loreLabel(x.entry))} <span class="bt-muted">· ${x.before.toLocaleString()} → ${x.after.toLocaleString()} 토큰</span></span>
+                        <details class="bt-disclosure bt-disclosure-sm"><summary><span>원래 내용 보기</span>${ico('chevron-down')}</summary><pre class="bt-paste">${escapeHtml(x.entry.content)}</pre></details>
+                        <pre class="bt-paste bt-diet-out">${escapeHtml(x.cleaned) || '<i>(전부 지워짐)</i>'}</pre>
+                    </span>
+                </label>`).join('') : '<p class="bt-note">카드와 겹치는 내용이 없었어요.</p>'}
+            ${ai.entries.length ? `<div class="bt-actions bt-actions-end"><button type="button" id="bt_dedup_ai_apply" class="bt-btn bt-btn-sm bt-btn-primary">${ico('file-import')}<span>체크한 항목 적용</span></button></div>` : ''}
+        </section>` : `<section class="bt-card">
             <div class="bt-diet-head"><h4>${ico('wand-magic-sparkles')} AI 중복 정리 · ${escapeHtml(T)}</h4><span class="bt-diet-tok">${ai.before.toLocaleString()} → <b>${ai.after.toLocaleString()}</b> <span class="bt-delta ${ai.after < ai.before ? 'up' : ''}">−${Math.max(0, ai.before - ai.after)}</span></span></div>
             ${ai.removed.length ? `<div class="bt-diet-removed"><span>지운 내용 (${escapeHtml(O)}에 이미 있음)</span>${renderList(ai.removed)}</div>` : '<p class="bt-note">겹치는 내용이 없었어요.</p>'}
             <details class="bt-disclosure bt-disclosure-sm"><summary><span>원래 ${escapeHtml(T)} 보기</span>${ico('chevron-down')}</summary><pre class="bt-paste">${escapeHtml(d.targetText)}</pre></details>
@@ -9108,10 +9348,25 @@ function renderDedup() {
                 <button type="button" id="bt_dedup_ai_copy" class="bt-btn bt-btn-sm">${ico('copy')}<span>복사</span></button>
                 <button type="button" id="bt_dedup_ai_apply" class="bt-btn bt-btn-sm bt-btn-primary">${ico('file-import')}<span>적용</span></button>
             </div>
-        </section>` : ''}</div>`;
+        </section>`;
+    el.innerHTML = `
+        ${d.rows.length || !ai ? `<section class="bt-card">
+            ${cardHead('Same text', `${escapeHtml(T)}에서 지울 문장`, d.rows.length ? `체크한 것만 ${escapeHtml(T)}에서 지워요. ${escapeHtml(O)}에는 그대로 남아요.` : '똑같거나 거의 같은 문장은 없어요. 표현만 다르게 겹치는 내용은 AI로 찾아보세요.')}
+            ${rows ? `<div class="bt-stack bt-dedup-list">${rows}</div>
+            <div class="bt-actions bt-actions-end"><button type="button" id="bt_dedup_apply" class="bt-btn bt-btn-primary">${ico('broom')}<span>체크한 것 지우기</span></button></div>` : ''}
+        </section>` : ''}
+        <div id="bt_dedup_ai_view">${aiHtml}</div>`;
     $id('dedup_apply')?.addEventListener('click', async () => {
         const picked = [...el.querySelectorAll('.bt-dedup-check:checked')].map(c => d.rows[Number(c.value)]).filter(Boolean);
         if (!picked.length) { toastr.warning('지울 문장을 골라주세요'); return; }
+        if (loreTarget) {
+            const groups = new Map();
+            for (const r of picked) { const k = `${r.entry.book}::${r.entry.uid}`; groups.set(k, [...(groups.get(k) || []), r]); }
+            const edits = [...groups.values()].map(list => ({ entry: list[0].entry, next: removeSpans(list[0].entry.content, list) }));
+            const ok = await applyLoreContents(edits, { note: `${picked.length}개를 지웠어요. ${O}에는 그대로 남아요.` });
+            if (ok) { refreshDietList(); runDedupFind(); }
+            return;
+        }
         const cur = rawCardValue(getCurrentCharacter(), d.side.target);
         if (cur !== d.targetText) { toastr.warning(`${T} 칸이 그사이 바뀌었어요. 다시 찾아주세요.`); return; }
         const next = removeSpans(cur, picked);
@@ -9120,6 +9375,13 @@ function renderDedup() {
     });
     $id('dedup_ai_copy')?.addEventListener('click', () => copyText(ai?.cleaned || ''));
     $id('dedup_ai_apply')?.addEventListener('click', async () => {
+        if (aiLore) {
+            const picked = [...el.querySelectorAll('.bt-dedup-ai-check:checked')].map(c => ai.entries[Number(c.value)]).filter(Boolean);
+            if (!picked.length) { toastr.warning('적용할 항목을 골라주세요'); return; }
+            const ok = await applyLoreContents(picked.map(x => ({ entry: x.entry, next: x.cleaned })), { note: '카드(Description·Personality)와 겹치는 내용을 뺐어요.' });
+            if (ok) { refreshDietList(); dedupState = null; renderDedup(); }
+            return;
+        }
         const ok = await applyReplace({ kind: 'field', field: d.side.target, label: T }, ai.cleaned, { tag: '중복 정리', note: `${O}와 겹치는 내용을 뺐어요.` });
         if (ok) { runDoctorLocal(true); refreshDietList(); dedupState = null; renderDedup(); }
     });
@@ -9129,6 +9391,7 @@ function bindDedup() {
     $id('dedup_find').addEventListener('click', () => { if (!running) runDedupFind(); });
     $id('dedup_ai').addEventListener('click', runDedupAi);
     $id('dedup_side').addEventListener('change', () => { dedupState = null; renderDedup(); });
+    renderDedup();
 }
 
 

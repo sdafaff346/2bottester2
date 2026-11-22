@@ -2093,3 +2093,11 @@
     #bt_panel .bt-footer .bt-status { flex: 1 1 calc(100% - 24px); max-height: 4.6em; }
 }
 #bt_panel .bt-field-hint, #bt_panel .bt-field-meta { font-size: 12px; }
+/* v4.3 — duplicate check across the lorebook */
+#bt_panel .bt-dedup-entry { display: block; margin-bottom: 3px; font-size: 12.5px; font-weight: 650; color: var(--bt-accent-ink); }
+#bt_panel .bt-dedup-entry .fa-solid { font-size: 11px; margin-right: 3px; }
+#bt_panel .bt-dedup-warn { display: block; color: var(--bt-warn); }
+#bt_panel .bt-dedup-locked { opacity: 0.6; }
+#bt_panel .bt-dedup-sidenote:empty { display: none; }
+#bt_panel .bt-dedup-row .bt-diet-out { margin-top: 6px; max-height: 220px; overflow: auto; }
+.bt-apply-dialog .bt-apply-list { margin: 6px 0 0; padding-left: 1.2em; text-align: left; line-height: 1.7; }
