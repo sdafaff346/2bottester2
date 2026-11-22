@@ -87,7 +87,9 @@ const defaultSettings = Object.freeze({
     verifyRuns: 2,           // B tests per verification
     verifyRule: 'strict',    // strict = keep only clear improvements | lenient = revert only clear regressions
     settingsRev: 0,
-    evalMode: 'criteria',    // criteria = grade against the per-character checklist | classic = felt 0-100 scores
+    evalMode: 'criteria',
+    benchScript: true,
+    evalTwice: false,        // grade every result twice and merge (steadier scores; verification always does)       // reuse one test script per character so scores can be compared    // criteria = grade against the per-character checklist | classic = felt 0-100 scores
 });
 
 /** One-time changes to saved settings when a version changes a default for safety. */
@@ -1280,10 +1282,12 @@ async function generateTestMessage(turn, total, charData) {
 }
 
 /** Batch mode: write every test message in ONE LLM call (much faster). */
-async function generateTestBatch(total, charData) {
+async function generateTestBatch(total, charData, { criteria = null } = {}) {
     const s = getSettings();
     const { userName, charName } = testerNames();
     const focuses = Array.from({ length: total }, (_, i) => `${i + 1}. ${pickFocus(s.scenario, i, botKind(charData)).replaceAll('{{user}}', userName)}`);
+    // benchmark script: every message gives the bot a chance to show sheet criteria (weight 3 first)
+    const critBlock = criteria?.length ? `[Criteria the bot will be graded on — across the ${total} messages, give the bot a clear chance to show EVERY weight-3 criterion and as many others as fit. A message may target several. Do not hint at the expected answer.]\n${[...criteria].sort((a, b) => (b.weight || 1) - (a.weight || 1)).slice(0, 16).map(c => `- (w${c.weight || 1}) ${c.text}`).join('\n')}` : '';
 
     const system = testerSystemPrompt(userName, charName, s.language) + [
         '',
@@ -1294,7 +1298,7 @@ async function generateTestBatch(total, charData) {
     const prompt = [
         ...testerContextBlocks(charData, s),
         `[End of the current chat]\n${collectChatLog(4) || '(no conversation yet — open the first message with a natural scene setup)'}`,
-        `[Test focus for each message]\n${focuses.join('\n')}`,
+        critBlock || `[Test focus for each message]\n${focuses.join('\n')}`,
         `Write the JSON array of ${total} messages now.`,
     ].join('\n\n');
 
@@ -1364,6 +1368,52 @@ function lastBotReply() {
  * @param {number} [turnsOverride]
  * @param {{ script?: string[], role?: 'A'|'B' }} [opts] script = re-send exactly these messages (A/B test)
  */
+/** Which scoring sheet a result belongs to: results from different sheets are not comparable. */
+function currentSheetKey(cd) {
+    return getSettings().evalMode === 'classic' ? 'classic' : critHash(critItems(cd));
+}
+
+/**
+ * The character's benchmark script: the same user messages every test, so a score change
+ * comes from the card, not from a different conversation. Rebuilt when the sheet or turn count changes.
+ */
+async function benchScriptFor(char, cd, turns) {
+    const sheet = currentSheetKey(cd);
+    const b = cd.bench;
+    if (b && Array.isArray(b.script) && b.script.length === turns && b.sheet === sheet && b.kind === botKind(cd)) return b.script;
+    if (getSettings().evalMode !== 'classic' && !critItems(cd).some(x => x.src === 'canon' || x.src === 'custom')) {
+        try { await generateCriteria(char, cd, { silent: true }); } catch (e) { if (e.message === '중단됨') throw e; console.warn(LOG, 'criteria for the bench script failed', e); }
+    }
+    const items = getSettings().evalMode === 'classic' ? null : critItems(cd);
+    const script = await withTimer(`📝 이 캐릭터용 기준 대본 ${turns}턴 작성 중…`, generateTestBatch(turns, cd, { criteria: items }));
+    const cd2 = await loadCharData(char);
+    cd2.bench = { script, turns, sheet: currentSheetKey(cd2), kind: botKind(cd2), time: Date.now() };
+    await saveCharData(char, cd2);
+    renderBenchNote(cd2);
+    toastr.info('기준 대본을 만들었어요. 다음 테스트부터 같은 대본으로 해서, 고치기 전후 점수를 공정하게 비교할 수 있어요.', '봇 테스터', { timeOut: 7000 });
+    return script;
+}
+
+function renderBenchNote(cd) {
+    const el = $id('bench_note');
+    if (!el) return;
+    const s = getSettings();
+    const b = cd?.bench;
+    const valid = b && b.sheet === currentSheetKey(cd || {});
+    el.innerHTML = !s.benchScript ? '매번 새 대화로 테스트해요. 점수가 대화에 따라 흔들려서 전후 비교는 정확하지 않아요.'
+        : valid ? `기준 대본 ${b.script.length}턴 · ${new Date(b.time).toLocaleDateString()} 만듦 <button type="button" class="bt-linkbtn" id="bt_bench_reset">새 대본 만들기</button>`
+            : '다음 테스트 때 이 캐릭터용 기준 대본을 만들어요.';
+    $id('bench_reset')?.addEventListener('click', async () => {
+        const char = getCurrentCharacter();
+        if (!char || running) return;
+        const c2 = await loadCharData(char);
+        c2.bench = null;
+        await saveCharData(char, c2);
+        renderBenchNote(c2);
+        toastr.info('다음 테스트 때 새 기준 대본을 만들어요. 그 전 점수와는 비교하지 않아요.');
+    });
+}
+
 async function runTest(turnsOverride, opts = {}) {
     if (running) { toastr.warning('이미 테스트가 진행 중이에요'); return; }
     const char = getCurrentCharacter();
@@ -1385,13 +1435,16 @@ async function runTest(turnsOverride, opts = {}) {
     let restorePrompt = async () => {};
     try {
         restorePrompt = await applyTestPrompt();
-        if (s.newChat || fixedScript || opts.forceNewChat) {
+        if (s.newChat || fixedScript || opts.forceNewChat || (s.benchScript && !opts.noBench)) {
             await ctx().executeSlashCommandsWithOptions('/newchat');
             await sleep(500);
             await waitIdle();
         }
 
         let script = fixedScript;
+        if (!script && s.benchScript && !opts.noBench) {
+            script = await benchScriptFor(char, charData, turns);
+        }
         if (!script && s.genMode === 'batch') {
             script = await withTimer(`📝 테스트 메시지 ${turns}개 한 번에 작성 중…`, generateTestBatch(turns, charData));
         }
@@ -1434,7 +1487,7 @@ async function runTest(turnsOverride, opts = {}) {
             running = false;
             updateRunState();
             handedOff = true;
-            const entry = await runEvaluation({ useChat: true, messages: run.script.length * 2 });
+            const entry = await runEvaluation({ useChat: true, messages: run.script.length * 2, twice: !!opts.verify });
             if (entry) {
                 const cd2 = await loadCharData(char);
                 const r = arr(cd2.runs).find(x => x.id === run.id);
@@ -1657,7 +1710,7 @@ async function requestJsonOnce({ system, prompt, profileId = '', maxTokens = 400
 }
 
 
-async function runEvaluation({ useChat = true, messages = 0 } = {}) {
+async function runEvaluation({ useChat = true, messages = 0, twice = false } = {}) {
     await flushCardSaves();
     if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
     const char = getCurrentCharacter();
@@ -1733,6 +1786,13 @@ async function runEvaluation({ useChat = true, messages = 0 } = {}) {
                 const sheetPrompt = prompt.replace('Now output the JSON evaluation.', `[CRITERIA SHEET — grade every item, nothing else]\n${criteriaPromptBlock(items)}\n\nNow output the JSON.`);
                 const raw = await requestJsonComplete({ system: withCustom(criteriaEvalSystem(charData, { useChat, loreRef }), 'eval'), prompt: sheetPrompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: '📋 기준표로 채점 중…' });
                 result = criteriaToResult(items, raw);
+                if (twice || s.evalTwice) {
+                    // the same transcript graded twice can differ: merge both so one harsh pass doesn't decide
+                    try {
+                        const raw2 = await requestJsonComplete({ system: withCustom(criteriaEvalSystem(charData, { useChat, loreRef }), 'eval'), prompt: sheetPrompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: '📋 한 번 더 채점 중 (점수 흔들림 줄이기)…' });
+                        result = criteriaToResult(items, mergeCritAnswers(raw, raw2));
+                    } catch (e2) { if (e2.message === '중단됨') throw e2; console.warn(LOG, 'second grading failed, keeping the first', e2); }
+                }
                 // nothing graded = the AI ignored the sheet; a 0% result here would only mislead
                 if (!result.criteria.some(r => r.verdict !== 'na')) throw new Error('AI가 기준표 항목을 하나도 채점하지 않았어요. 다시 평가하거나, 설정 탭에서 평가용 연결을 다른 모델로 바꿔 주세요.');
             } else {
@@ -1750,6 +1810,9 @@ async function runEvaluation({ useChat = true, messages = 0 } = {}) {
             time: Date.now(),
             mode: useChat ? 'chat' : 'card',
             chatId: ctx().getCurrentChatId?.() ?? '',
+            scriptKey: useChat ? hashText(evalUserLines(Math.max(Number(messages) || 0, Number(s.evalMessages) || 20)).join('\n')) : '',
+            sheet: result.sheet || (s.evalMode === 'classic' ? 'classic' : ''),
+            cardHash: cardHashNow(char),
             result,
             nsfwUsed,
             nsfwConfidence: nsfwUsed ? (charData.nsfwProfile.result.confidence || null) : null,
@@ -1758,7 +1821,7 @@ async function runEvaluation({ useChat = true, messages = 0 } = {}) {
         };
         charData.history = [entry, ...arr(charData.history)].slice(0, 20);
         await saveCharData(char, charData);
-        renderResult(entry, charData.history[1]);
+        renderResult(entry, ...comparablePrev(charData.history, entry));
         renderHistory(charData.history);
         switchTab('result');
         setMinimized(false);
@@ -1850,6 +1913,29 @@ function ringHtml(score, size = 'lg') {
         </svg>
         <div class="bt-ring-val">${score}<span>%</span></div>
     </div>`;
+}
+
+/** The user messages of the chat part that gets evaluated (same slice as collectChatLog). */
+function evalUserLines(n) {
+    return arr(ctx().chat).filter(m => !m.is_system && typeof m.mes === 'string').slice(-n).filter(m => m.is_user).map(m => m.mes.replace(/\s+/g, ' ').trim());
+}
+
+/**
+ * The latest earlier result that was measured the same way (same mode, sheet and test messages).
+ * Returns [prevEntry, note] — note says why there is nothing to compare with.
+ */
+function comparablePrev(history, entry) {
+    const list = arr(history).filter(h => h !== entry && h.time < entry.time);
+    if (!list.length) return [null, ''];
+    const sheetOf = (h) => h.sheet || h.result?.sheet || (h.result?.criteria ? '?' : 'classic');
+    const same = (h) => h.mode === entry.mode && sheetOf(h) === sheetOf(entry) && (entry.mode !== 'chat' || (h.scriptKey && h.scriptKey === entry.scriptKey));
+    const prev = list.find(same);
+    if (prev) return [prev, ''];
+    const last = list.find(h => h.mode === entry.mode) || list[0]; // explain against the closest kind of result
+    const why = last.mode !== entry.mode ? '평가 방식(채팅 평가 / 카드만 평가)이 달라서'
+        : sheetOf(last) !== sheetOf(entry) ? '평가 기준표가 바뀌어서'
+            : '테스트 대화가 달라서';
+    return [null, `지난 결과와 ${why} 점수를 비교하지 않았어요. 같은 대화로 비교하려면 테스트 탭의 “같은 대본으로 테스트”를 켜 두세요.`];
 }
 
 function deltaHtml(now, before) {
@@ -1995,11 +2081,13 @@ ${legacyCardHtml()}
         <div class="bt-switches">
           ${toggle('newchat', '새 채팅에서 테스트', '기존 채팅은 건드리지 않아요 (추천)')}
           ${toggle('autoeval', '끝나면 바로 평가')}
+          ${toggle('benchscript', '같은 대본으로 테스트 (점수 비교용)', '고치기 전후를 같은 대화로 재서, 점수 변화가 진짜 카드 때문인지 알 수 있어요 (추천)')}
         </div>
         <div class="bt-actions">
           <button type="button" id="bt_run" class="bt-btn bt-btn-primary bt-btn-wide">${ico('play')}<span>테스트 시작</span></button>
           <button type="button" id="bt_stop" class="bt-btn bt-btn-danger" style="display:none">${ico('stop')}<span>중단</span></button>
         </div>
+        <p class="bt-note bt-bench-note" id="bt_bench_note"></p>
         <p class="bt-note bt-testprompt-note" id="bt_testprompt_note"></p>
       </section>
 
@@ -2087,6 +2175,7 @@ ${doctorPageHtml()}
             <option value="criteria">평가 기준표로 채점 (추천 · 통과/부분/실패)</option>
             <option value="classic">예전 방식 (0~100점 느낌으로)</option>
           </select>`, '기준표는 원작 탭에서 고쳐요')}
+        <div class="bt-switches">${toggle('evaltwice', '두 번 채점해서 합치기', '같은 대화라도 채점이 흔들려요. 두 번 채점하면 더 믿을 만하지만 평가 시간·비용이 두 배예요. 수정 검증은 항상 두 번 채점해요.')}</div>
         ${field('고칠 문장 언어', `<select id="bt_pastelang" class="bt-input">
             <option value="card">카드와 같은 언어 (추천)</option>
             <option value="ko">한국어</option>
@@ -2301,6 +2390,9 @@ function bindPanel() {
     bindText('language', 'language');
     bindCheck('newchat', 'newChat');
     bindCheck('autoeval', 'autoEvalAfterTest');
+    bindCheck('benchscript', 'benchScript');
+    bindCheck('evaltwice', 'evalTwice');
+    $id('benchscript')?.addEventListener('change', async () => { const ch = getCurrentCharacter(); renderBenchNote(ch ? await loadCharData(ch) : null); });
     bindCheck('lorebook', 'includeLorebook');
     bindCheck('loreref', 'loreAsReference');
     bindCheck('pastelines', 'pasteKeepLines');
@@ -2799,6 +2891,7 @@ async function refreshPanelForChar() {
     renderVoiceForChar(await loadVoiceData(char));
     renderDoctorForChar(data);
     renderAbPanel(data);
+    renderBenchNote(data);
     renderAbCompare(data);
     renderApplyLog(data);
     dietResults = {};
@@ -2806,7 +2899,7 @@ async function refreshPanelForChar() {
     if ($id('ref_undo')) $id('ref_undo').style.display = data.refBackup ? '' : 'none';
     const dp = document.querySelector('#bt_panel .bt-page[data-page="doctor"]');
     if (dp && dp.style.display !== 'none') refreshDietList();
-    if (data.history?.length) renderResult(data.history[0], data.history[1]);
+    if (data.history?.length) renderResult(data.history[0], ...comparablePrev(data.history, data.history[0]));
     else $id('result').innerHTML = resultEmptyHtml();
     setStatus(char ? '' : '캐릭터와 1:1 채팅을 열면 사용할 수 있어요.');
     fillBuildUI();
@@ -2905,8 +2998,11 @@ function suggestionHtml(sg, i, copyCls, applyCls = '') {
     </article>`;
 }
 
-function renderResult(entry, prevEntry) {
+function renderResult(entry, prevEntry, cmpNote = '') {
     const r = entry.result || {};
+    const judged = Array.isArray(r.criteria) ? r.criteria.filter(x => x.verdict !== 'na').length : 0;
+    const judgeNote = Array.isArray(r.criteria) ? `<p class="bt-note bt-cmp-note">${ico('list-check')} 채점된 기준 ${judged}/${r.criteria.length}개${judged < r.criteria.length ? ' — 대화에서 확인할 기회가 없던 기준은 점수에서 빠져요' : ''}${prevEntry ? ` · ${new Date(prevEntry.time).toLocaleString()} 결과와 같은 조건으로 비교` : ''}</p>` : '';
+    const cmpHtml = cmpNote ? `<p class="bt-note bt-cmp-note bt-cmp-warn">${ico('scale-unbalanced')} ${escapeHtml(cmpNote)}</p>` : '';
     const overall = Math.max(0, Math.min(100, Number(r.overall) || 0));
     const hasFun = r.fun !== undefined && r.fun !== null && r.fun !== '';
     const fun = Math.max(0, Math.min(100, Number(r.fun) || 0));
@@ -2950,6 +3046,7 @@ function renderResult(entry, prevEntry) {
                 <div class="bt-hero-sub">${deltaHtml(overall, prevOverall)}<span>${escapeHtml(when)}</span></div>
             </div>
         </section>`}
+        ${cmpHtml}${judgeNote}
         ${r.summary ? `<section class="bt-card bt-summary">${ico('quote-left')}<div class="bt-prose">${prose(r.summary)}</div></section>` : ''}
         ${entry.nsfwUsed ? `<section class="bt-card bt-nsfw-eval-info">
             <div class="bt-nsfw-eval-head">${ico('sparkles')}<span>NSFW 프로필 반영</span></div>
@@ -3045,17 +3142,20 @@ function renderHistory(history) {
     const el = $id('history');
     if (!el) return;
     if (!history.length) { el.innerHTML = `<p class="bt-note">기록이 없어요.</p>`; return; }
-    el.innerHTML = history.map((h, i) => {
+    // results measured with the same test messages get the same 대본 number — only those compare fairly
+    const keys = [...new Set([...history].reverse().filter(h => h.mode === 'chat' && h.scriptKey).map(h => h.scriptKey))];
+    el.innerHTML = `<p class="bt-note">같은 <b>대본</b> 번호끼리만 점수를 비교할 수 있어요. 대화가 다르면 같은 카드도 점수가 10점 넘게 흔들려요.</p>` + history.map((h, i) => {
         const sc = Number(h.result?.overall) || 0;
+        const k = h.mode === 'chat' && h.scriptKey ? keys.indexOf(h.scriptKey) + 1 : 0;
         return `<button type="button" class="bt-hist-item" data-idx="${i}">
             <span class="bt-hist-score" style="color:${scoreColor(sc)}">${sc}<small>%</small></span>
             <span class="bt-hist-date">${escapeHtml(new Date(h.time).toLocaleString())}</span>
-            <span class="bt-tag bt-tag-ghost">${h.mode === 'card' ? '카드' : '대화'}</span>
+            <span class="bt-tag bt-tag-ghost">${h.mode === 'card' ? '카드' : k ? `대본 ${k}` : '대화'}</span>
         </button>`;
     }).join('');
     el.querySelectorAll('.bt-hist-item').forEach(item => item.addEventListener('click', () => {
         const i = Number(item.dataset.idx);
-        renderResult(history[i], history[i + 1]);
+        renderResult(history[i], ...comparablePrev(history, history[i]));
         scrollPanelTo($id('result'));
     }));
 }
@@ -5244,6 +5344,25 @@ function criteriaEvalSystem(charData, { useChat, loreRef }) {
     ].filter(Boolean).join('\n');
 }
 
+/** Merges two gradings of the same transcript: pass+partial→pass, pass+fail→partial, partial+fail→partial, na is ignored. */
+function mergeCritAnswers(a, b) {
+    const list = (d) => Object.fromEntries(arr(d?.criteria).filter(c => c && c.id).map(c => [String(c.id), c]));
+    const A = list(a); const B = list(b);
+    const val = (c) => CRIT_VERDICT[c?.verdict]?.v;
+    const ids = [...new Set([...Object.keys(A), ...Object.keys(B)])];
+    const criteria = ids.map(id => {
+        const x = A[id]; const y = B[id];
+        const vs = [val(x), val(y)].filter(v => v !== null && v !== undefined);
+        if (!vs.length) return x || y;
+        const m = vs.reduce((t, v) => t + v, 0) / vs.length;
+        const verdict = m >= 0.75 ? 'pass' : m >= 0.25 ? 'partial' : 'fail';
+        const base = (val(x) !== null && val(x) !== undefined ? x : y) || {};
+        const failing = [x, y].find(c => c && (c.verdict === 'fail' || c.verdict === 'partial')) || base;
+        return { ...base, verdict, ...(verdict !== 'pass' ? { cause: failing.cause || base.cause, fix_where: failing.fix_where || base.fix_where, fix_paste: failing.fix_paste || base.fix_paste, fix_note: failing.fix_note || base.fix_note } : {}) };
+    });
+    return { ...a, criteria, top_fixes: arr(a?.top_fixes).length ? a.top_fixes : b?.top_fixes, strengths: arr(a?.strengths).length ? a.strengths : arr(b?.strengths) };
+}
+
 /** Turns the checklist verdicts into the result shape the rest of the extension uses. */
 function criteriaToResult(items, data) {
     const byId = Object.fromEntries((Array.isArray(data?.criteria) ? data.criteria : []).map(c => [String(c?.id || ''), c]));
@@ -5944,8 +6063,10 @@ function critRunDiff(aEval, bEvals, cd) {
         if (a === null || a === undefined) continue;
         const bs = bEvals.map(b => val(b.crit[id])).filter(x => x !== null && x !== undefined);
         if (!bs.length) continue;
-        if (bs.some(b => b < a)) down.push({ id, text: name(id), weight: weight(id) });
-        else if (bs.every(b => b > a)) up.push({ id, text: name(id), weight: weight(id) });
+        // symmetric: one unlucky run must not count as "broken" (that reverted good fixes)
+        const mean = bs.reduce((t, x) => t + x, 0) / bs.length;
+        if (mean < a - 0.3) down.push({ id, text: name(id), weight: weight(id) });
+        else if (mean > a + 0.3) up.push({ id, text: name(id), weight: weight(id) });
     }
     return { up, down };
 }
@@ -6160,8 +6281,12 @@ async function verifyApply(itemId) {
         const cdNow = await loadCharData(char);
         const cdiff = critRunDiff(aRuns[0].eval, bRuns.map(r => r.eval), cdNow);
         const keyBroke = !!cdiff?.down.some(x => x.weight >= 3); // a ★★★ rule that passed before now fails
-        const verdict = delta <= -3 || keyBroke || (funDelta !== null && funDelta <= -5) ? 'worse'
-            : (delta >= 3 || (cdiff && cdiff.up.length && !cdiff.down.length)) && (funDelta === null || funDelta > -3) ? 'better' : 'same';
+        // a single A run is noisy: ask for a bigger gap, and for every B run to agree on the direction
+        const margin = aRuns.length >= 2 ? 4 : 6;
+        const bScores = bRuns.map(r => Number(r.eval.overall) || 0);
+        const allBelow = bScores.every(x => x < scoreA); const allAbove = bScores.every(x => x > scoreA);
+        const verdict = (delta <= -margin && allBelow) || keyBroke || (funDelta !== null && funDelta <= -8) ? 'worse'
+            : ((delta >= margin && allAbove) || (cdiff && cdiff.up.length && !cdiff.down.length)) && (funDelta === null || funDelta > -4) ? 'better' : 'same';
         const keep = verdict === 'better' || (verdict === 'same' && s.verifyRule === 'lenient');
         const record = { a: Math.round(scoreA), b: bRuns.map(r => Math.round(Number(r.eval.overall) || 0)), funA: funA === null ? null : Math.round(funA), funB: funB === null ? null : Math.round(funB), delta, funDelta, verdict, aRunId: aRuns[0].id, bRunIds: bRuns.map(r => r.id), critUp: cdiff?.up.map(x => x.text) || [], critDown: cdiff?.down.map(x => x.text) || [], keyBroke };
         if (!keep) { await undoApply(itemId, { quiet: true }); await flushCardSaves(); }
@@ -6723,6 +6848,8 @@ async function applyReplace(item, newText, { tag = '요약', note = '', noun = '
     const c = ctx();
     if (c.menuType === 'create') { toastr.warning('새 캐릭터 만들기 화면에서는 적용할 수 없어요'); return; }
     let text = newText;
+    let verify = false;
+    if (item.kind === 'field' && (verifying || running)) { toastr.warning('지금은 테스트·검증이 진행 중이에요. 끝난 뒤 적용해 주세요.'); return false; }
     if (c.callGenericPopup) {
         const wrap = document.createElement('div');
         wrap.className = 'bt-apply-dialog';
@@ -6730,11 +6857,13 @@ async function applyReplace(item, newText, { tag = '요약', note = '', noun = '
             <h3>${escapeHtml(item.label)} 바꾸기</h3>
             <p class="bt-apply-note">지금 내용을 아래 <b>${escapeHtml(nounText)}</b>(으)로 <b>바꿔요</b>. 필요하면 직접 고친 뒤 <b>적용</b>을 누르세요. 원래 내용은 백업돼서 <b>진단 → 적용 기록</b>에서 되돌릴 수 있어요.</p>
             ${note ? `<p class="bt-apply-reason">${escapeHtml(note)}</p>` : ''}
-            <label>새 내용 <textarea class="bt-apply-text" rows="16"></textarea></label>`;
+            <label>새 내용 <textarea class="bt-apply-text" rows="16"></textarea></label>
+            ${item.kind === 'field' ? `<label class="bt-apply-verify"><input type="checkbox" class="bt-apply-vcheck" ${getSettings().verifyAfterApply ? 'checked' : ''}> 적용한 뒤 같은 대본으로 전/후 테스트해서, 나빠지면 되돌리기</label>` : ''}`;
         wrap.querySelector('textarea').value = newText;
         const res = await c.callGenericPopup(wrap, c.POPUP_TYPE.CONFIRM, '', { okButton: '적용', cancelButton: '취소', wide: true, allowVerticalScrolling: true });
         if (res !== c.POPUP_RESULT.AFFIRMATIVE && res !== true && res !== 1) return false;
         text = wrap.querySelector('textarea').value;
+        verify = !!wrap.querySelector('.bt-apply-vcheck')?.checked;
     }
     try {
         if (item.kind === 'lore') {
@@ -6749,9 +6878,15 @@ async function applyReplace(item, newText, { tag = '요약', note = '', noun = '
         } else {
             const before = readField(item.field);
             if (before === null) throw new Error(editorProblem());
+            const epochBefore = (await loadCharData(char)).cardEpoch || 0;
+            const beforeHash = cardHashNow(char);
             writeField(item.field, text);
-            await logApply(char, { kind: 'field', field: item.field, label: `${item.label} (${tag})`, before, after: text });
-            await flushCardSaves();
+            const itemId = await logApply(char, { kind: 'field', field: item.field, label: `${item.label} (${tag})`, before, after: text, epochBefore, beforeHash, verify: { state: verify ? 'pending' : 'unverified' } });
+            const saved = await flushCardSaves();
+            toastr.success(`${item.label}을(를) ${nounText}(으)로 바꿨어요 (원본 백업됨)`);
+            if (verify && saved) verifyApply(itemId); // runs in the background; the strip shows progress
+            else if (verify) { await setVerifyState(char, itemId, { state: 'unverified' }); toastr.warning('저장이 확인되지 않아서 검증은 건너뛰었어요'); }
+            return true;
         }
         toastr.success(`${item.label}을(를) ${nounText}(으)로 바꿨어요 (원본 백업됨)`);
         return true;
