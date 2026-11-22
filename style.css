@@ -2016,3 +2016,80 @@
 #bt_panel .bt-jump { flex-wrap: wrap; overflow-x: visible; row-gap: 6px; }
 /* v4.1.1 — score that was never received */
 #bt_panel .bt-ring-val.bt-ring-none { color: var(--bt-faint); font-weight: 600; }
+
+/* ==========================================================================
+   v4.2 — panel that stays one size, a full-screen sheet on phones,
+   bigger text, and 중단 / 다시 요청 always in reach
+   ========================================================================== */
+
+/* PC: a fixed height, so switching tabs never makes the panel jump */
+@media (min-width: 769px) {
+    #bt_panel:not(.bt-min) {
+        width: 500px;
+        height: min(880px, calc(100vh - var(--topBarBlockSize, 40px) - 28px));
+        height: min(880px, calc(100dvh - var(--topBarBlockSize, 40px) - 28px));
+    }
+    #bt_panel > .bt-resize-b { top: auto; bottom: -3px; left: 24px; right: 24px; width: auto; height: 8px; cursor: ns-resize; }
+    #bt_panel > .bt-resize-b::after { top: 3px; left: 50%; width: 36px; height: 2px; margin: 0 0 0 -18px; }
+    #bt_panel > .bt-resize-br { top: auto; left: auto; right: -2px; bottom: -2px; width: 18px; height: 18px; cursor: nwse-resize; }
+    #bt_panel > .bt-resize-br::after { top: auto; left: auto; right: 5px; bottom: 5px; width: 8px; height: 8px; margin: 0; border-radius: 0 0 4px 0; background: none; border-right: 2px solid var(--bt-accent); border-bottom: 2px solid var(--bt-accent); }
+    #bt_panel:hover > .bt-resize-br::after { opacity: 0.55; }
+}
+
+/* readability: a step bigger, calmer line length */
+#bt_panel { font-size: 15px; line-height: 1.68; }
+#bt_panel .bt-desc { font-size: 13.5px; line-height: 1.7; }
+#bt_panel .bt-note { font-size: 13px; line-height: 1.65; }
+#bt_panel .bt-prose { font-size: 14.5px; line-height: 1.75; }
+#bt_panel .bt-list { font-size: 14px; line-height: 1.72; }
+#bt_panel .bt-switch-text { font-size: 14px; }
+#bt_panel .bt-switch-text small { font-size: 12.5px; }
+#bt_panel .bt-card-head h3 { font-size: 16px; }
+#bt_panel .bt-field > label, #bt_panel .bt-field-label { font-size: 13.5px; }
+#bt_panel .bt-input { font-size: 14.5px; }
+#bt_panel .bt-tab { font-size: 13px; }
+#bt_panel .bt-tab .fa-solid { font-size: 15px; }
+#bt_panel .bt-status { font-size: 13.5px; }
+#bt_panel .bt-card { margin-bottom: 14px; }
+
+/* footer: status on the left, controls on the right, wrapping when narrow */
+#bt_panel .bt-footer { flex-wrap: wrap; row-gap: 8px; column-gap: 8px; }
+#bt_panel .bt-footer .bt-status { flex: 1 1 200px; }
+#bt_panel .bt-footer .bt-btn-sm { flex: none; min-height: 34px; padding: 0 13px; font-size: 13px; gap: 6px; }
+#bt_panel .bt-stop-f { order: 9; }
+#bt_panel .bt-stop-h { color: var(--bt-bad); }
+#bt_panel .bt-stop-h:hover { color: var(--bt-bad); background: color-mix(in srgb, var(--bt-bad) 14%, transparent); }
+#bt_panel .bt-btn.disabled, #bt_panel .bt-iconbtn.disabled { opacity: 0.5; pointer-events: none; }
+
+/* phones: a full-screen sheet under SillyTavern's top bar — no dragging, no clipped edges */
+@media (max-width: 768px) {
+    #bt_panel#bt_panel {
+        left: 0 !important;
+        right: 0 !important;
+        top: var(--topBarBlockSize, 0px) !important;
+        bottom: 0 !important;
+        width: 100% !important;
+        max-width: 100% !important;
+        height: calc(100vh - var(--topBarBlockSize, 0px)) !important;
+        height: calc(100dvh - var(--topBarBlockSize, 0px)) !important;
+        max-height: none !important;
+        margin: 0 !important;
+        border-radius: 16px 16px 0 0;
+        border-left: 0; border-right: 0; border-bottom: 0;
+        font-size: 15.5px;
+    }
+    #bt_panel#bt_panel.bt-min { bottom: auto !important; height: auto !important; border-radius: 0 0 16px 16px; border-bottom: 1px solid var(--bt-line-strong); }
+    #bt_panel .bt-header { cursor: default; padding: 10px 8px 8px 14px; }
+    #bt_resetpos { display: none !important; }
+    #bt_panel .bt-iconbtn { width: 40px; height: 40px; font-size: 16px; }
+    #bt_panel .bt-tabs { margin: 0 10px 8px; }
+    #bt_panel .bt-tab { min-height: 54px; font-size: 12.5px; }
+    #bt_panel .bt-body { padding: 2px 12px 20px; }
+    #bt_panel .bt-card { padding: 16px 14px; }
+    #bt_panel .bt-input, #bt_panel select.bt-input, #bt_panel textarea.bt-input { font-size: 16px; } /* no iPhone zoom on focus */
+    #bt_panel .bt-btn { min-height: 46px; font-size: 15px; }
+    #bt_panel .bt-footer { padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px)); }
+    #bt_panel .bt-footer .bt-btn-sm { min-height: 42px; padding: 0 16px; font-size: 14px; }
+    #bt_panel .bt-footer .bt-status { flex: 1 1 calc(100% - 24px); max-height: 4.6em; }
+}
+#bt_panel .bt-field-hint, #bt_panel .bt-field-meta { font-size: 12px; }

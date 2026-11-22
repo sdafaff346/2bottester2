@@ -10,6 +10,15 @@ import { jsonrepair } from './lib/jsonrepair.mjs';
 
 const MODULE = 'bot_tester';
 const LOG = '[BotTester]';
+/** An AI answer's list field: always an array, never null/undefined items. */
+/** A score for status lines: "78%" or "—" when the AI gave none. */
+const pctText = (v) => (v !== null && v !== '' && Number.isFinite(Number(v)) ? `${Math.round(Number(v))}%` : '—');
+/** Error toast — but a stop the creator asked for is not an error. */
+function btError(msg, ...rest) {
+    if (/중단됨/.test(String(msg))) return toastr.info('중단했어요', '', { timeOut: 2000 });
+    return toastr.error(msg, ...rest);
+}
+const arr = (v) => (Array.isArray(v) ? v.filter(x => x !== null && x !== undefined) : []);
 const STORE_PREFIX = 'bot_tester::';
 
 const ctx = () => SillyTavern.getContext();
@@ -48,6 +57,7 @@ const defaultSettings = Object.freeze({
     accent: 'champagne',
     panelPos: null,
     panelWidth: null,        // user-resized width (desktop only)          // {x, y} in px, null = default dock
+    panelHeight: null,       // user-resized height (desktop only)
     language: '한국어',
     refMaxChars: 15000,
     evalMessages: 20,
@@ -146,7 +156,7 @@ async function saveCharData(char, data) {
         await localforage.setItem(charKey(char), data);
     } catch (e) {
         console.error(LOG, 'save failed', e);
-        toastr.error('봇 테스터: 데이터 저장 실패 (콘솔 확인)');
+        btError('봇 테스터: 데이터 저장 실패 (콘솔 확인)');
     }
 }
 
@@ -223,12 +233,18 @@ function closeDangling(t) {
 // Wiki fetching (uses ST's built-in server proxy: /api/search/visit)
 // ---------------------------------------------------------------------------
 
+const rateLimitedHosts = new Set(); // sites that answered 429 during the current lookup
+
 async function visit(url, html = true) {
+    let host = '';
+    try { host = new URL(url).host; } catch { /* keep '' */ }
+    if (host && rateLimitedHosts.has(host)) throw new Error(`페이지를 가져오지 못했어요 (HTTP 429 · ${host} 건너뜀)`);
     const res = await fetch('/api/search/visit', {
         method: 'POST',
         headers: ctx().getRequestHeaders(),
         body: JSON.stringify({ url, html }),
     });
+    if (res.status === 429 && host) rateLimitedHosts.add(host);
     if (!res.ok) throw new Error(`페이지를 가져오지 못했어요 (HTTP ${res.status})`);
     return await res.text();
 }
@@ -660,11 +676,43 @@ async function callLLMOnce(opts) {
 
 let currentReroll = null;
 
-function showRerollUI(on) {
+function showRerollUI(on, label = '다시 요청') {
     for (const id of ['reroll', 'reroll_h']) {
         const el = $id(id);
-        if (el) el.style.display = on ? '' : 'none';
+        if (!el) continue;
+        el.style.display = on ? '' : 'none';
+        const span = el.querySelector('span');
+        if (span) span.textContent = label;
+        el.title = label === '다시 요청' ? '응답이 너무 오래 걸리면 눌러서 같은 요청을 다시 보내요' : label;
     }
+}
+
+const RATE_LIMIT_RE = /\b429\b|rate.?limit|too many requests|resource.?exhausted|quota/i;
+const RATE_LIMIT_MSG = '요청 한도(429)에 걸렸어요. 1~2분 뒤 다시 하거나, 설정 탭에서 평가용 연결을 다른 모델·키로 바꿔 주세요.';
+
+/**
+ * Waits `sec` seconds with a countdown in the status line. 다시 요청 sends right away;
+ * ⏹ 중지 stops. Used when the API answers 429 (too many requests).
+ */
+function waitWithSkip(sec, text) {
+    return new Promise((resolve, reject) => {
+        let left = sec;
+        const show = () => setStatus(`${text} ${left}초 뒤에 다시 보내요 · ‘다시 요청’을 누르면 바로 보내요`);
+        const me = { trigger: () => finish() };
+        const iv = setInterval(() => {
+            if (stopRequested) { finish(new Error('중단됨')); return; }
+            left--;
+            if (left <= 0) finish(); else show();
+        }, 1000);
+        function finish(err) {
+            clearInterval(iv);
+            if (currentReroll === me) { currentReroll = null; showRerollUI(false); }
+            err ? reject(err) : resolve();
+        }
+        currentReroll = me;
+        showRerollUI(true);
+        show();
+    });
 }
 
 function requestReroll() {
@@ -681,16 +729,23 @@ async function rerollable(make, { onAbandon = null } = {}) {
     const maxAuto = Math.max(0, Number(s.autoRerollMax ?? 1));
     let autoUsed = 0;
     for (let attempt = 0; ; attempt++) {
+        if (stopRequested) throw new Error('중단됨');
         const ac = new AbortController();
         let fire;
         const rerollP = new Promise(r => { fire = r; });
+        const stop = onStop();
         const me = { trigger: (why) => fire(why) };
         currentReroll = me;
         showRerollUI(true);
         const timer = limit > 0 && autoUsed < maxAuto ? setTimeout(() => fire('auto'), limit * 1000) : null;
         try {
             const work = Promise.resolve().then(() => make(ac.signal)).then(v => ({ v }), e => ({ e }));
-            const res = await Promise.race([work, rerollP.then(why => ({ reroll: why }))]);
+            const res = await Promise.race([work, rerollP.then(why => ({ reroll: why })), stop.promise.then(() => ({ stopped: true }))]);
+            if (res.stopped) {
+                try { ac.abort(); } catch { /* ignore */ }
+                if (onAbandon) { try { await onAbandon(); } catch { /* ignore */ } }
+                throw new Error('중단됨');
+            }
             if (res.reroll) {
                 if (res.reroll === 'auto') autoUsed++;
                 try { ac.abort(); } catch { /* ignore */ }
@@ -702,6 +757,7 @@ async function rerollable(make, { onAbandon = null } = {}) {
             if (res.e) throw res.e;
             return res.v;
         } finally {
+            stop.off();
             if (timer) clearTimeout(timer);
             if (currentReroll === me) { currentReroll = null; showRerollUI(false); }
         }
@@ -741,7 +797,7 @@ async function selectPresetByName(name) {
 
 function currentProfile() {
     const cm = ctx().extensionSettings?.connectionManager;
-    return (cm?.profiles || []).find(p => p.id === cm?.selectedProfile) || null;
+    return arr(cm?.profiles).find(p => p.id === cm?.selectedProfile) || null;
 }
 
 /** Switches to the test preset/profile and returns a function that switches back (safe to call twice). */
@@ -836,7 +892,9 @@ async function callLLM({ system, prompt, profileId = '', maxTokens = 600 }) {
     let budget = Math.min(maxTokens, tokenCeiling);
     let lastErr = null;
     let emptyRetried = false;
-    for (let i = 0; i < 5; i++) {
+    let rateWaits = 0;
+    for (let i = 0; i < 8; i++) {
+        if (stopRequested) throw new Error('중단됨');
         try {
             const out = await callLLMOnce({ system, prompt, profileId, maxTokens: budget });
             const empty = !stripReasoning(String(out ?? '')).trim();
@@ -848,6 +906,7 @@ async function callLLM({ system, prompt, profileId = '', maxTokens = 600 }) {
             }
             return out;
         } catch (e) {
+            if (stopRequested || e?.message === '중단됨') throw new Error('중단됨');
             lastErr = e;
             const msg = `${e?.message || e} ${e?.status || ''}`;
             // SillyTavern itself reports an empty answer as "No message generated": ask once more, then explain it
@@ -855,6 +914,14 @@ async function callLLM({ system, prompt, profileId = '', maxTokens = 600 }) {
                 if (!emptyRetried) { emptyRetried = true; console.warn(LOG, 'empty answer (SillyTavern), asking once more'); continue; }
                 lastErr = new Error(EMPTY_ANSWER_MSG);
                 break;
+            }
+            // 429 / quota: wait a bit and send the same request again (10s → 20s → 40s)
+            if (RATE_LIMIT_RE.test(msg)) {
+                if (rateWaits >= 3) { lastErr = new Error(RATE_LIMIT_MSG); break; }
+                const sec = [10, 20, 40][rateWaits++];
+                console.warn(LOG, `rate limited (429), waiting ${sec}s`, e);
+                await waitWithSkip(sec, `⏳ 요청이 몰려서(429) 잠깐 기다려요 (${rateWaits}/3) ·`);
+                continue;
             }
             // only a budget problem is worth retrying smaller (network / auth errors fail fast)
             if (!/empty response|max.?(?:output.?)?tokens|max_completion|too (?:large|long|many)|exceed|limit|length|range|context|invalid|400|422/i.test(msg)) break;
@@ -971,7 +1038,7 @@ function sourceOrigin(cd) {
     if (kana.test(`${n.ja || ''}${n.seriesJa || ''}`)) return 'ja';
     const ref = String(cd?.refText || '').slice(0, 6000);
     if ((ref.match(/[\u3040-\u30ff]/g) || []).length > 40) return 'ja';
-    if (/fandom\.com/.test((cd?.urls || []).join(' ')) && !/dic\.pixiv|namu\.wiki/.test((cd?.urls || []).join(' '))) return 'en';
+    if (/fandom\.com/.test(arr(cd?.urls).join(' ')) && !/dic\.pixiv|namu\.wiki/.test(arr(cd?.urls).join(' '))) return 'en';
     return 'unknown';
 }
 
@@ -1075,7 +1142,7 @@ function collectCard(char) {
         const entries = char?.data?.character_book?.entries ?? [];
         const lore = entries
             .filter(e => e && e.enabled !== false && e.content)
-            .map(e => `- [${(e.keys || []).slice(0, 4).join(', ') || e.comment || 'entry'}] ${String(e.content).trim()}`)
+            .map(e => `- [${arr(e.keys).slice(0, 4).join(', ') || e.comment || 'entry'}] ${String(e.content).trim()}`)
             .join('\n');
         add('Embedded lorebook', truncate(lore, 8000));
     }
@@ -1300,7 +1367,7 @@ function lastBotReply() {
 async function runTest(turnsOverride, opts = {}) {
     if (running) { toastr.warning('이미 테스트가 진행 중이에요'); return; }
     const char = getCurrentCharacter();
-    if (!char) { toastr.error('1:1 캐릭터 채팅을 열어주세요 (그룹 채팅은 지원하지 않아요)'); return; }
+    if (!char) { btError('1:1 캐릭터 채팅을 열어주세요 (그룹 채팅은 지원하지 않아요)'); return; }
 
     const s = getSettings();
     const fixedScript = Array.isArray(opts.script) && opts.script.length ? opts.script : null;
@@ -1354,8 +1421,8 @@ async function runTest(turnsOverride, opts = {}) {
         // keep the run for A/B comparison
         const cd = await loadCharData(char);
         // keep the baseline (A) even when many verification runs pile up
-        const keepA = (cd.runs || []).find(r => r.id === cd.abBaselineId);
-        cd.runs = [run, ...(cd.runs || [])].slice(0, 12);
+        const keepA = arr(cd.runs).find(r => r.id === cd.abBaselineId);
+        cd.runs = [run, ...arr(cd.runs)].slice(0, 12);
         if (keepA && !cd.runs.includes(keepA)) cd.runs.push(keepA);
         if (!cd.abBaselineId || !cd.runs.some(r => r.id === cd.abBaselineId)) cd.abBaselineId = run.id;
         await saveCharData(char, cd);
@@ -1370,7 +1437,7 @@ async function runTest(turnsOverride, opts = {}) {
             const entry = await runEvaluation({ useChat: true, messages: run.script.length * 2 });
             if (entry) {
                 const cd2 = await loadCharData(char);
-                const r = (cd2.runs || []).find(x => x.id === run.id);
+                const r = arr(cd2.runs).find(x => x.id === run.id);
                 run.eval = { overall: entry.result.overall, fun: entry.result.fun, categories: entry.result.categories || [], summary: entry.result.summary || '', ...(entry.result.criteria ? { crit: critVerdictMap(entry.result), sheet: entry.result.sheet } : {}) };
                 if (r) {
                     r.eval = run.eval;
@@ -1378,7 +1445,7 @@ async function runTest(turnsOverride, opts = {}) {
                 }
                 renderAbPanel(cd2);
                 if (opts.role === 'B') {
-                    const a = (cd2.runs || []).find(x => x.id === cd2.abBaselineId);
+                    const a = arr(cd2.runs).find(x => x.id === cd2.abBaselineId);
                     if (a && a.id !== run.id) {
                         cd2.abLast = { a: a.id, b: run.id };
                         await saveCharData(char, cd2);
@@ -1393,7 +1460,7 @@ async function runTest(turnsOverride, opts = {}) {
     } catch (e) {
         console.error(LOG, e);
         setStatus(`❌ 오류: ${e.message}`);
-        toastr.error(`테스트 실패: ${e.message}`);
+        btError(`테스트 실패: ${e.message}`);
         return null;
     } finally {
         await restorePrompt();
@@ -1405,10 +1472,25 @@ async function runTest(turnsOverride, opts = {}) {
     }
 }
 
+const stopWaiters = new Set();
+
+/** Resolves when the creator presses 중단. Used to cut an in-flight request short. */
+function onStop() {
+    let done;
+    const p = new Promise(r => { done = r; });
+    if (stopRequested) { done(); return { promise: p, off() {} }; }
+    stopWaiters.add(done);
+    return { promise: p, off: () => stopWaiters.delete(done) };
+}
+
 function stopTest() {
+    if (!running && !verifying) return;
     stopRequested = true;
     try { ctx().stopGeneration(); } catch { /* ignore */ }
-    setStatus('⏹ 중단 요청됨…');
+    for (const w of [...stopWaiters]) { try { w(); } catch { /* ignore */ } }
+    stopWaiters.clear();
+    setStatus('⏹ 중단 요청됨… 지금 하던 요청을 멈추는 중이에요');
+    updateStopUI();
 }
 
 // ---------------------------------------------------------------------------
@@ -1422,7 +1504,7 @@ const KIND_EVAL_CATEGORIES = {
     rpg: ['규칙·판정', '수치 일관성'],
 };
 function evalCategories(kind) {
-    return [...EVAL_CATEGORIES, ...(KIND_EVAL_CATEGORIES[kind] || [])];
+    return [...EVAL_CATEGORIES, ...arr(KIND_EVAL_CATEGORIES[kind])];
 }
 
 /** Depth of unclosed {}/[] outside of strings — > 0 means the output was cut off. */
@@ -1579,7 +1661,7 @@ async function runEvaluation({ useChat = true, messages = 0 } = {}) {
     await flushCardSaves();
     if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
     const char = getCurrentCharacter();
-    if (!char) { toastr.error('1:1 캐릭터 채팅을 열어주세요'); return; }
+    if (!char) { btError('1:1 캐릭터 채팅을 열어주세요'); return; }
 
     const s = getSettings();
     const charData = await loadCharData(char);
@@ -1651,6 +1733,8 @@ async function runEvaluation({ useChat = true, messages = 0 } = {}) {
                 const sheetPrompt = prompt.replace('Now output the JSON evaluation.', `[CRITERIA SHEET — grade every item, nothing else]\n${criteriaPromptBlock(items)}\n\nNow output the JSON.`);
                 const raw = await requestJsonComplete({ system: withCustom(criteriaEvalSystem(charData, { useChat, loreRef }), 'eval'), prompt: sheetPrompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: '📋 기준표로 채점 중…' });
                 result = criteriaToResult(items, raw);
+                // nothing graded = the AI ignored the sheet; a 0% result here would only mislead
+                if (!result.criteria.some(r => r.verdict !== 'na')) throw new Error('AI가 기준표 항목을 하나도 채점하지 않았어요. 다시 평가하거나, 설정 탭에서 평가용 연결을 다른 모델로 바꿔 주세요.');
             } else {
                 result = await requestJsonComplete({ system: withCustom(system, 'eval'), prompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: '🔎 원작과 비교 평가 중…' });
             }
@@ -1672,7 +1756,7 @@ async function runEvaluation({ useChat = true, messages = 0 } = {}) {
             nsfwConfidenceNote: nsfwUsed ? (charData.nsfwProfile.result.confidence_note || null) : null,
             nsfwRequest: nsfwUsed ? (charData.nsfwRequest || null) : null,
         };
-        charData.history = [entry, ...(charData.history || [])].slice(0, 20);
+        charData.history = [entry, ...arr(charData.history)].slice(0, 20);
         await saveCharData(char, charData);
         renderResult(entry, charData.history[1]);
         renderHistory(charData.history);
@@ -1690,7 +1774,8 @@ async function runEvaluation({ useChat = true, messages = 0 } = {}) {
     } catch (e) {
         console.error(LOG, e);
         setStatus(`❌ 평가 실패: ${e.message}`);
-        toastr.error(`평가 실패: ${e.message}${e.cause ? ' / ' + (e.cause.message || e.cause) : ''}`);
+        btError(`평가 실패: ${e.message}${e.cause ? ' / ' + (e.cause.message || e.cause) : ''}`);
+        if (e.message !== '중단됨') offerRetry('다시 평가', () => runEvaluation({ useChat, messages }));
     } finally {
         running = false;
         updateRunState();
@@ -1825,6 +1910,7 @@ function buildPanel() {
     <span id="bt_hstatus" class="bt-hstatus"></span>
     <div class="bt-header-btns">
       <button type="button" id="bt_reroll_h" class="bt-iconbtn bt-icon bt-reroll-h" style="display:none" title="다시 요청 (리롤)">${ico('rotate-right')}</button>
+      <button type="button" id="bt_stop_h" class="bt-iconbtn bt-icon bt-stop-h" style="display:none" title="중단">${ico('stop')}</button>
       <button type="button" id="bt_help" class="bt-iconbtn bt-icon" title="시작 가이드 · 탭 안내">${ico('circle-question')}</button>
       <button type="button" id="bt_resetpos" class="bt-iconbtn bt-icon" title="위치 초기화">${ico('arrows-to-dot')}</button>
       <button type="button" id="bt_minimize" class="bt-iconbtn bt-icon" title="접기 / 펴기">${ico('minus')}</button>
@@ -2081,10 +2167,14 @@ ${nsfwSettingsCardHtml()}
 
   <div class="bt-resize bt-resize-l" data-edge="l" title="끌어서 폭 조절" aria-hidden="true"></div>
   <div class="bt-resize bt-resize-r" data-edge="r" title="끌어서 폭 조절" aria-hidden="true"></div>
+  <div class="bt-resize bt-resize-b" data-edge="b" title="끌어서 높이 조절" aria-hidden="true"></div>
+  <div class="bt-resize bt-resize-br" data-edge="br" title="끌어서 크기 조절" aria-hidden="true"></div>
   <footer class="bt-footer" data-state="idle">
     <span class="bt-status-dot" aria-hidden="true"></span>
     <span id="bt_status" class="bt-status">대기 중</span>
     <button type="button" id="bt_reroll" class="bt-btn bt-btn-sm bt-reroll" style="display:none" title="응답이 너무 오래 걸리면 눌러서 같은 요청을 다시 보내요">${ico('rotate-right')}<span>다시 요청</span></button>
+    <button type="button" id="bt_retry" class="bt-btn bt-btn-sm bt-retry" style="display:none">${ico('rotate-right')}<span>다시 만들기</span></button>
+    <button type="button" id="bt_stop_f" class="bt-btn bt-btn-sm bt-btn-danger bt-stop-f" style="display:none" title="지금 하는 작업을 멈춰요">${ico('stop')}<span>중단</span></button>
   </footer>
 </div>`;
     document.body.insertAdjacentHTML('beforeend', html);
@@ -2104,8 +2194,16 @@ function bindPanel() {
     $id('close').addEventListener('click', () => togglePanel(false));
     $id('minimize').addEventListener('click', () => setMinimized(!$id('panel').classList.contains('bt-min')));
     $id('resetpos').addEventListener('click', resetPanel);
+    $id('retry')?.addEventListener('click', () => { const fn = lastRetry; clearRetry(); if (fn && !running) fn(); });
     $id('help').addEventListener('click', toggleGuide);
     makeDraggable();
+    // remember which button started a job, so a failure can offer 다시 하기
+    $id('panel').addEventListener('click', (e) => {
+        if (running || verifying) return;
+        const b = e.target.closest('button');
+        if (!b || b.closest('.bt-header, .bt-tabs, .bt-footer') || b.classList.contains('disabled')) return;
+        lastJobButton = b;
+    }, true);
 
     document.querySelectorAll('#bt_panel .bt-tab').forEach(tab => {
         tab.addEventListener('click', () => switchTab(tab.dataset.tab));
@@ -2266,6 +2364,8 @@ function bindPanel() {
         runTest();
     });
     $id('stop').addEventListener('click', stopTest);
+    $id('stop_f')?.addEventListener('click', stopTest);
+    $id('stop_h')?.addEventListener('click', (e) => { e.stopPropagation(); stopTest(); });
     $id('evalchat').addEventListener('click', async () => { await saveSourceFromUI(false); runEvaluation({ useChat: true }); });
     $id('evalcard').addEventListener('click', async () => { await saveSourceFromUI(false); runEvaluation({ useChat: false }); });
 }
@@ -2365,8 +2465,26 @@ let runStartedAt = 0;
 let lastStatus = { kind: '', text: '' };
 
 /** Called from updateRunState: plays the sound when a long task finishes. */
+let lastJobButton = null; // the panel button that started the current job (for 다시 하기)
+
+/** When a job ends: never leave a "…중" progress line behind, and offer 다시 하기 after a failure. */
+function afterRunEnded() {
+    const footer = $id('status')?.closest('.bt-footer');
+    if (footer?.dataset.state === 'busy') {
+        if (stopRequested) setStatus('⏹ 중단했어요');
+        else setStatus('⚠️ 결과를 제대로 받지 못했어요. 위 내용을 확인하거나 다시 해 주세요.');
+    }
+    const failed = lastStatus.kind === 'error' || lastStatus.kind === 'warn';
+    const btn = lastJobButton;
+    if (failed && !lastRetry && btn && btn.isConnected && !stopRequested) {
+        offerRetry('다시 하기', () => { if (btn.isConnected && !btn.classList.contains('disabled')) btn.click(); });
+    }
+    if (stopRequested) { stopRequested = false; updateStopUI(); }
+}
+
 function trackRunForSound() {
     if (running && !wasRunning) { runStartedAt = Date.now(); lastStatus = { kind: '', text: '' }; stopRequested = false; getAudio(); }
+    if (!running && wasRunning && !verifying) { try { afterRunEnded(); } catch (e) { console.warn(LOG, e); } }
     if (!running && wasRunning && !verifying && Date.now() - runStartedAt > 1500 && lastStatus.kind !== 'stop') {
         notifyFinish(lastStatus.kind === 'error' || lastStatus.kind === 'warn' ? 'error' : 'ok', lastStatus.text);
     }
@@ -2380,6 +2498,7 @@ const STATUS_ICONS = [
 
 function setStatus(text) {
     let t = String(text || '');
+    if (/^(?:❌|⚠️?|⛔)?\s*[^\n]*(?:실패|오류):\s*중단됨/.test(t)) t = '⏹ 중단했어요';
     let state = running ? 'busy' : 'idle';
     for (const [re, st] of STATUS_ICONS) {
         if (re.test(t)) { t = t.replace(re, ''); state = st; break; }
@@ -2440,6 +2559,7 @@ function clampPanel() {
     const panel = $id('panel');
     if (!panel || panel.style.display === 'none') return;
     const { vw, vh } = viewportSize();
+    if (isNarrow()) { panel.style.maxHeight = ''; return; } // phone: CSS makes it a full-screen sheet
     if (panel.classList.contains('bt-floating')) {
         const r = panel.getBoundingClientRect();
         const x = Math.min(Math.max(0, r.left), Math.max(0, vw - r.width));
@@ -2457,6 +2577,9 @@ function applyPanelWidth() {
     const panel = $id('panel');
     if (!panel) return;
     const w = Number(getSettings().panelWidth);
+    const h = Number(getSettings().panelHeight);
+    if (isNarrow() || panel.classList.contains('bt-min') || !h) panel.style.height = '';
+    else panel.style.height = `${Math.max(320, Math.min(h, window.innerHeight - 16))}px`;
     if (isNarrow() || panel.classList.contains('bt-min') || !w) { panel.style.width = ''; return; }
     panel.style.width = `${Math.max(360, Math.min(w, window.innerWidth - 16))}px`;
 }
@@ -2487,6 +2610,7 @@ function makeDraggable() {
     handle.addEventListener('pointerdown', (e) => {
         if (e.button !== undefined && e.button !== 0) return;
         if (e.target.closest('.bt-icon')) return;
+        if (isNarrow()) return; // phone: the panel is a fixed full-screen sheet
         const r = panel.getBoundingClientRect();
         drag = { id: e.pointerId, dx: e.clientX - r.left, dy: e.clientY - r.top, moved: false, sx: e.clientX, sy: e.clientY };
         handle.setPointerCapture(e.pointerId);
@@ -2549,14 +2673,20 @@ function makeDraggable() {
             panel.style.left = `${r.left}px`;
             panel.style.top = `${r.top}px`;
             panel.style.width = `${r.width}px`;
-            rs = { id: e.pointerId, edge: grip.dataset.edge, x: e.clientX, left: r.left, width: r.width };
+            panel.style.maxHeight = '';
+            rs = { id: e.pointerId, edge: grip.dataset.edge, x: e.clientX, y: e.clientY, left: r.left, top: r.top, width: r.width, height: r.height };
             grip.setPointerCapture(e.pointerId);
         });
         grip.addEventListener('pointermove', (e) => {
             if (!rs || e.pointerId !== rs.id) return;
             const vw = window.innerWidth;
             const dx = e.clientX - rs.x;
-            if (rs.edge === 'r') {
+            if (rs.edge === 'b' || rs.edge === 'br') {
+                const h = Math.max(320, Math.min(rs.height + (e.clientY - rs.y), window.innerHeight - rs.top - 4));
+                panel.style.height = `${h}px`;
+                if (rs.edge === 'b') return;
+            }
+            if (rs.edge === 'r' || rs.edge === 'br') {
                 const w = Math.max(360, Math.min(rs.width + dx, vw - rs.left - 4));
                 panel.style.width = `${w}px`;
             } else {
@@ -2574,6 +2704,7 @@ function makeDraggable() {
             const r = panel.getBoundingClientRect();
             const s2 = getSettings();
             s2.panelWidth = Math.round(r.width);
+            if (panel.style.height) s2.panelHeight = Math.round(r.height);
             s2.panelPos = { x: Math.round(r.left), y: Math.round(r.top) };
             saveSettings();
             clampPanel();
@@ -2589,11 +2720,43 @@ function makeDraggable() {
     });
 }
 
+let lastRetry = null;
+
+/** After a failure, the footer offers one click to run the same job again. */
+function offerRetry(label, fn) {
+    lastRetry = fn;
+    const b = $id('retry');
+    if (!b) return;
+    b.querySelector('span').textContent = label;
+    b.title = `${label} — 방금 실패한 작업을 같은 설정으로 다시 해요`;
+    b.style.display = '';
+}
+
+function clearRetry() {
+    lastRetry = null;
+    const b = $id('retry');
+    if (b) b.style.display = 'none';
+}
+
+/** 중단 buttons (test page, footer, header) show whenever any job runs. */
+function updateStopUI() {
+    const busy = running || !!verifying;
+    for (const id of ['stop', 'stop_f', 'stop_h']) {
+        const b = $id(id);
+        if (!b) continue;
+        b.style.display = busy ? '' : 'none';
+        b.classList.toggle('disabled', busy && stopRequested);
+        const sp = b.querySelector('span');
+        if (sp) sp.textContent = busy && stopRequested ? '멈추는 중…' : '중단';
+    }
+}
+
 function updateRunState() {
     trackRunForSound();
+    if (running) clearRetry();
     const run = $id('run');
     if (!run) return;
-    $id('stop').style.display = running ? '' : 'none';
+    updateStopUI();
     for (const id of ['run', 'evalchat', 'evalcard', 'fetch', 'buildprofile', 'autonames', 'diet_run', 'ref_diet', 'anchor_grab', 'anchor_pin', 'cont_run', 'nsfw_run']) {
         $id(id)?.classList.toggle('disabled', running);
     }
@@ -2619,7 +2782,7 @@ async function refreshPanelForChar() {
     const data = await loadCharData(char);
     resolveCharWorld(char).catch(() => {});
     renderBotKindUI(data);
-    $id('urls').value = (data.urls || []).join('\n');
+    $id('urls').value = arr(data.urls).join('\n');
     $id('reftext').value = data.refText || '';
     $id('authornote').value = data.authorNote || '';
     $id('caehbase').value = data.caehBase || '';
@@ -2632,7 +2795,7 @@ async function refreshPanelForChar() {
     renderContPick(data);
     renderContResult(data.contLast);
     updateRefCount();
-    renderHistory(data.history || []);
+    renderHistory(arr(data.history));
     renderVoiceForChar(await loadVoiceData(char));
     renderDoctorForChar(data);
     renderAbPanel(data);
@@ -2653,7 +2816,7 @@ async function refreshPanelForChar() {
 
 async function saveSourceFromUI(notify) {
     const char = getCurrentCharacter();
-    if (!char) { if (notify) toastr.error('캐릭터 채팅을 먼저 열어주세요'); return; }
+    if (!char) { if (notify) btError('캐릭터 채팅을 먼저 열어주세요'); return; }
     const data = await loadCharData(char);
     data.urls = $id('urls').value.split('\n').map(x => x.trim()).filter(Boolean);
     data.refText = $id('reftext').value;
@@ -2673,7 +2836,7 @@ async function saveSourceFromUI(notify) {
 async function onFetchClick() {
     if (running) return;
     const char = getCurrentCharacter();
-    if (!char) { toastr.error('캐릭터 채팅을 먼저 열어주세요'); return; }
+    if (!char) { btError('캐릭터 채팅을 먼저 열어주세요'); return; }
     const urls = $id('urls').value.split('\n').map(x => x.trim()).filter(Boolean);
     if (!urls.length) { toastr.warning('링크를 넣어주세요'); return; }
 
@@ -2749,9 +2912,9 @@ function renderResult(entry, prevEntry) {
     const fun = Math.max(0, Math.min(100, Number(r.fun) || 0));
     const prevOverall = prevEntry?.result ? Number(prevEntry.result.overall) : null;
 
-    const cats = (r.categories || []).map(cat => meterHtml(escapeHtml(cat.name), cat.score, { sub: cat.comment })).join('');
+    const cats = arr(r.categories).map(cat => meterHtml(escapeHtml(cat.name), cat.score, { sub: cat.comment })).join('');
 
-    const issues = [...(r.issues || [])].sort((a, b) => (SEV_ORDER[a.severity] ?? 3) - (SEV_ORDER[b.severity] ?? 3)).map(it => `
+    const issues = [...arr(r.issues)].sort((a, b) => (SEV_ORDER[a.severity] ?? 3) - (SEV_ORDER[b.severity] ?? 3)).map(it => `
         <article class="bt-issue bt-sev-line-${SEV_ORDER[it.severity] !== undefined ? it.severity : 'low'}">
             <div class="bt-issue-head">${sevTag(it.severity)}<span class="bt-issue-cat">${escapeHtml(it.category || '')}</span></div>
             <div class="bt-prose">${prose(it.problem)}</div>
@@ -2763,7 +2926,7 @@ function renderResult(entry, prevEntry) {
         </article>`).join('');
 
     const crit = Array.isArray(r.criteria) && r.criteria.length;
-    const sugg = crit ? '' : (r.card_suggestions || []).map((sg, i) => suggestionHtml(sg, i, 'bt-copy', 'bt-res-apply')).join('');
+    const sugg = crit ? '' : arr(r.card_suggestions).map((sg, i) => suggestionHtml(sg, i, 'bt-copy', 'bt-res-apply')).join('');
     const when = new Date(entry.time).toLocaleString();
     const capA = crit ? '기준 점수' : '원작 일치도';
     const capB = crit ? '재미 기준' : '재미·몰입';
@@ -2805,10 +2968,10 @@ function renderResult(entry, prevEntry) {
     const el = $id('result');
     if (crit) bindCriteriaResult(el, r);
     el.querySelectorAll('.bt-copy').forEach(btn => btn.addEventListener('click', () => {
-        copyText((r.card_suggestions || [])[Number(btn.dataset.idx)]?.text || '');
+        copyText(arr(r.card_suggestions)[Number(btn.dataset.idx)]?.text || '');
     }));
     el.querySelectorAll('.bt-res-apply').forEach(btn => btn.addEventListener('click', () => {
-        const sg = (r.card_suggestions || [])[Number(btn.dataset.idx)];
+        const sg = arr(r.card_suggestions)[Number(btn.dataset.idx)];
         if (sg) openApplyDialog({ field: sg.field, text: sg.text || '', reason: sg.reason || '' });
     }));
     $id('copyall').addEventListener('click', () => copyText(resultToMarkdown(entry)));
@@ -2900,6 +3063,7 @@ function renderHistory(history) {
 function resetPanel() {
     getSettings().panelPos = null;
     getSettings().panelWidth = null;
+    getSettings().panelHeight = null;
     saveSettings();
     resetPageScroll();
     togglePanel(true);
@@ -3127,7 +3291,7 @@ async function searchViaStApi(engine, query) {
     });
     if (!res.ok) throw new Error(`${engine} 검색 실패 (HTTP ${res.status}) — API 키가 SillyTavern에 저장돼 있는지 확인해 주세요`);
     const data = await res.json();
-    if (engine === 'tavily') return (data.results || []).map(r => ({ title: r.title, url: r.url, snippet: r.content }));
+    if (engine === 'tavily') return arr(data.results).map(r => ({ title: r.title, url: r.url, snippet: r.content }));
     return (data.organic || data.organic_results || []).map(r => ({ title: r.title, url: r.link, snippet: r.snippet }));
 }
 
@@ -3146,7 +3310,7 @@ async function webSearch(query) {
 async function redditResearch(query) {
     const out = [];
     const json = JSON.parse(await visit(`https://www.reddit.com/search.json?q=${encodeURIComponent(query)}&limit=8&sort=relevance&t=all`, false));
-    const posts = (json?.data?.children || []).map(c => c.data).filter(Boolean);
+    const posts = arr(json?.data?.children).map(c => c.data).filter(Boolean);
     for (const p of posts) {
         if (hasShip(`${p.title} ${p.selftext}`)) continue;
         out.push({
@@ -3159,7 +3323,7 @@ async function redditResearch(query) {
     const top = [...posts].sort((a, b) => (b.num_comments || 0) - (a.num_comments || 0)).slice(0, 2);
     await Promise.allSettled(top.map(async p => {
         const thread = JSON.parse(await visit(`https://www.reddit.com${p.permalink}.json?limit=15&sort=top`, false));
-        const comments = (thread?.[1]?.data?.children || [])
+        const comments = arr(thread?.[1]?.data?.children)
             .map(c => c.data?.body).filter(b => b && !hasShip(b)).slice(0, 10)
             .map(b => '• ' + truncate(b.replace(/\s+/g, ' '), 350)).join('\n');
         if (comments) out.push({ title: `r/${p.subreddit} 댓글: ${p.title}`, url: `https://www.reddit.com${p.permalink}`, snippet: comments });
@@ -3191,11 +3355,44 @@ function buildResearchQueries(n) {
 
 async function runResearch(names) {
     const queries = buildResearchQueries(names);
-    const tasks = queries.map(({ group, query }) => webSearch(query).then(r => ({ group, query, results: r })));
+    const jobs = queries.map(({ group, query }) => () => webSearch(query).then(r => ({ group, query, results: r })));
     if (names.en) {
-        tasks.push(redditResearch(`${names.en} ${names.seriesEn}`.trim()).then(r => ({ group: 'fanon-reddit', query: 'reddit', results: r })));
+        jobs.push(() => redditResearch(`${names.en} ${names.seriesEn}`.trim()).then(r => ({ group: 'fanon-reddit', query: 'reddit', results: r })));
     }
-    const settled = await Promise.allSettled(tasks);
+    // A burst of searches makes sites answer 429 and hang. Run 3 at a time, give each 20s,
+    // skip a site after its first 429, and let the creator move on with what was found.
+    rateLimitedHosts.clear();
+    const settled = [];
+    let next = 0; let done = 0; let skipped = false;
+    let skipNow;
+    const skipP = new Promise(r => { skipNow = r; });
+    const me = { trigger: () => { skipped = true; skipNow(); } };
+    currentReroll = me;
+    showRerollUI(true, '자료 찾기 건너뛰기');
+    const show = () => setStatus(`🌐 자료 찾는 중… ${done}/${jobs.length}${rateLimitedHosts.size ? ` · 429로 건너뛴 사이트 ${rateLimitedHosts.size}곳` : ''} · ‘자료 찾기 건너뛰기’를 누르면 모은 자료로 바로 넘어가요`);
+    const timeout = (ms) => new Promise((_, rej) => setTimeout(() => rej(new Error('20초 안에 답이 없어서 건너뜀')), ms));
+    const worker = async () => {
+        while (!skipped && !stopRequested && next < jobs.length) {
+            const job = jobs[next++];
+            try {
+                const v = await Promise.race([job(), timeout(20000), skipP.then(() => null)]);
+                if (v) settled.push({ status: 'fulfilled', value: v });
+            } catch (e) {
+                settled.push({ status: 'rejected', reason: e });
+            }
+            done++;
+            show();
+        }
+    };
+    show();
+    try {
+        const stop = onStop();
+        try { await Promise.race([Promise.all([worker(), worker(), worker()]), skipP, stop.promise]); } finally { stop.off(); }
+        if (stopRequested) throw new Error('중단됨');
+    } finally {
+        if (currentReroll === me) { currentReroll = null; showRerollUI(false); }
+    }
+    const tasks = jobs;
     const blocks = [];
     const sources = [];
     const seen = new Set();
@@ -3257,7 +3454,7 @@ const SPEECH_KEYS_DOC = `{
 async function buildVoiceProfile() {
     if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
     const char = getCurrentCharacter();
-    if (!char) { toastr.error('1:1 캐릭터 채팅을 열어주세요'); return; }
+    if (!char) { btError('1:1 캐릭터 채팅을 열어주세요'); return; }
     const s = getSettings();
     const charData = await loadVoiceData(char);
     readNamesFromUI(charData);
@@ -3272,7 +3469,7 @@ async function buildVoiceProfile() {
 
         let research = { text: '', sources: [], okCount: 0, total: 0 };
         if (s.fanonSearch) {
-            research = await withTimer('🌐 자료 찾는 중…', runResearch(charData.names));
+            research = await runResearch(charData.names); // shows its own progress and skip button
         }
 
         const versions = Object.keys(VOICE_VERSIONS);
@@ -3328,7 +3525,8 @@ async function buildVoiceProfile() {
     } catch (e) {
         console.error(LOG, e);
         setStatus(`❌ 프로필 생성 실패: ${e.message}`);
-        toastr.error(`프로필 생성 실패: ${e.message}`);
+        btError(`프로필 생성 실패: ${e.message}`);
+        if (e.message !== '중단됨') offerRetry('프로필 다시 만들기', buildVoiceProfile);
     } finally {
         running = false;
         updateRunState();
@@ -3435,7 +3633,7 @@ function sanitizeProfile(p) {
     const c = p.personality?.canon;
     if (c) {
         // relationships stay (canon bonds like 선후배/라이벌) but romantic-shipping wording is removed
-        c.relationships = (c.relationships || []).filter(r => !hasShip(`${r?.name} ${r?.dynamic}`));
+        c.relationships = arr(c.relationships).filter(r => !hasShip(`${r?.name} ${r?.dynamic}`));
         c.behaviors = noShipList(c.behaviors);
     }
     if (p.notes) p.notes = stripShipping(p.notes);
@@ -3444,15 +3642,17 @@ function sanitizeProfile(p) {
 
 function sanitizeVoiceResult(r) {
     if (!r || typeof r !== 'object') return r;
+    if (r.personality !== undefined && (typeof r.personality !== 'object' || Array.isArray(r.personality))) r.personality = typeof r.personality === 'string' ? { canon_comment: r.personality } : {};
+    if (r.speech !== undefined && !Array.isArray(r.speech)) r.speech = [];
     const p = r.personality;
     if (p) {
         p.fanon_comment = stripShipping(p.fanon_comment);
         p.canon_comment = stripShipping(p.canon_comment);
-        p.ooc_moments = (p.ooc_moments || []).filter(o => !hasShip(`${o.problem} ${o.fix}`));
+        p.ooc_moments = arr(p.ooc_moments).filter(o => !hasShip(`${o.problem} ${o.fix}`));
     }
     r.summary = stripShipping(r.summary);
     r.compare_ko = stripShipping(r.compare_ko);
-    r.card_suggestions = (r.card_suggestions || []).filter(sg => !hasShip(`${sg.text} ${sg.reason}`));
+    r.card_suggestions = arr(r.card_suggestions).filter(sg => !hasShip(`${sg.text} ${sg.reason}`));
     return r;
 }
 
@@ -3489,7 +3689,7 @@ async function runVoiceCheck(setKey = 'ja_ko') {
     const set = VOICE_SETS[setKey];
     if (!set) return;
     const char = getCurrentCharacter();
-    if (!char) { toastr.error('1:1 캐릭터 채팅을 열어주세요'); return; }
+    if (!char) { btError('1:1 캐릭터 채팅을 열어주세요'); return; }
     const s = getSettings();
     let charData = await loadVoiceData(char);
     if (!charData.voiceProfile?.profile) {
@@ -3605,14 +3805,18 @@ async function runVoiceCheck(setKey = 'ja_ko') {
             card_suggestions: overview.card_suggestions || [],
         });
 
+        const hasNum = (v) => pctText(v) !== '—';
+        if (!speechResults.some(r => hasNum(r.score)) && !hasNum(result.personality?.canon_score) && !hasNum(result.personality?.fanon_score)) {
+            throw new Error('AI 답에 점수가 하나도 없어요. 다시 검증하거나, 설정 탭에서 평가용 연결을 다른 모델로 바꿔 주세요.');
+        }
         const entry = { time: Date.now(), set: setKey, versions, samples, result };
         charData.voiceResults = charData.voiceResults || {};
-        charData.voiceResults[setKey] = [entry, ...(charData.voiceResults[setKey] || [])].slice(0, 10);
+        charData.voiceResults[setKey] = [entry, ...arr(charData.voiceResults[setKey])].slice(0, 10);
         await saveVoiceData(char, charData);
         currentVoiceSet = setKey;
         renderVoiceResults(charData);
         const p = result.personality || {};
-        setStatus(`✅ ${set.label} 검증 완료 — 원작 캐해 ${p.canon_score ?? '?'}% / 2차 캐해 ${p.fanon_score ?? '?'}%`);
+        setStatus(`✅ ${set.label} 검증 완료 — 원작 캐해 ${pctText(p.canon_score)} / 2차 캐해 ${pctText(p.fanon_score)}`);
         toastr.success(`${set.label} 검증 완료`);
         setMinimized(false);
         scrollPanelTo($id('voice_result'));
@@ -3623,7 +3827,8 @@ async function runVoiceCheck(setKey = 'ja_ko') {
             setStatus('⚠️ 두 번 시도했지만 결과 형식이 깨져서 원문을 보여드려요');
         } else {
             setStatus(`❌ 검증 실패: ${e.message}`);
-            toastr.error(`검증 실패: ${e.message}`);
+            btError(`검증 실패: ${e.message}`);
+            if (e.message !== '중단됨') offerRetry('다시 검증', () => runVoiceCheck(setKey));
         }
     } finally {
         running = false;
@@ -3670,7 +3875,7 @@ function bindVoicePage() {
     $id('autonames').addEventListener('click', async () => {
         if (running) return;
         const char = getCurrentCharacter();
-        if (!char) { toastr.error('캐릭터 채팅을 먼저 열어주세요'); return; }
+        if (!char) { btError('캐릭터 채팅을 먼저 열어주세요'); return; }
         await saveSourceFromUI(false);
         const data = await loadVoiceData(char);
         running = true; updateRunState();
@@ -3775,6 +3980,8 @@ function kvRows(rows) {
 }
 
 function renderVoiceProfile(vp) {
+    const pb = $id('buildprofile')?.querySelector('span');
+    if (pb) pb.textContent = vp?.profile ? '프로필 다시 만들기' : '프로필 만들기';
     const view = $id('profile_view');
     const meta = $id('profile_meta');
     if (!view) return;
@@ -3813,7 +4020,7 @@ function renderVoiceProfile(vp) {
             ${kvRows([
                 ['가치관', c.values], ['감정 표현', c.emotional_expression],
                 ['좋아함', c.likes, 'chips'], ['싫어함', c.dislikes, 'chips'],
-                ['관계', (c.relationships || []).map(r => `${r.name} — ${r.dynamic}`), 'list'],
+                ['관계', arr(c.relationships).map(r => `${r.name} — ${r.dynamic}`), 'list'],
                 ['행동 패턴', c.behaviors, 'list'],
             ])}
         </article>
@@ -3843,7 +4050,7 @@ function renderVoiceResults(data) {
     tabs.innerHTML = Object.entries(VOICE_SETS).map(([k, v]) => {
         const last = results[k]?.[0]?.result?.personality;
         return `<button type="button" class="bt-seg-item ${k === currentVoiceSet ? 'active' : ''} ${results[k]?.length ? '' : 'empty'}" data-set="${k}">
-            <span>${v.short}</span>${last ? `<small>${Number(last.canon_score) || 0}%</small>` : ''}</button>`;
+            <span>${v.short}</span>${last ? `<small>${Number.isFinite(Number(last.canon_score)) && last.canon_score !== null && last.canon_score !== '' ? `${Number(last.canon_score)}%` : '—'}</small>` : ''}</button>`;
     }).join('');
     tabs.querySelectorAll('.bt-seg-item').forEach(t => t.addEventListener('click', () => {
         if (!results[t.dataset.set]?.length) { toastr.info('이 언어 짝은 아직 검증하지 않았어요'); return; }
@@ -3869,14 +4076,14 @@ function renderVoiceResult(entry, prev) {
     const pc = scoreOrNull(p.canon_score);
     const pf = scoreOrNull(p.fanon_score);
     // results saved before v4.1.1 could be completely empty (an empty AI answer was stored as {})
-    const hollow = pc === null && pf === null && !r.summary && !(r.speech || []).some(sp => sp && (sp.score != null || sp.style_ko || sp.comment || (sp.flagged || []).length));
+    const hollow = pc === null && pf === null && !r.summary && !arr(r.speech).some(sp => sp && (sp.score != null || sp.style_ko || sp.comment || arr(sp.flagged).length));
     const pp = prev?.result?.personality;
     const checkLabel = { first_person: '1인칭', address: '호칭', register: '격식', dialect: '사투리', tics: '말버릇' };
     const leanLabel = { canon: '원작 캐해에 가까워요', fanon: '2차 캐해에 가까워요', balanced: '원작과 2차 캐해 사이 균형', neither: '둘 다와 거리가 있어요' };
     const leanPos = { canon: 12, balanced: 50, fanon: 88, neither: 50 }[p.leaning] ?? 50;
 
     // --- fixes checklist
-    const allFixes = (r.speech || []).flatMap(sp => (sp.bot_fixes || []).map(f => ({ ...f, version: sp.version })))
+    const allFixes = arr(r.speech).flatMap(sp => arr(sp.bot_fixes).map(f => ({ ...f, version: sp.version })))
         .sort((a, b) => (PRIO_ORDER[a.priority] ?? 3) - (PRIO_ORDER[b.priority] ?? 3));
     const fixesHtml = allFixes.map((f, i) => {
         const pr = PRIO_ORDER[f.priority] !== undefined ? f.priority : 'low';
@@ -3899,11 +4106,11 @@ function renderVoiceResult(entry, prev) {
     const fixesMd = allFixes.map(f => `- [ ] (${PRIO_LABEL[f.priority] || f.priority}) [${VOICE_VERSIONS[f.version]?.label || f.version} / ${WHERE_LABEL[f.where] || f.where}] ${f.what}${f.how ? `\n  - 방법: ${f.how}` : ''}${f.paste ? `\n  - 붙여넣기: ${f.paste}` : ''}`).join('\n');
 
     // --- per-version speech cards
-    const speech = (r.speech || []).map(sp => {
+    const speech = arr(r.speech).map(sp => {
         const sc = sp.score === null || sp.score === undefined ? null : Math.max(0, Math.min(100, Number(sp.score) || 0));
         const checks = Object.entries(sp.checks || {}).map(([k, v]) =>
             `<span class="bt-check bt-check-${v === 'ok' ? 'ok' : v === 'bad' ? 'bad' : 'na'}">${ico(v === 'ok' ? 'check' : v === 'bad' ? 'xmark' : 'minus')}${escapeHtml(checkLabel[k] || k)}</span>`).join('');
-        const flags = (sp.flagged || []).map(f => `
+        const flags = arr(sp.flagged).map(f => `
             <div class="bt-flag">
                 <blockquote class="bt-quote">${escapeHtml(f.line)}</blockquote>
                 <dl class="bt-dl">
@@ -3925,7 +4132,7 @@ function renderVoiceResult(entry, prev) {
         </article>`;
     }).join('');
 
-    const ooc = (p.ooc_moments || []).map(o => `
+    const ooc = arr(p.ooc_moments).map(o => `
         <div class="bt-flag">
             <blockquote class="bt-quote">${escapeHtml(o.line)}</blockquote>
             <dl class="bt-dl">
@@ -3934,7 +4141,7 @@ function renderVoiceResult(entry, prev) {
             </dl>
         </div>`).join('');
 
-    const sugg = (r.card_suggestions || []).map((sg, i) => suggestionHtml(sg, i, 'bt-vcopy', 'bt-vapply')).join('');
+    const sugg = arr(r.card_suggestions).map((sg, i) => suggestionHtml(sg, i, 'bt-vcopy', 'bt-vapply')).join('');
     const samples = Object.entries(entry.samples || {}).map(([v, t]) =>
         `<dt>${codeTag(v)}</dt><dd><pre class="bt-paste">${escapeHtml(t)}</pre></dd>`).join('');
 
@@ -3972,7 +4179,7 @@ function renderVoiceResult(entry, prev) {
             ${cardHead('Personality', '성격')}
             <div class="bt-meters">
                 ${meterHtml('원작 캐해 일치도', pc, { sub: p.canon_comment, delta: deltaHtml(pc, pp?.canon_score) })}
-                ${meterHtml(`2차 캐해 일치도 <small class="bt-muted">${escapeHtml((set.fanon || []).map(k => FANON_LANGS[k]).join(', '))}</small>`, pf, { sub: p.fanon_comment, delta: deltaHtml(pf, pp?.fanon_score) })}
+                ${meterHtml(`2차 캐해 일치도 <small class="bt-muted">${escapeHtml(arr(set.fanon).map(k => FANON_LANGS[k]).join(', '))}</small>`, pf, { sub: p.fanon_comment, delta: deltaHtml(pf, pp?.fanon_score) })}
             </div>
             <div class="bt-lean">
                 <div class="bt-lean-labels"><span>원작</span><span>2차</span></div>
@@ -3986,7 +4193,7 @@ function renderVoiceResult(entry, prev) {
         ${samples ? `<details class="bt-disclosure"><summary><span>생성된 샘플 대사</span>${ico('chevron-down')}</summary><dl class="bt-dl bt-dl-wide">${samples}</dl></details>` : ''}`;
 
     el.querySelectorAll('.bt-vcopy').forEach(btn => btn.addEventListener('click', () => {
-        copyText((r.card_suggestions || [])[Number(btn.dataset.idx)]?.text || '');
+        copyText(arr(r.card_suggestions)[Number(btn.dataset.idx)]?.text || '');
     }));
     el.querySelectorAll('.bt-fixcopy').forEach(btn => btn.addEventListener('click', () => {
         copyText(allFixes[Number(btn.dataset.idx)]?.paste || '');
@@ -3996,7 +4203,7 @@ function renderVoiceResult(entry, prev) {
         if (f) openApplyDialog({ field: f.where, text: f.paste || '', reason: f.what || '' });
     }));
     el.querySelectorAll('.bt-vapply').forEach(btn => btn.addEventListener('click', () => {
-        const sg = (r.card_suggestions || [])[Number(btn.dataset.idx)];
+        const sg = arr(r.card_suggestions)[Number(btn.dataset.idx)];
         if (sg) openApplyDialog({ field: sg.field, text: sg.text || '', reason: sg.reason || '' });
     }));
     el.querySelector('#bt_fixcopyall')?.addEventListener('click', () => copyText(`# ${set.label || ''} 말투 수정 체크리스트\n${fixesMd}`));
@@ -4113,8 +4320,8 @@ async function getLoreEntries(char) {
             const data = await loadWorld(worldName);
             for (const e of Object.values(data?.entries || {})) {
                 out.push({
-                    name: e.comment || (e.key || []).slice(0, 3).join(', ') || `#${e.uid}`,
-                    keys: (e.key || []).map(String).filter(Boolean),
+                    name: e.comment || arr(e.key).slice(0, 3).join(', ') || `#${e.uid}`,
+                    keys: arr(e.key).map(String).filter(Boolean),
                     content: String(e.content || ''),
                     constant: !!e.constant,
                     enabled: !e.disable,
@@ -4126,8 +4333,8 @@ async function getLoreEntries(char) {
     if (!out.length) {
         for (const e of char?.data?.character_book?.entries || []) {
             out.push({
-                name: e.comment || e.name || (e.keys || []).slice(0, 3).join(', ') || '항목',
-                keys: (e.keys || []).map(String).filter(Boolean),
+                name: e.comment || e.name || arr(e.keys).slice(0, 3).join(', ') || '항목',
+                keys: arr(e.keys).map(String).filter(Boolean),
                 content: String(e.content || ''),
                 constant: !!e.constant,
                 enabled: e.enabled !== false,
@@ -4320,7 +4527,7 @@ const MODEL_HEURISTICS = [
 async function runCardDoctor() {
     if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
     const char = getCurrentCharacter();
-    if (!char) { toastr.error('1:1 캐릭터 채팅을 열어주세요'); return; }
+    if (!char) { btError('1:1 캐릭터 채팅을 열어주세요'); return; }
     const s = getSettings();
     running = true;
     updateRunState();
@@ -4361,14 +4568,14 @@ async function runCardDoctor() {
         cd.doctor = { ...(cd.doctor || {}), card: { time: Date.now(), result, permanent: stats.permanent } };
         await saveCharData(char, cd);
         renderDoctorCard(cd.doctor.card);
-        setStatus(`✅ 카드 진단 완료 — 롤플 적합도 ${result.overall ?? '?'}%`);
+        setStatus(`✅ 카드 진단 완료 — 롤플 적합도 ${pctText(result.overall)}`);
         toastr.success('카드 진단 완료');
         setMinimized(false);
         scrollPanelTo($id('doc_card'));
     } catch (e) {
         console.error(LOG, e);
         if (e.raw) { $id('doc_card').innerHTML = `<section class="bt-card bt-card-warn">${cardHead('Format error', '결과를 표로 만들지 못했어요', '한 번 더 눌러보세요.')}<pre class="bt-paste">${escapeHtml(e.raw)}</pre></section>`; setStatus('⚠️ 결과 형식이 깨져서 원문을 보여드려요'); }
-        else { setStatus(`❌ 카드 진단 실패: ${e.message}`); toastr.error(`카드 진단 실패: ${e.message}`); }
+        else { setStatus(`❌ 카드 진단 실패: ${e.message}`); btError(`카드 진단 실패: ${e.message}`); }
     } finally {
         running = false;
         updateRunState();
@@ -4378,7 +4585,7 @@ async function runCardDoctor() {
 async function runChatDoctor() {
     if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
     const char = getCurrentCharacter();
-    if (!char) { toastr.error('1:1 캐릭터 채팅을 열어주세요'); return; }
+    if (!char) { btError('1:1 캐릭터 채팅을 열어주세요'); return; }
     const st = chatStats();
     if (!st || st.count < 3) { toastr.warning('봇 답장이 3개 이상 있어야 해요. 테스트 탭에서 자동 테스트를 먼저 돌려보세요.'); return; }
     const s = getSettings();
@@ -4415,14 +4622,14 @@ async function runChatDoctor() {
         cd.doctor = { ...(cd.doctor || {}), chat: { time: Date.now(), result, stats: st } };
         await saveCharData(char, cd);
         renderDoctorChat(cd.doctor.chat);
-        setStatus(`✅ 채팅 진단 완료 — 롤플 품질 ${result.overall ?? '?'}%`);
+        setStatus(`✅ 채팅 진단 완료 — 롤플 품질 ${pctText(result.overall)}`);
         toastr.success('채팅 진단 완료');
         setMinimized(false);
         scrollPanelTo($id('doc_chat'));
     } catch (e) {
         console.error(LOG, e);
         if (e.raw) { $id('doc_chat').innerHTML = `<section class="bt-card bt-card-warn">${cardHead('Format error', '결과를 표로 만들지 못했어요', '한 번 더 눌러보세요.')}<pre class="bt-paste">${escapeHtml(e.raw)}</pre></section>`; setStatus('⚠️ 결과 형식이 깨져서 원문을 보여드려요'); }
-        else { setStatus(`❌ 채팅 진단 실패: ${e.message}`); toastr.error(`채팅 진단 실패: ${e.message}`); }
+        else { setStatus(`❌ 채팅 진단 실패: ${e.message}`); btError(`채팅 진단 실패: ${e.message}`); }
     } finally {
         running = false;
         updateRunState();
@@ -4516,7 +4723,7 @@ function renderDoctorCard(entry) {
     const r = entry.result;
     const overall = Math.max(0, Math.min(100, Number(r.overall) || 0));
     const models = Object.keys(MODEL_FAMILIES).map(k => {
-        const m = (r.model_fit || []).find(x => String(x.model).toLowerCase().includes(k)) || {};
+        const m = arr(r.model_fit).find(x => String(x.model).toLowerCase().includes(k)) || {};
         const sc = Math.max(0, Math.min(100, Number(m.score) || 0));
         return `<article class="bt-model">
             <div class="bt-model-head"><span class="bt-model-name">${ico(MODEL_FAMILIES[k].icon)}${MODEL_FAMILIES[k].label}</span><span class="bt-vcard-score" style="color:${scoreColor(sc)}">${sc}<small>%</small></span></div>
@@ -4528,7 +4735,7 @@ function renderDoctorCard(entry) {
             </dl>
         </article>`;
     }).join('');
-    const issues = [...(r.issues || [])].sort((a, b) => (SEV_ORDER[a.severity] ?? 3) - (SEV_ORDER[b.severity] ?? 3)).map((it, i) => `
+    const issues = [...arr(r.issues)].sort((a, b) => (SEV_ORDER[a.severity] ?? 3) - (SEV_ORDER[b.severity] ?? 3)).map((it, i) => `
         <article class="bt-issue bt-sev-line-${SEV_ORDER[it.severity] !== undefined ? it.severity : 'low'}">
             <div class="bt-issue-head">${sevTag(it.severity)}<span class="bt-issue-cat">${escapeHtml(it.category || '')}</span>${it.where ? `<span class="bt-tag bt-tag-ghost">${escapeHtml(it.where)}</span>` : ''}${funBadge(it.fun_impact, it.fun_note)}${contBadge(it.continuity)}</div>
             <div class="bt-prose">${prose(it.problem)}</div>
@@ -4536,8 +4743,8 @@ function renderDoctorCard(entry) {
             ${it.fix ? `<dl class="bt-dl"><dt>수정</dt><dd class="bt-accent-text">${escapeHtml(it.fix)}</dd></dl>` : ''}
             ${it.paste ? `<div class="bt-paste-wrap"><pre class="bt-paste">${escapeHtml(it.paste)}</pre><span class="bt-paste-actions">${copyBtn('bt-doccopy', i)}${applyBtn('bt-docapply', i)}</span></div>` : ''}
         </article>`).join('');
-    const sortedIssues = [...(r.issues || [])].sort((a, b) => (SEV_ORDER[a.severity] ?? 3) - (SEV_ORDER[b.severity] ?? 3));
-    const rewrites = (r.rewrite_examples || []).map(x => `
+    const sortedIssues = [...arr(r.issues)].sort((a, b) => (SEV_ORDER[a.severity] ?? 3) - (SEV_ORDER[b.severity] ?? 3));
+    const rewrites = arr(r.rewrite_examples).map(x => `
         <article class="bt-rewrite">
             <div class="bt-rw bt-rw-before"><span>Before</span><p>${escapeHtml(x.before)}</p></div>
             <div class="bt-rw bt-rw-after"><span>After</span><p>${escapeHtml(x.after)}</p></div>
@@ -4571,11 +4778,11 @@ function renderDoctorChat(entry) {
     const r = entry.result;
     const st = entry.stats || {};
     const overall = Math.max(0, Math.min(100, Number(r.overall) || 0));
-    const sorted = [...(r.patterns || [])].sort((a, b) => (SEV_ORDER[a.severity] ?? 3) - (SEV_ORDER[b.severity] ?? 3));
+    const sorted = [...arr(r.patterns)].sort((a, b) => (SEV_ORDER[a.severity] ?? 3) - (SEV_ORDER[b.severity] ?? 3));
     const patterns = sorted.map((pt, i) => `
         <article class="bt-issue bt-sev-line-${SEV_ORDER[pt.severity] !== undefined ? pt.severity : 'low'}">
             <div class="bt-issue-head">${sevTag(pt.severity)}<span class="bt-issue-cat">${escapeHtml(pt.name || '')}</span></div>
-            ${(pt.evidence || []).map(q => `<blockquote class="bt-quote">${escapeHtml(q)}</blockquote>`).join('')}
+            ${arr(pt.evidence).map(q => `<blockquote class="bt-quote">${escapeHtml(q)}</blockquote>`).join('')}
             <dl class="bt-dl">
                 ${pt.cause ? `<dt>원인</dt><dd>${escapeHtml(pt.cause)}</dd>` : ''}
                 ${pt.fix ? `<dt>수정</dt><dd class="bt-accent-text">${escapeHtml(pt.fix)}</dd>` : ''}
@@ -4584,9 +4791,9 @@ function renderDoctorChat(entry) {
         </article>`).join('');
     const statItems = [
         ['봇 답장', `${st.count ?? '-'}개`], ['평균 길이', `${(st.avg ?? 0).toLocaleString()}자`],
-        ['질문으로 끝남', `${st.endsQuestionPct ?? 0}%`], ['반복 표현', `${(st.repeatedPhrases || []).length}개`],
+        ['질문으로 끝남', `${st.endsQuestionPct ?? 0}%`], ['반복 표현', `${arr(st.repeatedPhrases).length}개`],
     ].map(([k, v]) => `<div class="bt-stat"><span>${k}</span><b>${v}</b></div>`).join('');
-    const reps = [...(st.repeatedOpeners || []).map(([o, n]) => `"${o}…" 로 시작 ×${n}`), ...(st.repeatedPhrases || []).map(([g, n]) => `"${g}" ×${n}`)];
+    const reps = [...arr(st.repeatedOpeners).map(([o, n]) => `"${o}…" 로 시작 ×${n}`), ...arr(st.repeatedPhrases).map(([g, n]) => `"${g}" ×${n}`)];
     const cFun = r.fun === undefined || r.fun === null || r.fun === '' ? null : Math.max(0, Math.min(100, Number(r.fun) || 0));
     el.innerHTML = `
         <section class="bt-card bt-hero">
@@ -4614,7 +4821,7 @@ function renderDoctorChat(entry) {
 
 async function runDoctorLocal(silent = false) {
     const char = getCurrentCharacter();
-    if (!char) { if (!silent) toastr.error('1:1 캐릭터 채팅을 열어주세요'); return; }
+    if (!char) { if (!silent) btError('1:1 캐릭터 채팅을 열어주세요'); return; }
     try {
         const stats = await analyzeTokens(char);
         renderDoctorLocal(stats, lintCard(stats, ctx().name1));
@@ -4795,7 +5002,7 @@ async function logApply(char, item) {
     const cd = await loadCharData(char);
     const id = Date.now() * 1000 + Math.floor(Math.random() * 1000);
     cd.cardEpoch = (cd.cardEpoch || 0) + 1; // every change starts a new "card state" for A/B baselines
-    cd.applyLog = [{ id, time: Date.now(), ...item }, ...(cd.applyLog || [])].slice(0, 30);
+    cd.applyLog = [{ id, time: Date.now(), ...item }, ...arr(cd.applyLog)].slice(0, 30);
     await saveCharData(char, cd);
     renderActiveStrip();
     renderApplyLog(cd);
@@ -4850,7 +5057,7 @@ function universalCriteria(kind) {
 }
 
 function critItems(cd) {
-    return (cd?.criteria?.items || []).filter(x => x && x.on !== false && String(x.text || '').trim());
+    return arr(cd?.criteria?.items).filter(x => x && x.on !== false && String(x.text || '').trim());
 }
 
 function critHash(items) {
@@ -4902,8 +5109,8 @@ async function generateCriteria(char, cd, { silent = false } = {}) {
             pass_example: String(c.pass_example || '').trim(), fail_example: String(c.fail_example || '').trim(),
         }));
     if (!made.length) throw new Error('기준을 만들지 못했어요');
-    const keep = (cd.criteria?.items || []).filter(x => x.src === 'custom');
-    const uni = universalCriteria(kind).map(u => ({ ...u, ...(cd.criteria?.items || []).find(x => x.id === u.id && x.src === 'play') }));
+    const keep = arr(cd.criteria?.items).filter(x => x.src === 'custom');
+    const uni = universalCriteria(kind).map(u => ({ ...u, ...arr(cd.criteria?.items).find(x => x.id === u.id && x.src === 'play') }));
     cd.criteria = { items: [...made, ...uni, ...keep], time: Date.now(), kind };
     await saveCharData(char, cd);
     if (!silent) toastr.success(`평가 기준표를 만들었어요 (캐릭터 기준 ${made.length}개 + 공통 ${uni.length}개)`);
@@ -4976,7 +5183,7 @@ function bindCriteriaUI() {
     $id('crit_make')?.addEventListener('click', async () => {
         if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
         const char = getCurrentCharacter();
-        if (!char) { toastr.error('캐릭터 채팅을 먼저 열어주세요'); return; }
+        if (!char) { btError('캐릭터 채팅을 먼저 열어주세요'); return; }
         await saveSourceFromUI(false);
         const cd = await loadCharData(char);
         if (cd.criteria?.items?.some(x => x.src === 'canon') && ctx().callGenericPopup) {
@@ -4986,7 +5193,7 @@ function bindCriteriaUI() {
         }
         running = true; updateRunState();
         try { await generateCriteria(char, cd); setStatus('✅ 평가 기준표를 만들었어요'); }
-        catch (e) { console.error(LOG, e); setStatus(`❌ 기준표 만들기 실패: ${e.message}`); toastr.error(`기준표 만들기 실패: ${e.message}`); }
+        catch (e) { console.error(LOG, e); setStatus(`❌ 기준표 만들기 실패: ${e.message}`); btError(`기준표 만들기 실패: ${e.message}`); }
         finally { running = false; updateRunState(); }
     });
     $id('crit_add')?.addEventListener('click', async () => {
@@ -5071,7 +5278,7 @@ function criteriaToResult(items, data) {
 }
 
 function critVerdictMap(result) {
-    return Object.fromEntries((result?.criteria || []).map(r => [r.id, r.verdict]));
+    return Object.fromEntries(arr(result?.criteria).map(r => [r.id, r.verdict]));
 }
 
 /** Criteria whose verdict got better / worse between two results (same sheet only). */
@@ -5139,7 +5346,7 @@ function criteriaResultHtml(entry, prevEntry) {
 }
 
 function bindCriteriaResult(el, r) {
-    const byId = Object.fromEntries((r.criteria || []).map(x => [x.id, x]));
+    const byId = Object.fromEntries(arr(r.criteria).map(x => [x.id, x]));
     el.querySelectorAll('.bt-critcopy').forEach(b => b.addEventListener('click', (e) => { e.preventDefault(); copyText(byId[b.dataset.idx]?.fix_paste || ''); }));
     el.querySelectorAll('.bt-critapply').forEach(b => b.addEventListener('click', (e) => {
         e.preventDefault();
@@ -5309,7 +5516,7 @@ function renderBuildResult() {
 async function runBuild() {
     if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
     const char = getCurrentCharacter();
-    if (!char) { toastr.error('1:1 캐릭터 채팅을 열어주세요'); return; }
+    if (!char) { btError('1:1 캐릭터 채팅을 열어주세요'); return; }
     await saveSourceFromUI(false);
     const s = getSettings();
     const cd = await loadCharData(char);
@@ -5395,7 +5602,8 @@ async function runBuild() {
     } catch (e) {
         console.error(LOG, e);
         setStatus(`❌ 봇 만들기 실패: ${e.message}`);
-        toastr.error(`봇 만들기 실패: ${e.message}`);
+        if (e.message !== '중단됨') offerRetry('Description 다시 만들기', runBuild);
+        btError(`봇 만들기 실패: ${e.message}`);
     } finally {
         running = false;
         updateRunState();
@@ -5449,9 +5657,9 @@ async function renderGuide() {
     box.style.display = '';
     const char = getCurrentCharacter();
     const cd = char ? await loadCharData(char) : null;
-    const hasRef = !!(cd && (String(cd.refText || '').trim() || (cd.urls || []).length));
-    const hasRun = !!(cd && ((cd.runs || []).length || (cd.history || []).length));
-    const hasResult = !!(cd && (cd.history || []).length);
+    const hasRef = !!(cd && (String(cd.refText || '').trim() || arr(cd.urls).length));
+    const hasRun = !!(cd && (arr(cd.runs).length || arr(cd.history).length));
+    const hasResult = !!(cd && arr(cd.history).length);
     const emptyDesc = !!char && !String(cardFieldsNow(char)?.description || '').trim();
     const steps = [
         [hasRef && !emptyDesc, hasRef && emptyDesc ? 'Description 만들기' : '원작 자료 넣기',
@@ -5512,8 +5720,8 @@ const COLLAPSIBLES = [
         return d.trim() ? { text: '자료로 Description 다시 쓰기' } : { text: 'Description이 비어 있어요', tone: 'warn', open: true };
     }],
     ['bt_legacy_card', 'legacy', () => (legacyMeta()?.on ? { text: '이 채팅: 예전 캐해 들어감', tone: 'warn' } : { text: '이 채팅은 지금 카드로' })],
-    ['bt_ab_card', 'ab', (cd) => ((cd.runs || []).some(r => r.id === cd.abBaselineId) ? { text: '기준(A) 있음', tone: 'ok' } : { text: '테스트하면 자동으로 A가 돼요' })],
-    ['bt_cont_card', 'cont', (cd) => ((cd.applyLog || []).some(x => !x.undone && x.kind === 'field') ? { text: '비교할 수정 있음' } : { text: '적용한 수정이 생기면 써요' })],
+    ['bt_ab_card', 'ab', (cd) => (arr(cd.runs).some(r => r.id === cd.abBaselineId) ? { text: '기준(A) 있음', tone: 'ok' } : { text: '테스트하면 자동으로 A가 돼요' })],
+    ['bt_cont_card', 'cont', (cd) => (arr(cd.applyLog).some(x => !x.undone && x.kind === 'field') ? { text: '비교할 수정 있음' } : { text: '적용한 수정이 생기면 써요' })],
     ['bt_rescue_card', 'rescue', (cd) => {
         const n = (legacyMeta()?.on ? 1 : 0) + (chatNoteBlockRe().test(currentChatNote() || '') ? 1 : 0) + (getSettings().testRestore ? 1 : 0);
         return n ? { text: `확인할 것 ${n}개`, tone: 'warn', open: true } : { text: '이 채팅은 문제 없음', tone: 'ok' };
@@ -5522,7 +5730,7 @@ const COLLAPSIBLES = [
     ['bt_dedup_card', 'dedup', () => ({ text: '겹치는 문장 지우기' })],
     ['bt_diet_card', 'diet', () => ({ text: '매번 들어가는 토큰 줄이기' })],
     ['bt_applylog_card', 'applylog', (cd) => {
-        const act = (cd.applyLog || []).filter(x => !x.undone);
+        const act = arr(cd.applyLog).filter(x => !x.undone);
         const un = act.filter(x => x.verify && ['unverified', 'aborted'].includes(x.verify.state)).length;
         return un ? { text: `검증 안 한 수정 ${un}개`, tone: 'warn', open: true } : act.length ? { text: `적용한 수정 ${act.length}개` } : { text: '아직 없음' };
     }],
@@ -5700,12 +5908,12 @@ async function applyPreviewHtml(before, after, merged) {
 
 /** Latest change that is still waiting for a verdict (blocks stacking several unverified edits). */
 function openUnverified(cd) {
-    return (cd.applyLog || []).find(x => !x.undone && x.verify && ['unverified', 'pending', 'aborted'].includes(x.verify.state));
+    return arr(cd.applyLog).find(x => !x.undone && x.verify && ['unverified', 'pending', 'aborted'].includes(x.verify.state));
 }
 
 async function setVerifyState(char, itemId, patch) {
     const cd = await loadCharData(char);
-    const item = (cd.applyLog || []).find(x => x.id === itemId);
+    const item = arr(cd.applyLog).find(x => x.id === itemId);
     if (!item) return null;
     item.verify = { ...(item.verify || {}), ...patch, at: Date.now() };
     await saveCharData(char, cd);
@@ -5717,7 +5925,7 @@ async function setVerifyState(char, itemId, patch) {
 /** Evaluated test runs made on exactly the card this change started from. */
 function baselineRunsFor(cd, item) {
     const sheet = getSettings().evalMode === 'classic' ? null : critHash(critItems(cd));
-    return (cd.runs || []).filter(r => r.eval && r.time < item.time
+    return arr(cd.runs).filter(r => r.eval && r.time < item.time
         && (r.epoch ?? -1) === item.epochBefore
         && (!item.beforeHash || !r.cardHash || r.cardHash === item.beforeHash)
         && (!sheet || !r.eval.sheet || r.eval.sheet === sheet));
@@ -5745,7 +5953,7 @@ function critRunDiff(aEval, bEvals, cd) {
 /** Opens an editable preview; the user confirms before anything is written. */
 async function openApplyDialog({ field, text, reason = '' }) {
     const char = getCurrentCharacter();
-    if (!char) { toastr.error('캐릭터 채팅을 먼저 열어주세요'); return; }
+    if (!char) { btError('캐릭터 채팅을 먼저 열어주세요'); return; }
     const c = ctx();
     if (c.menuType === 'create') { toastr.warning('새 캐릭터 만들기 화면에서는 적용할 수 없어요'); return; }
     if (!c.callGenericPopup) { copyText(text); return; }
@@ -5797,7 +6005,7 @@ async function openApplyDialog({ field, text, reason = '' }) {
     const preview = wrap.querySelector('.bt-apply-preview');
     const vOn = wrap.querySelector('.bt-apply-verify-on');
     vOn.checked = s.verifyAfterApply !== false;
-    const baseRuns = (cd0.runs || []).filter(r => r.eval && (r.epoch ?? -1) === (cd0.cardEpoch || 0) && (!r.cardHash || r.cardHash === cardHashNow(char)));
+    const baseRuns = arr(cd0.runs).filter(r => r.eval && (r.epoch ?? -1) === (cd0.cardEpoch || 0) && (!r.cardHash || r.cardHash === cardHashNow(char)));
     const turns = baseRuns[0]?.script?.length || Math.max(1, Number(s.turns) || 5);
     const nB = Math.max(1, Math.min(4, Number(s.verifyRuns) || 2));
     wrap.querySelector('.bt-apply-verify-cost').textContent = `${baseRuns.length ? '지금 카드로 한 테스트를 기준(A)으로 쓰고, ' : '먼저 지금 카드로 기준 테스트(A)를 1번 하고, '}고친 카드로 ${turns}턴 테스트를 ${nB}번 해서 평가해요. 각각 새 채팅에서 하고, 끝나면 지금 채팅으로 돌아와요.`;
@@ -5892,7 +6100,7 @@ async function openApplyDialog({ field, text, reason = '' }) {
         else setStatus('✅ 카드에 적용했어요 — 적용 기록에서 검증할 수 있어요');
     } catch (e) {
         console.error(LOG, e);
-        toastr.error(`적용 실패: ${e.message}`);
+        btError(`적용 실패: ${e.message}`);
     }
 }
 
@@ -5912,7 +6120,7 @@ async function verifyApply(itemId) {
     const c = ctx();
     const s = getSettings();
     let cd = await loadCharData(char);
-    let item = (cd.applyLog || []).find(x => x.id === itemId);
+    let item = arr(cd.applyLog).find(x => x.id === itemId);
     if (!item || item.undone) return;
     const origChat = c.getCurrentChatId?.() || '';
     const nB = Math.max(1, Math.min(4, Number(s.verifyRuns) || 2));
@@ -5992,9 +6200,9 @@ async function showVerifyResult(char, item) {
     if (!v) return;
     const c = ctx();
     const sum = verifySummaryText(v);
-    const critLines = `${(v.critUp || []).length ? `<p class="bt-verify-crit up">통과로 바뀐 기준: ${(v.critUp || []).map(escapeHtml).join(', ')}</p>` : ''}${(v.critDown || []).length ? `<p class="bt-verify-crit down">나빠진 기준: ${(v.critDown || []).map(escapeHtml).join(', ')}</p>` : ''}`;
+    const critLines = `${arr(v.critUp).length ? `<p class="bt-verify-crit up">통과로 바뀐 기준: ${arr(v.critUp).map(escapeHtml).join(', ')}</p>` : ''}${arr(v.critDown).length ? `<p class="bt-verify-crit down">나빠진 기준: ${arr(v.critDown).map(escapeHtml).join(', ')}</p>` : ''}`;
     if (v.state === 'kept') {
-        toastr.success(`효과가 있어서 남겼어요. ${sum}${(v.critUp || []).length ? ` · 통과로 바뀐 기준: ${v.critUp.join(', ')}` : ''}`, '봇 테스터', { timeOut: 10000 });
+        toastr.success(`효과가 있어서 남겼어요. ${sum}${arr(v.critUp).length ? ` · 통과로 바뀐 기준: ${v.critUp.join(', ')}` : ''}`, '봇 테스터', { timeOut: 10000 });
         setStatus(`✅ 검증 완료: 유지 · ${sum}`);
         return;
     }
@@ -6011,7 +6219,7 @@ async function showVerifyResult(char, item) {
 /** Puts an undone change back after the creator looked at the replies themselves. */
 async function reapplyItem(char, itemId) {
     const cd = await loadCharData(char);
-    const item = (cd.applyLog || []).find(x => x.id === itemId);
+    const item = arr(cd.applyLog).find(x => x.id === itemId);
     if (!item || !item.undone) return;
     try {
         if (item.kind === 'field') { writeField(item.field, item.after ?? ''); await flushCardSaves(); }
@@ -6025,13 +6233,14 @@ async function reapplyItem(char, itemId) {
         renderActiveStrip();
         toastr.success('다시 적용했어요');
     } catch (e) {
-        toastr.error(`다시 적용 실패: ${e.message}`);
+        btError(`다시 적용 실패: ${e.message}`);
     }
 }
 
 // --- always-visible strip: everything Bot Tester is doing behind the chat ---
 
 async function renderActiveStrip() {
+    updateStopUI();
     const el = $id('active');
     if (!el) return;
     refreshCollapsibles().catch(() => {});
@@ -6045,7 +6254,7 @@ async function renderActiveStrip() {
         if (meta?.on) chips.push(['clock-rotate-left', '이 채팅: 예전 캐해 들어감', 'warn', 'rescue']);
         if (chatNoteBlockRe().test(currentChatNote() || '')) chips.push(['note-sticky', '작가 노트: 봇 테스터 블록', 'warn', 'rescue']);
         const cd = await loadCharData(char);
-        const un = (cd.applyLog || []).filter(x => !x.undone && x.verify && ['unverified', 'aborted'].includes(x.verify.state));
+        const un = arr(cd.applyLog).filter(x => !x.undone && x.verify && ['unverified', 'aborted'].includes(x.verify.state));
         if (un.length && !verifying) chips.push(['pen-to-square', `검증 안 한 수정 ${un.length}개`, 'warn', 'log']);
     }
     if (s.testRestore && !running) chips.push(['sliders', '테스트 전용 프롬이 켜진 채 남음', 'bad', 'rescue']);
@@ -6065,7 +6274,7 @@ async function undoApply(id, { quiet = false } = {}) {
     const char = getCurrentCharacter();
     if (!char) return;
     const cd = await loadCharData(char);
-    const item = (cd.applyLog || []).find(x => x.id === id);
+    const item = arr(cd.applyLog).find(x => x.id === id);
     if (!item) return;
     const c = ctx();
     try {
@@ -6078,7 +6287,7 @@ async function undoApply(id, { quiet = false } = {}) {
             const data = await loadWorld(item.world);
             const e = data?.entries?.[item.uid];
             if (!e) { say.info('그 로어북 항목은 이미 없어요'); }
-            else { e.key = [...(item.before || [])]; await saveWorld(item.world, data); try { c.reloadWorldInfoEditor?.(item.world, true); } catch { /* optional */ } say.success('로어북 키워드를 되돌렸어요'); }
+            else { e.key = [...arr(item.before)]; await saveWorld(item.world, data); try { c.reloadWorldInfoEditor?.(item.world, true); } catch { /* optional */ } say.success('로어북 키워드를 되돌렸어요'); }
         } else if (item.kind === 'lore') {
             const ok = await removeLoreEntry(item.world, item.uid);
             say[ok ? 'success' : 'info'](ok ? '추가했던 로어북 항목을 지웠어요' : '그 로어북 항목은 이미 없어요');
@@ -6100,7 +6309,7 @@ async function undoApply(id, { quiet = false } = {}) {
         if (!quiet) renderRescue();
     } catch (e) {
         if (quiet) throw e;
-        toastr.error(`되돌리기 실패: ${e.message}`);
+        btError(`되돌리기 실패: ${e.message}`);
     }
 }
 
@@ -6171,9 +6380,9 @@ function renderAbPanel(data) {
 
 async function runAbB() {
     const char = getCurrentCharacter();
-    if (!char) { toastr.error('캐릭터 채팅을 먼저 열어주세요'); return; }
+    if (!char) { btError('캐릭터 채팅을 먼저 열어주세요'); return; }
     const cd = await loadCharData(char);
-    const a = (cd.runs || []).find(r => r.id === cd.abBaselineId);
+    const a = arr(cd.runs).find(r => r.id === cd.abBaselineId);
     if (!a) { toastr.warning('기준(A) 테스트가 없어요. 먼저 테스트를 한 번 돌려주세요.'); return; }
     if (!a.eval) {
         toastr.info('A는 아직 평가 전이라, B와 함께 비교하려면 A 채팅도 평가가 필요해요. A를 새로 돌리는 걸 추천해요.');
@@ -6202,8 +6411,8 @@ function renderAbCompare(data) {
     if (!a || !b) { el.innerHTML = ''; return; }
     const sa = a.eval ? Number(a.eval.overall) || 0 : null;
     const sb = b.eval ? Number(b.eval.overall) || 0 : null;
-    const catNames = [...new Set([...(a.eval?.categories || []), ...(b.eval?.categories || [])].map(c => c.name))];
-    const catScore = (run, name) => { const c = (run.eval?.categories || []).find(x => x.name === name); return c ? Math.round(Number(c.score) || 0) : null; };
+    const catNames = [...new Set([...arr(a.eval?.categories), ...arr(b.eval?.categories)].map(c => c.name))];
+    const catScore = (run, name) => { const c = arr(run.eval?.categories).find(x => x.name === name); return c ? Math.round(Number(c.score) || 0) : null; };
     const rows = catNames.map(n => {
         const x = catScore(a, n); const y = catScore(b, n);
         const d = x !== null && y !== null ? y - x : null;
@@ -6340,7 +6549,7 @@ async function dietTargets(char) {
                 if (e.disable || !String(e.content || '').trim()) continue;
                 out.push({
                     id: `l:${e.uid}`, kind: 'lore', world: worldName, uid: e.uid,
-                    label: `로어북: ${e.comment || (e.key || []).slice(0, 3).join(', ') || `#${e.uid}`}`,
+                    label: `로어북: ${e.comment || arr(e.key).slice(0, 3).join(', ') || `#${e.uid}`}`,
                     text: String(e.content), tokens: await countTokens(String(e.content)), constant: !!e.constant,
                     cost: e.constant ? 'lorec' : 'lorek',
                 });
@@ -6547,7 +6756,7 @@ async function applyReplace(item, newText, { tag = '요약', note = '', noun = '
         toastr.success(`${item.label}을(를) ${nounText}(으)로 바꿨어요 (원본 백업됨)`);
         return true;
     } catch (e) {
-        toastr.error(`적용 실패: ${e.message}`);
+        btError(`적용 실패: ${e.message}`);
         return false;
     }
 }
@@ -6570,7 +6779,7 @@ async function applySplit(item, r) {
             const uid = await addLoreEntry(worldName, { comment: e.name, keys: e.keys, content: e.content });
             await logApply(char, { kind: 'lore', label: `로어북: ${e.name} (나누기)`, world: worldName, uid, after: e.content });
             added++;
-        } catch (err) { toastr.error(`로어북 항목 추가 실패: ${err.message}`); }
+        } catch (err) { btError(`로어북 항목 추가 실패: ${err.message}`); }
     }
     if (added) toastr.success(`키워드 로어북 항목 ${added}개를 추가했어요`);
     return true;
@@ -6778,7 +6987,7 @@ async function runDiet() {
 async function runReferenceDiet() {
     if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
     const char = getCurrentCharacter();
-    if (!char) { toastr.error('캐릭터 채팅을 먼저 열어주세요'); return; }
+    if (!char) { btError('캐릭터 채팅을 먼저 열어주세요'); return; }
     const ta = $id('reftext');
     const text = ta.value.trim();
     if (!text) { toastr.warning('원작 자료가 비어 있어요'); return; }
@@ -6786,6 +6995,7 @@ async function runReferenceDiet() {
     updateRunState();
     try {
         const r = await withTimer('✂️ 원작 자료 요약 중…', compressText({ text: truncate(text, 60000), label: '원작 자료', kind: 'reference', level: 'normal', keepExamples: true, positive: false, isReference: true }));
+        if (!String(r.compressed || '').trim() || r.after >= r.before) throw new Error('요약했더니 오히려 길어지거나 비어서, 원래 자료를 그대로 뒀어요');
         const cd = await loadCharData(char);
         cd.refBackup = ta.value; // what is on screen right now (may be unsaved edits)
         cd.refText = r.compressed;
@@ -6797,7 +7007,7 @@ async function runReferenceDiet() {
         toastr.success('원작 자료를 요약했어요. 마음에 안 들면 되돌리기를 누르세요.');
     } catch (e) {
         setStatus(`❌ 요약 실패: ${e.message}`);
-        toastr.error(`요약 실패: ${e.message}`);
+        btError(`요약 실패: ${e.message}`);
     } finally {
         running = false;
         updateRunState();
@@ -6964,7 +7174,7 @@ function renderRestyleResults() {
 async function runRestyle() {
     if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
     const char = getCurrentCharacter();
-    if (!char) { toastr.error('1:1 캐릭터 채팅을 열어주세요'); return; }
+    if (!char) { btError('1:1 캐릭터 채팅을 열어주세요'); return; }
     const src = restyleSource();
     if (!src) { toastr.warning('먼저 재미 분석에서 기준 스타일을 저장해 주세요'); return; }
     const keys = [...document.querySelectorAll('#bt_restyle_fields input:checked')].map(x => x.value);
@@ -7016,13 +7226,13 @@ const ENGINE_STRENGTH = { strong: '강함', ok: '있음', weak: '약함', missin
 async function runFunAnalysis() {
     if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
     const char = getCurrentCharacter();
-    if (!char) { toastr.error('1:1 캐릭터 채팅을 열어주세요'); return; }
+    if (!char) { btError('1:1 캐릭터 채팅을 열어주세요'); return; }
     const s = getSettings();
     running = true;
     updateRunState();
     try {
         const stats = await analyzeTokens(char);
-        const greetings = [char.first_mes || char.data?.first_mes || '', ...(char.data?.alternate_greetings || [])].filter(Boolean);
+        const greetings = [char.first_mes || char.data?.first_mes || '', ...arr(char.data?.alternate_greetings)].filter(Boolean);
         const lore = stats.lore.filter(e => e.enabled).slice(0, 30)
             .map(e => `- ${e.constant ? '[constant]' : `[keys: ${e.keys.slice(0, 4).join(', ')}]`} ${e.name}: ${truncate(e.content.replace(/\s+/g, ' '), e.constant ? 900 : 300)}`).join('\n');
         const cdDir = await loadCharData(char);
@@ -7051,17 +7261,17 @@ async function runFunAnalysis() {
         ].filter(Boolean).join('\n\n');
         const result = await requestJsonComplete({ system: withCustom(system, 'doctor'), prompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: '🎭 이 봇이 왜 재밌는지 분석 중…' });
         const cd = await loadCharData(char);
-        cd.funProfile = { time: Date.now(), result, protect: (result.protect || []).filter(p => p && p.what) };
+        cd.funProfile = { time: Date.now(), result, protect: arr(result.protect).filter(p => p && p.what) };
         await saveCharData(char, cd);
         renderFunAnalysis(cd);
-        setStatus(`✅ 재미 분석 완료 — 재미 ${result.fun ?? '?'}% · 보호 항목 ${cd.funProfile.protect.length}개 저장`);
+        setStatus(`✅ 재미 분석 완료 — 재미 ${pctText(result.fun)} · 보호 항목 ${cd.funProfile.protect.length}개 저장`);
         toastr.success('재미 분석 완료. 보호 항목은 이제 모든 제안·토큰 다이어트에서 지켜져요.');
         setMinimized(false);
         scrollPanelTo($id('doc_fun'));
     } catch (e) {
         console.error(LOG, e);
         if (e.raw) { $id('doc_fun').innerHTML = `<section class="bt-card bt-card-warn">${cardHead('Format error', '결과를 표로 만들지 못했어요', '한 번 더 눌러보세요.')}<pre class="bt-paste">${escapeHtml(e.raw)}</pre></section>`; }
-        else { setStatus(`❌ 재미 분석 실패: ${e.message}`); toastr.error(`재미 분석 실패: ${e.message}`); }
+        else { setStatus(`❌ 재미 분석 실패: ${e.message}`); btError(`재미 분석 실패: ${e.message}`); }
     } finally {
         running = false;
         updateRunState();
@@ -7077,14 +7287,14 @@ function renderFunAnalysis(data) {
     if (!r) { el.innerHTML = refSaved ? `<p class="bt-note bt-fun-ref">${ico('star')} 기준 재미 스타일이 저장돼 있어요. 모든 제안이 그 스타일을 따라요.</p>` : ''; return; }
     const fun = Math.max(0, Math.min(100, Number(r.fun) || 0));
     const order = { strong: 0, ok: 1, weak: 2, missing: 3 };
-    const engines = [...(r.engines || [])].sort((a, b) => (order[a.strength] ?? 4) - (order[b.strength] ?? 4)).map(e => `
+    const engines = [...arr(r.engines)].sort((a, b) => (order[a.strength] ?? 4) - (order[b.strength] ?? 4)).map(e => `
         <article class="bt-engine bt-engine-${escapeHtml(e.strength || 'ok')}">
             <div class="bt-issue-head"><span class="bt-tag bt-eng-${escapeHtml(e.strength || 'ok')}">${ENGINE_STRENGTH[e.strength] || e.strength || ''}</span><span class="bt-issue-cat">${escapeHtml(e.name || '')}</span></div>
             ${e.evidence ? `<blockquote class="bt-quote">${escapeHtml(e.evidence)}</blockquote>` : ''}
             ${e.why ? `<div class="bt-prose bt-muted">${prose(e.why)}</div>` : ''}
         </article>`).join('');
-    const protect = (fp.protect || []).map(p => `<li><b>${escapeHtml(p.what)}</b>${p.where ? ` <span class="bt-muted">· ${escapeHtml(p.where)}</span>` : ''}${p.quote ? `<div class="bt-quote">${escapeHtml(p.quote)}</div>` : ''}</li>`).join('');
-    const improve = (r.improve || []).map((x, i) => `
+    const protect = arr(fp.protect).map(p => `<li><b>${escapeHtml(p.what)}</b>${p.where ? ` <span class="bt-muted">· ${escapeHtml(p.where)}</span>` : ''}${p.quote ? `<div class="bt-quote">${escapeHtml(p.quote)}</div>` : ''}</li>`).join('');
+    const improve = arr(r.improve).map((x, i) => `
         <article class="bt-sugg">
             <div class="bt-sugg-head"><span class="bt-tag">${escapeHtml(FIELD_LABEL[x.where] || x.where || '')}</span>${funBadge(x.fun_impact || '+', x.fun_note)}${contBadge(x.continuity)}
                 <span class="bt-sugg-btns">${copyBtn('bt-funcopy', i)}${applyBtn('bt-funapply', i)}</span></div>
@@ -7119,7 +7329,7 @@ function renderFunAnalysis(data) {
     }));
     $id('fun_saveref')?.addEventListener('click', () => {
         getSettings().funReference = `(${getCurrentCharacter()?.name || ''} 기준)\n${r.style_summary}`;
-        getSettings().funReferenceSamples = (fp.protect || []).filter(p => p.quote).slice(0, 10).map(p => `- ${p.what}: ${p.quote}`).join('\n');
+        getSettings().funReferenceSamples = arr(fp.protect).filter(p => p.quote).slice(0, 10).map(p => `- ${p.what}: ${p.quote}`).join('\n');
         saveSettings();
         renderRestyleSource();
         toastr.success('기준 재미 스타일로 저장했어요. 이제 모든 봇의 제안이 이 스타일을 따라요.');
@@ -7161,7 +7371,7 @@ function bindCaehUI() {
 async function grabAnchor() {
     if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
     const char = getCurrentCharacter();
-    if (!char) { toastr.error('캐릭터 채팅을 먼저 열어주세요'); return; }
+    if (!char) { btError('캐릭터 채팅을 먼저 열어주세요'); return; }
     const msgs = ctx().chat.filter(m => m && !m.is_system && typeof m.mes === 'string');
     const botCount = msgs.filter(m => !m.is_user).length;
     if (botCount < 3) { toastr.warning('이 채팅에 봇 답장이 너무 적어요. 실제로 하던 채팅을 연 상태에서 눌러주세요.'); return; }
@@ -7206,7 +7416,7 @@ async function grabAnchor() {
         toastr.success('이어가는 채팅 기준을 저장했어요. 필요하면 직접 고쳐도 돼요.');
     } catch (e) {
         setStatus(`❌ 채팅 기준 가져오기 실패: ${e.message}`);
-        toastr.error(`실패: ${e.message}`);
+        btError(`실패: ${e.message}`);
     } finally {
         running = false;
         updateRunState();
@@ -7267,7 +7477,7 @@ async function pinAnchorToChatNote() {
     if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
     const c = ctx();
     const char = getCurrentCharacter();
-    if (!char || !c.chatMetadata) { toastr.error('하던 채팅을 먼저 열어주세요'); return; }
+    if (!char || !c.chatMetadata) { btError('하던 채팅을 먼저 열어주세요'); return; }
     let text = $id('anchor').value.trim();
     if (!text) {
         toastr.info('먼저 이 채팅의 캐릭터를 정리할게요');
@@ -7300,7 +7510,7 @@ async function pinAnchorToChatNote() {
     if (md.note_position === undefined) md.note_position = 1; // in chat, at depth
     try {
         await c.saveMetadata?.();
-    } catch (e) { toastr.error(`작가 노트 저장 실패: ${e.message}`); return; }
+    } catch (e) { btError(`작가 노트 저장 실패: ${e.message}`); return; }
     syncNoteUI(md);
     const tok = await countTokens(block).catch(() => 0);
     toastr.success(`이 채팅 작가 노트에 넣었어요${tok ? ` (${tok}토큰)` : ''}. 새 채팅에는 들어가지 않아요.${turnedOn ? ' 꺼져 있던 작가 노트를 매 턴으로 켰어요.' : ''}`);
@@ -7314,7 +7524,7 @@ async function unpinAnchorFromChatNote() {
     const md = c.chatMetadata;
     if (!md) return;
     md.note_prompt = String(md.note_prompt || '').replace(chatNoteBlockRe(), '\n\n').trim();
-    try { await c.saveMetadata?.(); } catch (e) { toastr.error(`작가 노트 저장 실패: ${e.message}`); return; }
+    try { await c.saveMetadata?.(); } catch (e) { btError(`작가 노트 저장 실패: ${e.message}`); return; }
     syncNoteUI(md);
     toastr.success('이 채팅 작가 노트에서 뺐어요');
     renderAnchorNote();
@@ -7337,7 +7547,7 @@ function continuityCardHtml() {
 }
 
 function contCandidates(data) {
-    return (data?.applyLog || []).filter(x => !x.undone && ['field', 'lore', 'lore-edit'].includes(x.kind)).slice(0, 10);
+    return arr(data?.applyLog).filter(x => !x.undone && ['field', 'lore', 'lore-edit'].includes(x.kind)).slice(0, 10);
 }
 
 function renderContPick(data) {
@@ -7377,12 +7587,12 @@ async function loreForVersions(char, picked, recentText) {
     const hay = recentText.toLowerCase();
     for (const e of Object.values(data?.entries || {})) {
         if (e.disable || !String(e.content || '').trim()) continue;
-        const hit = e.constant || (e.key || []).some(k => k && hay.includes(String(k).toLowerCase()));
+        const hit = e.constant || arr(e.key).some(k => k && hay.includes(String(k).toLowerCase()));
         if (!hit) continue;
         const uid = String(e.uid);
-        out.after.push(`- ${e.comment || (e.key || [])[0] || ''}: ${e.content}`);
+        out.after.push(`- ${e.comment || arr(e.key)[0] || ''}: ${e.content}`);
         if (added.has(uid)) continue;
-        out.before.push(`- ${e.comment || (e.key || [])[0] || ''}: ${uid in edited ? edited[uid] : e.content}`);
+        out.before.push(`- ${e.comment || arr(e.key)[0] || ''}: ${uid in edited ? edited[uid] : e.content}`);
     }
     return out;
 }
@@ -7409,7 +7619,7 @@ async function generateNextReply({ fields, lore, history, userName, charName, no
 async function runContinuity() {
     if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
     const char = getCurrentCharacter();
-    if (!char) { toastr.error('캐릭터 채팅을 먼저 열어주세요'); return; }
+    if (!char) { btError('캐릭터 채팅을 먼저 열어주세요'); return; }
     const cd = await loadCharData(char);
     const ids = [...document.querySelectorAll('#bt_cont_pick input:checked')].map(x => Number(x.value));
     const picked = contCandidates(cd).filter(x => ids.includes(x.id));
@@ -7495,7 +7705,7 @@ async function runContinuity() {
     } catch (e) {
         console.error(LOG, e);
         setStatus(`❌ 이어하기 비교 실패: ${e.message}`);
-        toastr.error(`이어하기 비교 실패: ${e.message}`);
+        btError(`이어하기 비교 실패: ${e.message}`);
     } finally {
         running = false;
         updateRunState();
@@ -7593,7 +7803,7 @@ async function getLinkedBooks(char) {
     try {
         const cd = await loadCharData(char);
         for (const name of cd.manualBooks || []) push(name, 'manual');
-        if ((cd.manualBooks || []).length) diag.push(`직접 추가: ${cd.manualBooks.join(', ')}`);
+        if (arr(cd.manualBooks).length) diag.push(`직접 추가: ${cd.manualBooks.join(', ')}`);
     } catch { /* ignore */ }
     const embedded = char?.data?.character_book?.entries || [];
     if (embedded.length && !primary) {
@@ -7638,9 +7848,9 @@ function entryFires(e, text, g) {
     if (e.disable) return false;
     if (e.constant) return true;
     const opt = { wholeWords: e.matchWholeWords ?? g.wholeWords, caseSensitive: e.caseSensitive ?? g.caseSensitive };
-    const primary = (e.key || []).some(k => keyMatches(k, text, opt));
+    const primary = arr(e.key).some(k => keyMatches(k, text, opt));
     if (!primary) return false;
-    const sec = (e.keysecondary || []).filter(Boolean);
+    const sec = arr(e.keysecondary).filter(Boolean);
     if (!e.selective || !sec.length) return true;
     const hits = sec.map(k => keyMatches(k, text, opt));
     switch (Number(e.selectiveLogic) || 0) {
@@ -7658,7 +7868,7 @@ async function collectLoreForCheck(char) {
     for (const b of books) {
         try {
             const list = b.kind === 'embedded'
-                ? (char?.data?.character_book?.entries || []).map((e, i) => ({
+                ? arr(char?.data?.character_book?.entries).map((e, i) => ({
                     uid: e.id ?? i, key: e.keys || [], keysecondary: e.secondary_keys || [], content: e.content || '',
                     comment: e.comment || e.name || '', constant: !!e.constant, disable: e.enabled === false,
                     selective: !!e.selective, position: e.position, order: e.insertion_order,
@@ -7669,9 +7879,9 @@ async function collectLoreForCheck(char) {
                 entries.push({
                     ...e,
                     book: b.name, bookKind: b.kind,
-                    name: e.comment || (e.key || []).slice(0, 3).join(', ') || `#${e.uid}`,
-                    key: (e.key || []).map(String).filter(x => x.trim()),
-                    keysecondary: (e.keysecondary || []).map(String).filter(x => x.trim()),
+                    name: e.comment || arr(e.key).slice(0, 3).join(', ') || `#${e.uid}`,
+                    key: arr(e.key).map(String).filter(x => x.trim()),
+                    keysecondary: arr(e.keysecondary).map(String).filter(x => x.trim()),
                     content: String(e.content || ''),
                     tokens: e.disable ? 0 : await countTokens(String(e.content || '')),
                 });
@@ -7768,7 +7978,7 @@ function isReadonlyBook(name) {
 async function runLoreCheck() {
     if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
     const char = getCurrentCharacter();
-    if (!char) { toastr.error('1:1 캐릭터 채팅을 열어주세요'); return; }
+    if (!char) { btError('1:1 캐릭터 채팅을 열어주세요'); return; }
     try {
         const wi = await worldInfoModule();
         const g = wiGlobals(wi);
@@ -7789,7 +7999,7 @@ async function runLoreCheck() {
     } catch (e) {
         console.error(LOG, e);
         setStatus(`❌ 로어북 검사 실패: ${e.message}`);
-        toastr.error(`로어북 검사 실패: ${e.message}`);
+        btError(`로어북 검사 실패: ${e.message}`);
     }
 }
 
@@ -7826,8 +8036,8 @@ async function runLoreAi() {
             'Now output the JSON.',
         ].filter(Boolean).join('\n\n');
         const r = await requestJsonComplete({ system: withCustom(system, 'doctor'), prompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: '📚 로어북 내용 점검 중…' });
-        r.issues = (r.issues || []).filter(x => x && !hasShip(`${x.problem} ${x.fix} ${x.paste}`)).map(x => ({ ...x, entry: active[Number(x.idx)] ? { book: active[Number(x.idx)].book, uid: active[Number(x.idx)].uid, name: active[Number(x.idx)].name } : null }));
-        r.missing = (r.missing || []).filter(x => x && x.content && !hasShip(`${x.name} ${x.content}`));
+        r.issues = arr(r.issues).filter(x => x && !hasShip(`${x.problem} ${x.fix} ${x.paste}`)).map(x => ({ ...x, entry: active[Number(x.idx)] ? { book: active[Number(x.idx)].book, uid: active[Number(x.idx)].uid, name: active[Number(x.idx)].name } : null }));
+        r.missing = arr(r.missing).filter(x => x && x.content && !hasShip(`${x.name} ${x.content}`));
         loreCheckCache.ai = { time: Date.now(), result: r };
         renderLoreCheck();
         setStatus(`✅ 로어북 내용 점검 완료 — ${r.score ?? '?'}점`);
@@ -7835,7 +8045,7 @@ async function runLoreAi() {
     } catch (e) {
         console.error(LOG, e);
         setStatus(`❌ 로어북 내용 점검 실패: ${e.message}`);
-        toastr.error(`로어북 내용 점검 실패: ${e.message}`);
+        btError(`로어북 내용 점검 실패: ${e.message}`);
     } finally {
         running = false;
         updateRunState();
@@ -7847,8 +8057,8 @@ async function applyLoreKeys(entryRef, addKeys) {
     const c = ctx();
     const data = await loadWorld(entryRef.book);
     const e = data?.entries?.[entryRef.uid];
-    if (!e) { toastr.error('로어북 항목을 찾지 못했어요'); return false; }
-    const before = [...(e.key || [])];
+    if (!e) { btError('로어북 항목을 찾지 못했어요'); return false; }
+    const before = [...arr(e.key)];
     const have = new Set(before.map(k => String(k).trim().toLowerCase()));
     const add = addKeys.map(k => String(k).trim()).filter(k => k && !have.has(k.toLowerCase()));
     if (!add.length) { toastr.info('이미 다 들어 있는 키워드예요'); return false; }
@@ -7878,7 +8088,7 @@ function renderLoreCheck() {
         </article>`).join('');
     const nowList = d.now.length ? `<ul class="bt-list bt-lore-now">${d.now.slice(0, 20).map(e => `<li><b>${escapeHtml(e.name)}</b> <small class="bt-muted">${e.constant ? '상시' : escapeHtml(e.key.slice(0, 3).join(', '))} · ${e.tokens}토큰</small></li>`).join('')}</ul>` : '<p class="bt-note">지금은 켜지는 항목이 없어요.</p>';
     const ai = d.ai?.result;
-    const aiIssues = (ai?.issues || []).map((x, i) => `
+    const aiIssues = arr(ai?.issues).map((x, i) => `
         <article class="bt-issue bt-sev-line-${escapeHtml(x.severity || 'low')}">
             <div class="bt-issue-head">${sevTag(x.severity)}<span class="bt-issue-cat">${escapeHtml(x.category || '')}</span>${x.entry ? `<span class="bt-tag bt-tag-ghost">${escapeHtml(x.entry.name)}</span>` : ''}${funBadge(x.fun_impact, x.fun_note)}${contBadge(x.continuity)}</div>
             <div class="bt-fixwhat">${escapeHtml(x.problem || '')}</div>
@@ -7890,18 +8100,18 @@ function renderLoreCheck() {
                 ${x.paste ? `<button type="button" class="bt-btn bt-btn-sm bt-btn-primary bt-lore-replace" data-i="${i}">${ico('file-import')}<span>내용 바꾸기</span></button>` : ''}
             </div>` : ''}
         </article>`).join('');
-    const missing = (ai?.missing || []).map((m, i) => `
+    const missing = arr(ai?.missing).map((m, i) => `
         <article class="bt-sugg">
             <div class="bt-sugg-head"><b>${escapeHtml(m.name || '새 항목')}</b><span class="bt-sugg-btns">${copyBtn('bt-lore-mcopy', i)}${applyBtn('bt-lore-madd', i)}</span></div>
             ${m.why ? `<div class="bt-prose bt-muted">${prose(m.why)}</div>` : ''}
-            <div class="bt-lore-keys">${(m.keys || []).map(k => `<span class="bt-tag">${escapeHtml(k)}</span>`).join('')}</div>
+            <div class="bt-lore-keys">${arr(m.keys).map(k => `<span class="bt-tag">${escapeHtml(k)}</span>`).join('')}</div>
             <pre class="bt-paste">${escapeHtml(m.content)}</pre>
         </article>`).join('');
     el.innerHTML = `
         <section class="bt-card">
             ${cardHead('Lorebook', '로어북 검사', `${escapeHtml(new Date(d.time).toLocaleString())}`)}
             ${d.books.length ? `<div class="bt-lore-books">${books}</div>` : ''}
-            <details class="bt-disclosure bt-disclosure-sm" ${d.books.length ? '' : 'open'}><summary><span>찾아본 곳</span>${ico('chevron-down')}</summary><ul class="bt-list bt-lore-diag">${(d.diag || []).map(x => `<li>${escapeHtml(x)}</li>`).join('')}</ul>
+            <details class="bt-disclosure bt-disclosure-sm" ${d.books.length ? '' : 'open'}><summary><span>찾아본 곳</span>${ico('chevron-down')}</summary><ul class="bt-list bt-lore-diag">${arr(d.diag).map(x => `<li>${escapeHtml(x)}</li>`).join('')}</ul>
                 <div class="bt-lore-manual">${field('검사할 로어북 직접 추가', '<select id="bt_lore_manual" class="bt-input"><option value="">불러오는 중…</option></select>', '연결이 안 잡힐 때')}
                 <div class="bt-actions"><button type="button" id="bt_lore_manual_add" class="bt-btn bt-btn-sm">${ico('plus')}<span>추가하고 다시 검사</span></button>${d.books.some(b => b.kind === 'manual') ? `<button type="button" id="bt_lore_manual_clear" class="bt-btn bt-btn-sm">${ico('xmark')}<span>직접 추가한 것 빼기</span></button>` : ''}</div></div>
             </details>
@@ -7946,7 +8156,7 @@ function renderLoreCheck() {
         const ch = getCurrentCharacter();
         if (!name || !ch) return;
         const cd = await loadCharData(ch);
-        cd.manualBooks = [...new Set([...(cd.manualBooks || []), name])];
+        cd.manualBooks = [...new Set([...arr(cd.manualBooks), name])];
         await saveCharData(ch, cd);
         runLoreCheck();
     });
@@ -7973,13 +8183,13 @@ function renderLoreCheck() {
         const ok = await applyReplace({ kind: 'lore', world: x.entry.book, uid: x.entry.uid, label: `로어북: ${x.entry.name}` }, x.paste, { tag: '수정' });
         if (ok) { b.classList.add('disabled'); b.querySelector('span').textContent = '적용됨'; }
     }));
-    el.querySelectorAll('.bt-lore-mcopy').forEach(b => b.addEventListener('click', () => { const m = ai.missing[Number(b.dataset.idx)]; if (m) copyText(`[${(m.keys || []).join(', ')}]\n${m.content}`); }));
+    el.querySelectorAll('.bt-lore-mcopy').forEach(b => b.addEventListener('click', () => { const m = ai.missing[Number(b.dataset.idx)]; if (m) copyText(`[${arr(m.keys).join(', ')}]\n${m.content}`); }));
     el.querySelectorAll('.bt-lore-madd').forEach(b => b.addEventListener('click', async () => {
         const m = ai.missing[Number(b.dataset.idx)];
         const book = d.books.find(x => x.kind === 'char' && !x.error)?.name || d.books.find(x => !x.error && !x.readonly)?.name;
         if (!m || !book) { toastr.warning('항목을 넣을 로어북이 없어요'); return; }
         const char = getCurrentCharacter();
-        const uid = await addLoreEntry(book, { comment: m.name, keys: (m.keys || []).filter(Boolean), content: m.content });
+        const uid = await addLoreEntry(book, { comment: m.name, keys: arr(m.keys).filter(Boolean), content: m.content });
         await logApply(char, { kind: 'lore', label: `로어북: ${m.name} (로어북 검사)`, world: book, uid, after: m.content });
         toastr.success(`“${book}”에 새 항목을 추가했어요`);
         b.classList.add('disabled');
@@ -7996,11 +8206,11 @@ async function loreReferenceText(char, maxChars = 8000) {
     for (const b of books) {
         try {
             const list = b.kind === 'embedded'
-                ? (char?.data?.character_book?.entries || []).map(e => ({ ...e, key: e.keys, disable: e.enabled === false }))
+                ? arr(char?.data?.character_book?.entries).map(e => ({ ...e, key: e.keys, disable: e.enabled === false }))
                 : Object.values((await loadWorld(b.name))?.entries || {});
             for (const e of list) {
                 if (e.disable || !String(e.content || '').trim()) continue;
-                items.push({ constant: !!e.constant, text: `- [${e.comment || (e.key || []).slice(0, 3).join(', ') || `#${e.uid}`}${e.constant ? ' · constant' : ` · keys: ${(e.key || []).slice(0, 4).join(', ')}`}] ${String(e.content).trim()}` });
+                items.push({ constant: !!e.constant, text: `- [${e.comment || arr(e.key).slice(0, 3).join(', ') || `#${e.uid}`}${e.constant ? ' · constant' : ` · keys: ${arr(e.key).slice(0, 4).join(', ')}`}] ${String(e.content).trim()}` });
             }
         } catch { /* skip broken book */ }
     }
@@ -8044,9 +8254,9 @@ async function applyQuoteReplace(field, quote, paste, reason) {
 async function runLoreChatCheck() {
     if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
     const char = getCurrentCharacter();
-    if (!char) { toastr.error('1:1 캐릭터 채팅을 열어주세요'); return; }
+    if (!char) { btError('1:1 캐릭터 채팅을 열어주세요'); return; }
     const d = await ensureLoreCache(char);
-    const active = (d?.entries || []).filter(e => !e.disable && e.content.trim()).slice(0, 60);
+    const active = arr(d?.entries).filter(e => !e.disable && e.content.trim()).slice(0, 60);
     if (!active.length) { toastr.warning('검사할 로어북 항목이 없어요'); return; }
     const s = getSettings();
     const msgs = ctx().chat.filter(m => m && !m.is_system && typeof m.mes === 'string').slice(-Math.max(Number(s.evalMessages) || 20, 10));
@@ -8092,15 +8302,15 @@ async function runLoreChatCheck() {
         ].join('\n\n');
         const r = await requestJsonComplete({ system: withCustom(system, 'doctor'), prompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: '📚 로어북 기준으로 채팅 검사 중…' });
         const ref = (i) => active[Number(i)] ? { book: active[Number(i)].book, uid: active[Number(i)].uid, name: active[Number(i)].name } : null;
-        r.violations = (r.violations || []).filter(x => x && !hasShip(`${x.problem} ${x.fix} ${x.paste}`)).map(x => ({ ...x, entry: ref(x.idx) }));
-        r.unused = (r.unused || []).filter(Boolean).map(x => ({ ...x, entry: ref(x.idx) }));
+        r.violations = arr(r.violations).filter(x => x && !hasShip(`${x.problem} ${x.fix} ${x.paste}`)).map(x => ({ ...x, entry: ref(x.idx) }));
+        r.unused = arr(r.unused).filter(Boolean).map(x => ({ ...x, entry: ref(x.idx) }));
         d.chatAi = { time: Date.now(), result: r };
         renderLoreCheck();
         setStatus(`✅ 로어북 기준 채팅 검사 완료 — ${r.score ?? '?'}점`);
         scrollPanelTo($id('lore_chat_view'));
     } catch (e) {
         console.error(LOG, e);
-        if (e.raw) toastr.error('결과 형식이 깨졌어요. 한 번 더 눌러주세요.');
+        if (e.raw) btError('결과 형식이 깨졌어요. 한 번 더 눌러주세요.');
         setStatus(`❌ 로어북 기준 채팅 검사 실패: ${e.message}`);
     } finally {
         running = false;
@@ -8111,9 +8321,9 @@ async function runLoreChatCheck() {
 async function runLoreCardCheck() {
     if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
     const char = getCurrentCharacter();
-    if (!char) { toastr.error('1:1 캐릭터 채팅을 열어주세요'); return; }
+    if (!char) { btError('1:1 캐릭터 채팅을 열어주세요'); return; }
     const d = await ensureLoreCache(char);
-    const active = (d?.entries || []).filter(e => !e.disable && e.content.trim()).slice(0, 60);
+    const active = arr(d?.entries).filter(e => !e.disable && e.content.trim()).slice(0, 60);
     if (!active.length) { toastr.warning('검사할 로어북 항목이 없어요'); return; }
     const s = getSettings();
     const cd = await loadCharData(char);
@@ -8149,15 +8359,15 @@ async function runLoreCardCheck() {
         ].join('\n\n');
         const r = await requestJsonComplete({ system: withCustom(system, 'doctor'), prompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: '📚 로어북 지시에 맞게 카드 검사 중…' });
         const ref = (i) => active[Number(i)] ? { book: active[Number(i)].book, uid: active[Number(i)].uid, name: active[Number(i)].name } : null;
-        for (const key of ['rules', 'conflicts', 'missing']) r[key] = (r[key] || []).filter(x => x && !hasShip(JSON.stringify(x))).map(x => ({ ...x, entry: ref(x.idx) }));
-        r.overrides = (r.overrides || []).filter(Boolean);
+        for (const key of ['rules', 'conflicts', 'missing']) r[key] = arr(r[key]).filter(x => x && !hasShip(JSON.stringify(x))).map(x => ({ ...x, entry: ref(x.idx) }));
+        r.overrides = arr(r.overrides).filter(Boolean);
         d.cardAi = { time: Date.now(), result: r };
         renderLoreCheck();
         setStatus(`✅ 로어북 지시 기준 카드 검사 완료 — ${r.score ?? '?'}점`);
         scrollPanelTo($id('lore_card_view'));
     } catch (e) {
         console.error(LOG, e);
-        if (e.raw) toastr.error('결과 형식이 깨졌어요. 한 번 더 눌러주세요.');
+        if (e.raw) btError('결과 형식이 깨졌어요. 한 번 더 눌러주세요.');
         setStatus(`❌ 로어북 지시 기준 카드 검사 실패: ${e.message}`);
     } finally {
         running = false;
@@ -8172,7 +8382,7 @@ function loreChatHtml(ai) {
     const r = ai.result;
     const sc = r.scores || {};
     const meter = (label, v) => meterHtml(label, v ?? null);
-    const v = (r.violations || []).map((x, i) => `
+    const v = arr(r.violations).map((x, i) => `
         <article class="bt-issue bt-sev-line-${x.kind === 'facts' ? 'high' : x.kind === 'rules' ? 'medium' : 'low'}">
             <div class="bt-issue-head"><span class="bt-tag">${escapeHtml(LORE_KIND_LABEL[x.kind] || x.kind || '')}</span>${x.reply ? `<span class="bt-tag bt-tag-ghost">답장 ${escapeHtml(String(x.reply))}</span>` : ''}${x.entry ? `<span class="bt-tag bt-tag-ghost">${escapeHtml(x.entry.name)}</span>` : ''}${funBadge(x.fun_impact, x.fun_note)}${contBadge(x.continuity)}</div>
             <div class="bt-fixwhat">${escapeHtml(x.problem || '')}</div>
@@ -8180,7 +8390,7 @@ function loreChatHtml(ai) {
             ${x.fix ? `<div class="bt-prose bt-muted">${prose(x.fix)}</div>` : ''}
             ${x.paste ? `<pre class="bt-paste">${escapeHtml(x.paste)}</pre><div class="bt-actions bt-actions-end"><button type="button" class="bt-btn bt-btn-sm bt-btn-primary bt-lc-apply" data-i="${i}">${ico('file-import')}<span>${x.where === 'lore' ? '로어북 항목 바꾸기' : `${escapeHtml(FIELD_LABEL[x.where] || x.where || '')}에 넣기`}</span></button></div>` : ''}
         </article>`).join('');
-    const unused = (r.unused || []).map(x => `<li><b>${escapeHtml(x.entry?.name || `#${x.idx}`)}</b> — ${escapeHtml(x.why || '')}${x.fix ? `<div class="bt-muted">${escapeHtml(x.fix)}</div>` : ''}</li>`).join('');
+    const unused = arr(r.unused).map(x => `<li><b>${escapeHtml(x.entry?.name || `#${x.idx}`)}</b> — ${escapeHtml(x.why || '')}${x.fix ? `<div class="bt-muted">${escapeHtml(x.fix)}</div>` : ''}</li>`).join('');
     return `
         <section class="bt-card bt-hero">
             ${ringHtml(Math.max(0, Math.min(100, Number(r.score) || 0)))}
@@ -8196,8 +8406,8 @@ function loreChatHtml(ai) {
 function loreCardHtml(ai) {
     if (!ai?.result) return '';
     const r = ai.result;
-    const rules = (r.rules || []).map(x => `<li><b>${escapeHtml(x.entry?.name || `#${x.idx}`)}</b> — ${escapeHtml(x.rule || '')}</li>`).join('');
-    const conflicts = (r.conflicts || []).map((x, i) => `
+    const rules = arr(r.rules).map(x => `<li><b>${escapeHtml(x.entry?.name || `#${x.idx}`)}</b> — ${escapeHtml(x.rule || '')}</li>`).join('');
+    const conflicts = arr(r.conflicts).map((x, i) => `
         <article class="bt-issue bt-sev-line-high">
             <div class="bt-issue-head"><span class="bt-tag">${escapeHtml(FIELD_LABEL[x.field] || x.field || '')}</span>${x.entry ? `<span class="bt-tag bt-tag-ghost">${escapeHtml(x.entry.name)}</span>` : ''}${funBadge(x.fun_impact, x.fun_note)}${contBadge(x.continuity)}</div>
             <div class="bt-fixwhat">${escapeHtml(x.problem || '')}</div>
@@ -8205,14 +8415,14 @@ function loreCardHtml(ai) {
             ${x.card_quote ? `<blockquote class="bt-quote">${escapeHtml(x.card_quote)}</blockquote>` : ''}
             ${x.paste ? `<pre class="bt-paste">${escapeHtml(x.paste)}</pre><div class="bt-actions bt-actions-end"><button type="button" class="bt-btn bt-btn-sm bt-btn-primary bt-lk-fix" data-i="${i}">${ico('file-import')}<span>이 부분 바꾸기</span></button></div>` : ''}
         </article>`).join('');
-    const missing = (r.missing || []).map((x, i) => `
+    const missing = arr(r.missing).map((x, i) => `
         <article class="bt-sugg">
             <div class="bt-sugg-head"><span class="bt-tag">${escapeHtml(FIELD_LABEL[x.field] || x.field || '')}</span>${funBadge(x.fun_impact, x.fun_note)}${contBadge(x.continuity)}<span class="bt-sugg-btns">${copyBtn('bt-lk-mcopy', i)}${applyBtn('bt-lk-madd', i)}</span></div>
             <div class="bt-fixwhat" style="margin-top:6px">${escapeHtml(x.rule || '')}</div>
             ${x.why ? `<div class="bt-prose bt-muted">${prose(x.why)}</div>` : ''}
             ${x.paste ? `<pre class="bt-paste">${escapeHtml(x.paste)}</pre>` : ''}
         </article>`).join('');
-    const overrides = (r.overrides || []).map(x => `<li><b>${escapeHtml(FIELD_LABEL[x.field] || x.field || '')}</b> — ${escapeHtml(x.problem || '')}${x.card_quote ? `<div class="bt-quote">${escapeHtml(x.card_quote)}</div>` : ''}</li>`).join('');
+    const overrides = arr(r.overrides).map(x => `<li><b>${escapeHtml(FIELD_LABEL[x.field] || x.field || '')}</b> — ${escapeHtml(x.problem || '')}${x.card_quote ? `<div class="bt-quote">${escapeHtml(x.card_quote)}</div>` : ''}</li>`).join('');
     return `
         <section class="bt-card bt-hero">
             ${ringHtml(Math.max(0, Math.min(100, Number(r.score) || 0)))}
@@ -8334,7 +8544,7 @@ function renderBotKindUI(cd) {
 async function grabRoster() {
     if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
     const char = getCurrentCharacter();
-    if (!char) { toastr.error('캐릭터 채팅을 먼저 열어주세요'); return; }
+    if (!char) { btError('캐릭터 채팅을 먼저 열어주세요'); return; }
     const s = getSettings();
     const cd = await loadCharData(char);
     running = true;
@@ -8351,7 +8561,7 @@ async function grabRoster() {
             'Now output the JSON.',
         ].filter(Boolean).join('\n\n');
         const r = await requestJson({ system, prompt, profileId: s.evalProfile, maxTokens: 4000, label: '👥 등장인물 찾는 중…' });
-        const list = (r.characters || []).filter(x => x?.name).map(x => [x.name, x.orig || '', x.note || ''].join(' | ').replace(/\s\|\s*\|\s*$|\s\|\s*$/, ''));
+        const list = arr(r.characters).filter(x => x?.name).map(x => [x.name, x.orig || '', x.note || ''].join(' | ').replace(/\s\|\s*\|\s*$|\s\|\s*$/, ''));
         if (!list.length) throw new Error('등장인물을 찾지 못했어요');
         $id('roster').value = list.join('\n');
         await saveSourceFromUI(false);
@@ -8359,7 +8569,7 @@ async function grabRoster() {
         setStatus(`✅ 등장인물 ${list.length}명을 찾았어요 — 맞는지 확인해 주세요`);
     } catch (e) {
         setStatus(`❌ 등장인물 찾기 실패: ${e.message}`);
-        toastr.error(`등장인물 찾기 실패: ${e.message}`);
+        btError(`등장인물 찾기 실패: ${e.message}`);
     } finally {
         running = false;
         updateRunState();
@@ -8531,7 +8741,7 @@ function kindDoctorHtml() {
 
 function runStatusTrack() {
     const char = getCurrentCharacter();
-    if (!char) { toastr.error('1:1 캐릭터 채팅을 열어주세요'); return; }
+    if (!char) { btError('1:1 캐릭터 채팅을 열어주세요'); return; }
     const msgs = ctx().chat.filter(m => m && !m.is_system && typeof m.mes === 'string');
     if (msgs.filter(m => !m.is_user).length < 2) { toastr.warning('봇 답장이 있는 채팅을 열어주세요'); return; }
     if (kindCache?.char !== char.avatar) kindCache = { char: char.avatar };
@@ -8544,7 +8754,7 @@ function runStatusTrack() {
 async function runKindCheck(mode) {
     if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
     const char = getCurrentCharacter();
-    if (!char) { toastr.error('1:1 캐릭터 채팅을 열어주세요'); return; }
+    if (!char) { btError('1:1 캐릭터 채팅을 열어주세요'); return; }
     const cd = await loadCharData(char);
     const kind = botKind(cd);
     if (kind === 'single') { toastr.info('1인 캐릭터봇은 다른 진단을 쓰면 돼요'); return; }
@@ -8583,7 +8793,7 @@ async function runKindCheck(mode) {
             'Now output the JSON.',
         ].filter(Boolean).join('\n\n');
         const r = await requestJsonComplete({ system: withCustom(system, 'doctor'), prompt, profileId: s.evalProfile, maxTokens: evalTokens(), label: mode === 'card' ? `🧩 ${BOT_KINDS[kind].short} 카드 검사 중…` : `🧩 ${BOT_KINDS[kind].short} 채팅 검사 중…` });
-        r.issues = (r.issues || []).filter(x => x && !hasShip(`${x.problem} ${x.fix} ${x.paste}`));
+        r.issues = arr(r.issues).filter(x => x && !hasShip(`${x.problem} ${x.fix} ${x.paste}`));
         if (kindCache?.char !== char.avatar) kindCache = { char: char.avatar };
         kindCache[mode] = { time: Date.now(), kind, result: r };
         if (status) kindCache.status = { time: Date.now(), ...status };
@@ -8593,7 +8803,7 @@ async function runKindCheck(mode) {
         scrollPanelTo($id(`kind_${mode}_view`));
     } catch (e) {
         console.error(LOG, e);
-        if (e.raw) toastr.error('결과 형식이 깨졌어요. 한 번 더 눌러주세요.');
+        if (e.raw) btError('결과 형식이 깨졌어요. 한 번 더 눌러주세요.');
         setStatus(`❌ 검사 실패: ${e.message}`);
     } finally {
         running = false;
@@ -8604,9 +8814,9 @@ async function runKindCheck(mode) {
 function kindResultHtml(mode, data) {
     if (!data?.result) return '';
     const r = data.result;
-    const checks = (r.checks || []).map(c => meterHtml(escapeHtml(c.name || ''), c.score ?? null, { sub: c.comment })).join('');
-    const per = (r.per_character || []).map(c => meterHtml(escapeHtml(c.name || ''), c.score ?? null, { sub: c.comment })).join('');
-    const issues = (r.issues || []).map((x, i) => `
+    const checks = arr(r.checks).map(c => meterHtml(escapeHtml(c.name || ''), c.score ?? null, { sub: c.comment })).join('');
+    const per = arr(r.per_character).map(c => meterHtml(escapeHtml(c.name || ''), c.score ?? null, { sub: c.comment })).join('');
+    const issues = arr(r.issues).map((x, i) => `
         <article class="bt-issue bt-sev-line-${SEV_ORDER[x.severity] !== undefined ? x.severity : 'low'}">
             <div class="bt-issue-head">${sevTag(x.severity)}<span class="bt-issue-cat">${escapeHtml(x.check || '')}</span>${x.character ? `<span class="bt-tag">${escapeHtml(x.character)}</span>` : ''}${x.where ? `<span class="bt-tag bt-tag-ghost">${escapeHtml(FIELD_LABEL[x.where] || x.where)}</span>` : ''}${funBadge(x.fun_impact, x.fun_note)}${contBadge(x.continuity)}</div>
             <div class="bt-fixwhat">${escapeHtml(x.problem || '')}</div>
@@ -8631,7 +8841,7 @@ function renderKindResults() {
     const k = kindCache;
     if (!k || k.char !== getCurrentCharacter()?.avatar) { el.innerHTML = ''; return; }
     const st = k.status;
-    const stFind = (st?.findings || []).map(f => `
+    const stFind = arr(st?.findings).map(f => `
         <article class="bt-issue bt-sev-line-${f.severity}">
             <div class="bt-issue-head">${sevTag(f.severity)}<span class="bt-issue-cat">${escapeHtml(f.category)}</span></div>
             <div class="bt-fixwhat">${escapeHtml(f.title)}</div>
@@ -8807,7 +9017,7 @@ function dedupTexts() {
 
 async function runDedupFind() {
     const { char, side, targetText, otherText } = dedupTexts();
-    if (!char) { toastr.error('1:1 캐릭터 채팅을 열어주세요'); return; }
+    if (!char) { btError('1:1 캐릭터 채팅을 열어주세요'); return; }
     if (!targetText.trim() || !otherText.trim()) { toastr.info(`${!targetText.trim() ? FIELD_LABEL[side.target] : FIELD_LABEL[side.other]} 칸이 비어 있어서 겹칠 내용이 없어요`); return; }
     const rows = findDuplicates(targetText, otherText, char.name);
     dedupState = { char: char.avatar, side, targetText, otherText, rows, ai: null, time: Date.now() };
@@ -8819,7 +9029,7 @@ async function runDedupFind() {
 async function runDedupAi() {
     if (running) { toastr.warning('다른 작업이 진행 중이에요'); return; }
     const { char, side, targetText, otherText } = dedupTexts();
-    if (!char) { toastr.error('1:1 캐릭터 채팅을 열어주세요'); return; }
+    if (!char) { btError('1:1 캐릭터 채팅을 열어주세요'); return; }
     if (!targetText.trim() || !otherText.trim()) { toastr.info(`${!targetText.trim() ? FIELD_LABEL[side.target] : FIELD_LABEL[side.other]} 칸이 비어 있어서 겹칠 내용이 없어요`); return; }
     const cd = await loadCharData(char);
     const T = FIELD_LABEL[side.target]; const O = FIELD_LABEL[side.other];
@@ -8858,7 +9068,7 @@ async function runDedupAi() {
     } catch (e) {
         console.error(LOG, e);
         setStatus(`❌ 중복 정리 실패: ${e.message}`);
-        toastr.error(`중복 정리 실패: ${e.message}`);
+        btError(`중복 정리 실패: ${e.message}`);
     } finally {
         running = false;
         updateRunState();
@@ -9027,7 +9237,7 @@ async function recordCardVersion(char, cd, { fields = null, time = Date.now(), l
     cd.cardVersions.sort((a, b) => a.time - b.time);
     if (cd.cardVersions.length > 12) {
         // keep the first, any version a chat is locked to, and the newest ones
-        const pinned = new Set(cd.pinnedVersions || []);
+        const pinned = new Set(arr(cd.pinnedVersions));
         const keep = new Set([cd.cardVersions[0].id, ...cd.cardVersions.slice(-8).map(v => v.id)]);
         cd.cardVersions = cd.cardVersions.filter(v => keep.has(v.id) || pinned.has(v.id));
     }
@@ -9050,7 +9260,7 @@ function chatStartTime() {
     const c = ctx();
     const fromId = parseChatTime(String(c.getCurrentChatId?.() || ''));
     if (fromId) return fromId;
-    const first = (c.chat || []).find(m => m && m.send_date);
+    const first = arr(c.chat).find(m => m && m.send_date);
     return first ? parseChatTime(first.send_date) : 0;
 }
 
@@ -9128,8 +9338,8 @@ async function legacyLock(char, cd, version, { mode = getSettings().legacyMode |
     await setLegacyInject(text);
     const meta = { on: true, versionId: version.id, versionTime: version.time, fields: version.fields, mode, text, curHash: fieldsHash(now), auto, at: Date.now() };
     // remember that a chat uses this version so trimming old versions never drops it
-    if (version.id && !(cd.pinnedVersions || []).includes(version.id)) {
-        cd.pinnedVersions = [...(cd.pinnedVersions || []), version.id].slice(-30);
+    if (version.id && !arr(cd.pinnedVersions).includes(version.id)) {
+        cd.pinnedVersions = [...arr(cd.pinnedVersions), version.id].slice(-30);
         await saveCharData(char, cd);
     }
     await saveLegacyMeta(meta);
@@ -9151,8 +9361,8 @@ async function purgeBadVersions(char, cd) {
     const now = cardFieldsFromChar(char);
     if (!now) return { cd, dropped: 0 };
     const nowHash = fieldsHash(now);
-    const before = (cd.cardVersions || []).length;
-    cd.cardVersions = (cd.cardVersions || []).filter(v => {
+    const before = arr(cd.cardVersions).length;
+    cd.cardVersions = arr(cd.cardVersions).filter(v => {
         if (looksLikeOtherCharacter(v.fields, char)) return false;
         if (v.v === 2 || v.label) return true; // recorded safely, or around an edit made in the editor
         return v.hash === nowHash; // old automatic snapshot: keep only if it is exactly the current card
@@ -9193,10 +9403,10 @@ async function legacyOnChatChanged() {
         const msgs = (ctx().chat || []).filter(m => m && !m.is_system);
         if (meta?.on) {
             // the version may have been trimmed from the list; the chat keeps its own copy (v3.2.1+)
-            let v = (cd.cardVersions || []).find(x => x.id === meta.versionId);
+            let v = arr(cd.cardVersions).find(x => x.id === meta.versionId);
             if (!v && meta.fields) v = { id: meta.versionId, time: meta.versionTime, fields: meta.fields };
-            else if (v && !(cd.pinnedVersions || []).includes(v.id)) { // chats locked before v3.2.1
-                cd.pinnedVersions = [...(cd.pinnedVersions || []), v.id].slice(-30);
+            else if (v && !arr(cd.pinnedVersions).includes(v.id)) { // chats locked before v3.2.1
+                cd.pinnedVersions = [...arr(cd.pinnedVersions), v.id].slice(-30);
                 await saveCharData(char, cd);
             }
             const textDesc = (meta.text || '').includes('### Description (earlier version)\n')
@@ -9217,7 +9427,7 @@ async function legacyOnChatChanged() {
         } else if (!meta && s.legacyAuto !== false && msgs.length >= 3) {
             const start = chatStartTime();
             const v = versionForStart(cd, start);
-            const latest = (cd.cardVersions || []).slice(-1)[0];
+            const latest = arr(cd.cardVersions).slice(-1)[0];
             if (v && latest && v.id !== latest.id && v.v === 2 && versionSafeFor(v, char) && bigChange(v.fields, cardFieldsNow(char))) {
                 const m = await legacyLock(char, cd, v, { mode: 'changed', auto: true });
                 if (m) toastr.info('카드를 고치기 전에 시작한 채팅이라, 예전 캐해로 이어가요. 봇 테스터 원작 탭에서 끌 수 있어요.', '봇 테스터', { timeOut: 6000 });
@@ -9300,9 +9510,9 @@ function bindLegacyUI() {
     $id('legacy_lock').addEventListener('click', async () => {
         if (running) return;
         const char = getCurrentCharacter();
-        if (!char) { toastr.error('캐릭터 채팅을 먼저 열어주세요'); return; }
+        if (!char) { btError('캐릭터 채팅을 먼저 열어주세요'); return; }
         const cd = await loadCharData(char);
-        const v = (cd.cardVersions || []).find(x => x.id === $id('legacy_ver').value);
+        const v = arr(cd.cardVersions).find(x => x.id === $id('legacy_ver').value);
         if (!v) { toastr.warning('저장된 예전 버전이 없어요'); return; }
         const mode = $id('legacy_mode').value;
         running = true; updateRunState();
@@ -9311,7 +9521,7 @@ function bindLegacyUI() {
             if (m) { setStatus('✅ 이 채팅은 예전 캐해로 이어가요 — 새 채팅은 지금 카드대로'); toastr.success('이 채팅에만 예전 캐해를 넣었어요'); }
             else toastr.info('고른 버전이 지금 카드와 같아서 넣을 게 없어요');
         } catch (e) {
-            setStatus(`❌ 실패: ${e.message}`); toastr.error(`실패: ${e.message}`);
+            setStatus(`❌ 실패: ${e.message}`); btError(`실패: ${e.message}`);
         } finally { running = false; updateRunState(); renderLegacyCard(); }
     });
     $id('legacy_unlock').addEventListener('click', async () => { await legacyUnlock(); renderLegacyCard(); });
@@ -9395,8 +9605,8 @@ async function renderRescue() {
         : `<p class="bt-rescue-clean">${ico('circle-check')} 이 채팅에는 봇 테스터가 넣은 게 없어요.</p>`;
 
     // --- card changes ---
-    const versions = (cd.cardVersions || []).filter(v => versionSafeFor(v, char));
-    const active = (cd.applyLog || []).filter(x => !x.undone);
+    const versions = arr(cd.cardVersions).filter(v => versionSafeFor(v, char));
+    const active = arr(cd.applyLog).filter(x => !x.undone);
     let cardHtml = '';
     if (!now) {
         cardHtml = '<p class="bt-note">카드를 아직 불러오지 못했어요. 캐릭터 편집 화면을 한 번 열어 주세요.</p>';
@@ -9462,8 +9672,8 @@ async function restoreCardToVersion(versionId, keys = null) {
     const char = getCurrentCharacter();
     if (!char) return;
     const cd = await loadCharData(char);
-    const v = (cd.cardVersions || []).find(x => x.id === versionId);
-    if (!versionSafeFor(v, char)) { toastr.error('그 버전은 되돌릴 수 없어요'); return; }
+    const v = arr(cd.cardVersions).find(x => x.id === versionId);
+    if (!versionSafeFor(v, char)) { btError('그 버전은 되돌릴 수 없어요'); return; }
     if (!editorBelongsTo(char)) { toastr.warning(editorProblem()); return; }
     const now = cardFieldsNow(char);
     const targets = LEGACY_FIELDS.filter(([k]) => (!keys || keys.includes(k)) && (v.fields[k] || '').trim() !== (now[k] || '').trim());
@@ -9483,7 +9693,7 @@ async function restoreCardToVersion(versionId, keys = null) {
         if (legacyMeta()?.on) await legacyOnChatChanged();
         toastr.success(`${targets.length}개 칸을 예전 버전으로 되돌렸어요`);
     } catch (e) {
-        toastr.error(`되돌리기 실패: ${e.message}`);
+        btError(`되돌리기 실패: ${e.message}`);
     }
     runDoctorLocal(true);
     renderRescue();
@@ -9495,7 +9705,7 @@ async function undoAllApplies() {
     if (!char) return;
     const c = ctx();
     let cd = await loadCharData(char);
-    const active = (cd.applyLog || []).filter(x => !x.undone);
+    const active = arr(cd.applyLog).filter(x => !x.undone);
     if (!active.length) return;
     if (active.some(x => x.kind === 'field') && !editorBelongsTo(char)) { toastr.warning(editorProblem()); return; }
     if (c.callGenericPopup) {
@@ -9608,7 +9818,7 @@ function bindCustomPromptUI() {
             renderCustomPromptUI();
             toastr.success(`지시문 ${n}개를 가져왔어요`);
         } catch (e) {
-            toastr.error(`가져오기 실패: ${e.message}`);
+            btError(`가져오기 실패: ${e.message}`);
         }
     });
     renderCustomPromptUI();
@@ -9678,10 +9888,10 @@ function sanitizeNsfw(r) {
     r.summary = stripShipping(r.summary);
     r.canon_basis = noShipList(r.canon_basis);
     r.boundaries = noShipList(r.boundaries);
-    r.sections = (r.sections || []).filter(x => x && typeof x === 'object').map(x => ({ ...x, body: stripShipping(x.body), bullets: noShipList(x.bullets) }));
-    r.sample_lines = (r.sample_lines || []).filter(x => x && !hasShip(`${x.situation} ${x.line}`));
-    r.ooc_risks = (r.ooc_risks || []).filter(x => x && !hasShip(`${x.risk} ${x.fix}`));
-    r.requests_applied = (r.requests_applied || []).filter(x => x && typeof x === 'object' && (x.request || x.how));
+    r.sections = arr(r.sections).filter(x => x && typeof x === 'object').map(x => ({ ...x, body: stripShipping(x.body), bullets: noShipList(x.bullets) }));
+    r.sample_lines = arr(r.sample_lines).filter(x => x && !hasShip(`${x.situation} ${x.line}`));
+    r.ooc_risks = arr(r.ooc_risks).filter(x => x && !hasShip(`${x.risk} ${x.fix}`));
+    r.requests_applied = arr(r.requests_applied).filter(x => x && typeof x === 'object' && (x.request || x.how));
     return r;
 }
 
@@ -9696,7 +9906,7 @@ async function runNsfwProfile() {
     const s = getSettings();
     if (!s.nsfwOn) { toastr.info('설정 탭 → NSFW 프로필에서 먼저 켜 주세요'); return; }
     const char = getCurrentCharacter();
-    if (!char) { toastr.error('1:1 캐릭터 채팅을 열어주세요'); return; }
+    if (!char) { btError('1:1 캐릭터 채팅을 열어주세요'); return; }
     await saveSourceFromUI(false);
     const vd = await loadVoiceData(char);
     readNamesFromUI(vd);
@@ -9727,7 +9937,8 @@ async function runNsfwProfile() {
     } catch (e) {
         console.error(LOG, e);
         setStatus(`❌ NSFW 프로필 실패: ${e.message}`);
-        toastr.error(`NSFW 프로필 실패: ${e.message}`);
+        btError(`NSFW 프로필 실패: ${e.message}`);
+        if (e.message !== '중단됨') offerRetry('NSFW 프로필 다시 만들기', runNsfwProfile);
     } finally {
         running = false;
         updateRunState();
@@ -9745,7 +9956,7 @@ function nsfwEvalBlock(cd) {
         r.confidence ? `Confidence: ${r.confidence}${r.confidence_note ? ` (${r.confidence_note})` : ''}` : '',
         req ? `Creator's NSFW request: ${truncate(req, 500)}` : '',
         r.summary,
-        ...(r.sections || []).map(x => `- ${x.title}: ${x.body || ''}`),
+        ...arr(r.sections).map(x => `- ${x.title}: ${x.body || ''}`),
         r.boundaries?.length ? `Boundaries: ${r.boundaries.join('; ')}` : '',
     ].filter(Boolean).join('\n');
     return `[Intimacy profile — for intimate scenes, judge in-character behaviour against it]\n${truncate(body, 3000)}`;
@@ -9803,15 +10014,15 @@ function renderNsfwProfile(p, req) {
         return;
     }
     const r = p.result || {};
-    const sections = (r.sections || []).map(x => `
+    const sections = arr(r.sections).map(x => `
         <article class="bt-vcard">
             <div class="bt-vcard-head"><h4>${escapeHtml(x.title || '')}</h4></div>
             ${x.body ? `<div class="bt-prose">${prose(x.body)}</div>` : ''}
             ${renderList(x.bullets)}
         </article>`).join('');
-    const lines = (r.sample_lines || []).map(x => `<div class="bt-nsfw-line">${x.situation ? `<span>${escapeHtml(x.situation)}</span>` : ''}<blockquote class="bt-quote">${escapeHtml(x.line || '')}</blockquote></div>`).join('');
-    const risks = (r.ooc_risks || []).map(x => `<li><b>${escapeHtml(x.risk || '')}</b>${x.fix ? `<div class="bt-muted">${escapeHtml(x.fix)}</div>` : ''}</li>`).join('');
-    const applied = (r.requests_applied || []).map(x => `<li><b>${escapeHtml(x.request || '')}</b>${x.how ? `<div class="bt-muted">${escapeHtml(x.how)}</div>` : ''}</li>`).join('');
+    const lines = arr(r.sample_lines).map(x => `<div class="bt-nsfw-line">${x.situation ? `<span>${escapeHtml(x.situation)}</span>` : ''}<blockquote class="bt-quote">${escapeHtml(x.line || '')}</blockquote></div>`).join('');
+    const risks = arr(r.ooc_risks).map(x => `<li><b>${escapeHtml(x.risk || '')}</b>${x.fix ? `<div class="bt-muted">${escapeHtml(x.fix)}</div>` : ''}</li>`).join('');
+    const applied = arr(r.requests_applied).map(x => `<li><b>${escapeHtml(x.request || '')}</b>${x.how ? `<div class="bt-muted">${escapeHtml(x.how)}</div>` : ''}</li>`).join('');
     view.innerHTML = `
         ${r.confidence ? `<div class="bt-nsfw-conf bt-conf-row-${escapeHtml(r.confidence)}">${ico('gauge-high')}<span class="bt-nsfw-conf-label">신뢰도</span>${confTag(r.confidence)}${r.confidence_note ? `<small>${escapeHtml(r.confidence_note)}</small>` : ''}</div>` : ''}
         ${applied ? `<article class="bt-vcard bt-nsfw-req-card"><div class="bt-vcard-head"><h4>${ico('list-check')} 요청사항 반영</h4></div><ul class="bt-list">${applied}</ul></article>` : (p.request ? `<div class="bt-nsfw-req-echo">${ico('quote-left')}<div><span class="bt-sub-label">이 프로필에 넣은 요청</span><p>${escapeHtml(truncate(p.request, 300))}</p></div></div>` : '')}
@@ -9835,7 +10046,7 @@ function renderNsfwProfile(p, req) {
         p.request ? `\n## 요청사항\n${p.request}` : '',
         r.requests_applied?.length ? `\n## 요청사항 반영\n${r.requests_applied.map(x => `- ${x.request || ''}: ${x.how || ''}`).join('\n')}` : '',
         r.summary || '',
-        ...(r.sections || []).map(x => `\n## ${x.title}\n${x.body || ''}${(x.bullets || []).map(b => `\n- ${b}`).join('')}`),
+        ...arr(r.sections).map(x => `\n## ${x.title}\n${x.body || ''}${arr(x.bullets).map(b => `\n- ${b}`).join('')}`),
         r.sample_lines?.length ? `\n## 예시 대사\n${r.sample_lines.map(x => `- (${x.situation || ''}) ${x.line || ''}`).join('\n')}` : '',
         r.boundaries?.length ? `\n## 하지 않는 것\n${r.boundaries.map(x => `- ${x}`).join('\n')}` : '',
         r.card_paste ? `\n## 카드에 넣을 문장\n${r.card_paste}` : '',
